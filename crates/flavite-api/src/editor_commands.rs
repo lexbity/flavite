@@ -1021,6 +1021,8 @@ pub enum MotionArg {
     DocEnd,
     PageUp,
     PageDown,
+    // FEUX-0004 X03/X06: goto-line motion
+    Line(u64),
 }
 
 impl From<MotionArg> for flavite_buffer::motion::Motion {
@@ -1039,6 +1041,7 @@ impl From<MotionArg> for flavite_buffer::motion::Motion {
             MotionArg::DocEnd => Self::DocEnd,
             MotionArg::PageUp => Self::PageUp,
             MotionArg::PageDown => Self::PageDown,
+            MotionArg::Line(n) => Self::Line(n),
         }
     }
 }
@@ -1671,33 +1674,184 @@ pub(crate) fn handle_goto_line(
     if args.line > line_count {
         return Err(format!("Document has {line_count} lines"));
     }
-    // GotoLine is a selection-only command - it moves carets to the line
-    // For now, we'll use a Line motion (to be implemented in X06 with counts)
-    // But for X03, we need to implement it as a selection-only operation
-    // that moves each member's head to line N at column 0
+    // GotoLine is a selection-only command - it moves each member's head to line N at column 0
+    // We implement this by delegating to editor.move with the Line motion
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let motion = flavite_buffer::motion::Motion::Line(args.line);
+    let moved = flavite_buffer::motion::apply(&snapshot.text, &set, motion, false, None)
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(args.buffer_id, args.revision, &moved))
+}
 
-    // This is a simplified implementation - in X06 we'll have the full count support
-    // For now, we handle the draft-based dispatch
+// FEUX-0004 X04: Surround handlers
 
-    // Build a Line motion that will be applied to each selection
-    let _line_byte = snapshot
-        .text
-        .lines()
-        .take(args.line as usize - 1)
-        .map(|line| line.len() + 1) // +1 for newline
-        .sum::<usize>();
+/// Arguments for surround_add command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorSurroundAddArgs {
+    pub buffer_id: u64,
+    pub revision: u64,
+    pub operation: OperationArg,
+    pub origin: EditorOriginArg,
+    pub selections: SelectionSetArg,
+    pub char: String,
+    #[serde(default)]
+    pub undo_policy: Option<crate::flavite::UndoPolicyArg>,
+}
 
-    // Create a motion operation to go to the start of the line
-    // We'll reuse the LineStart motion with a custom target
-    // For X03, we'll use a simpler approach: just move the head of each selection
-    // to the start of the requested line
+/// Arguments for surround_delete command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorSurroundDeleteArgs {
+    pub buffer_id: u64,
+    pub revision: u64,
+    pub operation: OperationArg,
+    pub origin: EditorOriginArg,
+    pub selections: SelectionSetArg,
+    pub char: String,
+    #[serde(default)]
+    pub undo_policy: Option<crate::flavite::UndoPolicyArg>,
+}
 
-    // This requires a custom edit operation or using the existing motion infrastructure
-    // For now, let's use a simple approach that moves each caret to line start
-    // The full implementation will come with the count support in X06
+/// Arguments for surround_change command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorSurroundChangeArgs {
+    pub buffer_id: u64,
+    pub revision: u64,
+    pub operation: OperationArg,
+    pub origin: EditorOriginArg,
+    pub selections: SelectionSetArg,
+    pub old_char: String,
+    pub new_char: String,
+    #[serde(default)]
+    pub undo_policy: Option<crate::flavite::UndoPolicyArg>,
+}
 
-    // Return an error for now - this will be fixed when we implement the motion
-    Err("GotoLine not yet fully implemented".to_string())
+pub(crate) fn handle_surround_add(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorSurroundAddArgs = decode(invocation)?;
+    // Validate char is a single character
+    if args.char.chars().count() != 1 {
+        return Err("Surround character must be a single character".to_string());
+    }
+    let char = args.char.chars().next().unwrap();
+    let pair = flavite_buffer::pairs::pair_for_char(char);
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::SurroundAdd {
+            open: pair.open.to_string(),
+            close: pair.close.to_string(),
+        },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_surround_delete(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorSurroundDeleteArgs = decode(invocation)?;
+    // Validate char is a single character
+    if args.char.chars().count() != 1 {
+        return Err("Surround character must be a single character".to_string());
+    }
+    let char = args.char.chars().next().unwrap();
+    let pair = flavite_buffer::pairs::pair_for_char(char);
+    // Validate that all selections have the enclosing pair
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let validation = flavite_buffer::pairs::validate_enclosing_pairs(
+        &snapshot.text,
+        &set,
+        &flavite_buffer::pairs::Pair::from_open(pair.open).unwrap_or(pair),
+    );
+    if let flavite_buffer::pairs::SurroundValidation::MissingPairs { count, total } = validation {
+        return Err(format!(
+            "{} of {} selections have no enclosing ({})",
+            count, total, pair.open
+        ));
+    }
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::SurroundDelete {
+            open: pair.open.to_string(),
+            close: pair.close.to_string(),
+        },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_surround_change(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorSurroundChangeArgs = decode(invocation)?;
+    // Validate old_char is a single character
+    if args.old_char.chars().count() != 1 {
+        return Err("Old surround character must be a single character".to_string());
+    }
+    // Validate new_char is a single character
+    if args.new_char.chars().count() != 1 {
+        return Err("New surround character must be a single character".to_string());
+    }
+    let old_char = args.old_char.chars().next().unwrap();
+    let new_char = args.new_char.chars().next().unwrap();
+    let old_pair = flavite_buffer::pairs::pair_for_char(old_char);
+    let new_pair = flavite_buffer::pairs::pair_for_char(new_char);
+    // Validate that all selections have the enclosing old pair
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let validation = flavite_buffer::pairs::validate_enclosing_pairs(
+        &snapshot.text,
+        &set,
+        &flavite_buffer::pairs::Pair::from_open(old_pair.open).unwrap_or(old_pair),
+    );
+    if let flavite_buffer::pairs::SurroundValidation::MissingPairs { count, total } = validation {
+        return Err(format!(
+            "{} of {} selections have no enclosing ({})",
+            count, total, old_pair.open
+        ));
+    }
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::SurroundChange {
+            old_open: old_pair.open.to_string(),
+            old_close: old_pair.close.to_string(),
+            new_open: new_pair.open.to_string(),
+            new_close: new_pair.close.to_string(),
+        },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
 }
 
 fn handle_match_selection(

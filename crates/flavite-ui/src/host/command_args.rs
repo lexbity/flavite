@@ -241,14 +241,17 @@ pub(crate) fn open_lines_align(app: &mut App, target: EditorTarget) {
         .insert(target.tab, CommandArgsState::new(draft, target));
 }
 
-/// Open a goto-line draft for the given target with the max line count.
-pub(crate) fn open_goto_line(app: &mut App, target: EditorTarget, max_lines: u32) {
+/// Open a goto-line draft for the given target.
+/// Uses a large max line count; the actual validation happens in the handler (FEUX-0004 E-12).
+pub(crate) fn open_goto_line(app: &mut App, target: EditorTarget) {
     // Close any existing draft on this tab
     app.command_args.tabs.remove(&target.tab);
     // Close matches draft for mutual exclusion
     app.selection_search.tabs.remove(&target.tab);
 
-    let draft = DraftCommand::goto_line(max_lines);
+    // Use a large max value; the handler will validate against actual line count
+    // and return an error with the correct bound if needed
+    let draft = DraftCommand::goto_line(999_999);
     app.command_args
         .tabs
         .insert(target.tab, CommandArgsState::new(draft, target));

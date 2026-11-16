@@ -28,6 +28,8 @@ pub enum Motion {
     DocEnd,
     PageUp,
     PageDown,
+    // FEUX-0004 X03/X06: goto-line motion
+    Line(u64),
 }
 
 impl Motion {
@@ -38,6 +40,21 @@ impl Motion {
             self,
             Self::LineUp | Self::LineDown | Self::PageUp | Self::PageDown
         )
+    }
+
+    /// Whether this motion is a line-number motion (FEUX-0004).
+    #[must_use]
+    pub const fn is_line_number(self) -> bool {
+        matches!(self, Self::Line(_))
+    }
+
+    /// Get the line number for Line motions, if applicable.
+    #[must_use]
+    pub const fn line_number(self) -> Option<u64> {
+        match self {
+            Self::Line(n) => Some(n),
+            _ => None,
+        }
     }
 }
 
@@ -156,6 +173,21 @@ fn head_target(
         Motion::LineEnd => text[head..].find('\n').map_or(text.len(), |at| head + at),
         Motion::DocStart => 0,
         Motion::DocEnd => text.len(),
+        Motion::Line(n) => {
+            // Line numbers are 1-based; go to the start of line n (column 0)
+            // consistent with the delivered line-start motion
+            let line_num = n.saturating_sub(1) as usize; // Convert to 0-based
+            text.lines()
+                .nth(line_num)
+                .map_or(text.len(), |_| {
+                    // Calculate byte offset by summing lengths of previous lines + newlines
+                    text.lines()
+                        .take(line_num)
+                        .map(|line| line.len() + 1) // +1 for newline
+                        .sum()
+                })
+                .min(text.len())
+        }
         Motion::LineUp | Motion::LineDown | Motion::PageUp | Motion::PageDown => {
             unreachable!("visual motions take caller-supplied targets and never reach head_target")
         }
@@ -259,6 +291,33 @@ mod tests {
         assert_eq!(moved.primary().head(), 0);
         let moved = apply(text, &set_of(text, 3), Motion::DocEnd, false, None).unwrap();
         assert_eq!(moved.primary().head(), 5);
+    }
+
+    // FEUX-0004 X03: Line motion tests
+    #[test]
+    fn line_motion_goes_to_start_of_line() {
+        let text = "line1\nline2\nline3";
+        // Go to line 1 (1-based)
+        let moved = apply(text, &set_of(text, 10), Motion::Line(1), false, None).unwrap();
+        assert_eq!(moved.primary().head(), 0);
+        // Go to line 2
+        let moved = apply(text, &set_of(text, 0), Motion::Line(2), false, None).unwrap();
+        assert_eq!(moved.primary().head(), 6); // "line1\n" = 6 bytes
+        // Go to line 3
+        let moved = apply(text, &set_of(text, 0), Motion::Line(3), false, None).unwrap();
+        assert_eq!(moved.primary().head(), 12); // "line1\nline2\n" = 12 bytes
+    }
+
+    #[test]
+    fn line_motion_handles_edge_cases() {
+        let text = "single";
+        // Line 1 in a single-line document
+        let moved = apply(text, &set_of(text, 3), Motion::Line(1), false, None).unwrap();
+        assert_eq!(moved.primary().head(), 0);
+        // Empty document
+        let text = "";
+        let moved = apply(text, &set_of(text, 0), Motion::Line(1), false, None).unwrap();
+        assert_eq!(moved.primary().head(), 0);
     }
 
     #[test]

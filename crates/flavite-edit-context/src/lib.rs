@@ -21,8 +21,8 @@ pub use key::{KeyCode, Modifiers, Motion};
 pub use keymap::{BindingId, BindingToken, ContextKeymap, KeymapError, Slot};
 pub use labels::Layout;
 pub use session::{
-    AwaitChar, BURST_MIN_ACTIVATIONS, BURST_MIN_MUTATING, BURST_SUPPRESS_MS, BURST_WINDOW_MS,
-    ContextState, Effect, EscapeOutcome, Event, reduce,
+    AwaitArgs, BURST_MIN_ACTIVATIONS, BURST_MIN_MUTATING, BURST_SUPPRESS_MS,
+    BURST_WINDOW_MS, ContextState, Effect, EscapeOutcome, Event, PendingCommand, reduce,
 };
 pub use text::{clamp_grapheme_boundary, selected_characters, word_bounds};
 pub use vocabulary::{ContextCommand, ContextMenu, ContextMode};

@@ -119,6 +119,13 @@ pub enum ContextCommand {
     LinesMoveUp,
     /// Move each selection's containing line block down by one position.
     LinesMoveDown,
+    // FEUX-0004 X04: Surround family
+    /// Add surrounding delimiters to each selection.
+    SurroundAdd,
+    /// Change surrounding delimiters of each selection.
+    SurroundChange,
+    /// Delete surrounding delimiters from each selection.
+    SurroundDelete,
 }
 
 impl ContextCommand {
@@ -182,6 +189,10 @@ impl ContextCommand {
         Self::LinesShuffle,
         Self::LinesMoveUp,
         Self::LinesMoveDown,
+        // FEUX-0004 X04: Surround family
+        Self::SurroundAdd,
+        Self::SurroundChange,
+        Self::SurroundDelete,
     ];
 
     #[must_use]
@@ -249,6 +260,10 @@ impl ContextCommand {
             Self::LinesShuffle => "editor.lines_shuffle",
             Self::LinesMoveUp => "editor.lines_move_up",
             Self::LinesMoveDown => "editor.lines_move_down",
+            // FEUX-0004 X04: Surround family
+            Self::SurroundAdd => "editor.surround_add",
+            Self::SurroundChange => "editor.surround_change",
+            Self::SurroundDelete => "editor.surround_delete",
         }
     }
 
@@ -316,6 +331,10 @@ impl ContextCommand {
             Self::LinesShuffle => "Shuffle lines",
             Self::LinesMoveUp => "Move lines up",
             Self::LinesMoveDown => "Move lines down",
+            // FEUX-0004 X04: Surround family
+            Self::SurroundAdd => "Surround add",
+            Self::SurroundChange => "Surround change",
+            Self::SurroundDelete => "Surround delete",
         }
     }
 
@@ -352,6 +371,10 @@ impl ContextCommand {
                 | Self::LinesShuffle
                 | Self::LinesMoveUp
                 | Self::LinesMoveDown
+                // FEUX-0004 X04: Surround family - all mutate
+                | Self::SurroundAdd
+                | Self::SurroundChange
+                | Self::SurroundDelete
         )
     }
 
@@ -379,6 +402,8 @@ pub enum ContextMenu {
     // FEUX-0004 X01: new menus
     Transform,
     Lines,
+    // FEUX-0004 X04: Surround menu
+    Surround,
 }
 
 impl ContextMenu {
@@ -390,6 +415,7 @@ impl ContextMenu {
             Self::More => "More",
             Self::Transform => "Transform",
             Self::Lines => "Lines",
+            Self::Surround => "Surround",
         }
     }
 
@@ -479,6 +505,12 @@ impl ContextMenu {
                 C::LinesMoveUp,
                 C::LinesMoveDown,
                 C::LinesAlign,
+            ],
+            // FEUX-0004 X04: Surround menu (E-2)
+            Self::Surround => &[
+                C::SurroundAdd,
+                C::SurroundChange,
+                C::SurroundDelete,
             ],
         }
     }

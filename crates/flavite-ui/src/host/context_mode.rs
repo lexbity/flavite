@@ -4,7 +4,8 @@ use crate::app::{App, Message};
 use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, Origin};
 use flavite_edit_context::{
-    BindingId, ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, reduce,
+    BindingId, ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, PendingCommand,
+    reduce,
 };
 use flavite_editor::{
     context::{native_code, native_modifiers},
@@ -256,7 +257,7 @@ pub fn preview_command(app: &App, tab: TabId) -> Option<ContextCommand> {
     // §5.4.1: while `AwaitChar` captures, the state row shows the capture
     // hint — the Command-mode default preview (Delete) must not paint over
     // it, and the next key resolves find-char, not a delete.
-    if session.state.await_char().is_some() {
+    if session.state.await_args().is_some() {
         return None;
     }
     let target = EditorTarget::capture(app, tab)?;
@@ -608,15 +609,15 @@ pub fn native_key(
     }
     let mode = app.context_mode.mode(target.tab);
     if mode.active() {
-        // AwaitChar capture (FEUX-0002 E-8, §5.4.1): the first event with
-        // produced text resolves the find-char; Esc cancels through the
-        // session's escape pop; menu keys cancel then process; Dead and
-        // modifier-only events are never published here at all.
+        // AwaitArgs capture (FEUX-0004 E-6, supersedes FEUX-0002 E-8, §5.4.1):
+        // the first event with produced text resolves one argument; Esc cancels
+        // through the session's escape pop; menu keys cancel then process;
+        // Dead and modifier-only events are never published here at all.
         if let Some(request) = app
             .context_mode
             .session
             .as_ref()
-            .and_then(|s| s.state.await_char())
+            .and_then(|s| s.state.await_args())
         {
             let produced = key
                 .input
@@ -626,26 +627,54 @@ pub fn native_key(
                 .filter(|_| !key.input.text.is_empty())
                 .filter(|_| !key.input.text.chars().nth(1).is_some());
             if let Some(produced) = produced {
-                let extend = key.modifiers.shift;
+                // Collect this argument and potentially dispatch
                 if let Some(s) = &mut app.context_mode.session {
-                    s.state.end_await_char();
-                    // The capture hint must not outlive the capture: the
-                    // resolved command names the outcome (§5.4.1).
-                    s.state.admit_run(ContextCommand::FindChar {
-                        forward: request.forward,
-                    });
+                    // Use the new collect_char method to add the char and potentially complete
+                    if let Some(collected) = s.state.collect_char(produced) {
+                        // All arguments collected - dispatch based on the command
+                        match request.command {
+                            PendingCommand::FindChar { forward } => {
+                                s.state.admit_run(ContextCommand::FindChar { forward });
+                            }
+                            PendingCommand::SurroundAdd if collected.len() == 1 => {
+                                return kernel_task(
+                                    app,
+                                    &target,
+                                    "editor.surround_add",
+                                    serde_json::json!({ "char": collected[0].to_string() }),
+                                    "Surround add was refused; source changed",
+                                );
+                            }
+                            PendingCommand::SurroundDelete if collected.len() == 1 => {
+                                return kernel_task(
+                                    app,
+                                    &target,
+                                    "editor.surround_delete",
+                                    serde_json::json!({ "char": collected[0].to_string() }),
+                                    "Surround delete was refused; source changed",
+                                );
+                            }
+                            PendingCommand::SurroundChange if collected.len() == 2 => {
+                                return kernel_task(
+                                    app,
+                                    &target,
+                                    "editor.surround_change",
+                                    serde_json::json!({ 
+                                        "old_char": collected[0].to_string(),
+                                        "new_char": collected[1].to_string()
+                                    }),
+                                    "Surround change was refused; source changed",
+                                );
+                            }
+                            _ => {
+                                // Should not happen - argument count mismatch
+                                s.state.cancel_await_args();
+                            }
+                        }
+                    }
+                    // If collect_char returned None, we advanced to next arg and don't need to do anything
                 }
-                let extra = serde_json::json!({
-                    "direction": if request.forward { "fwd" } else { "back" },
-                    "char": produced.to_string(),
-                    "extend": extend,
-                });
-                let installed = selections_only(app, &target, "editor.find_char", extra);
-                return if installed.is_some() {
-                    focus(app, target.tab)
-                } else {
-                    Task::none()
-                };
+                return Task::none();
             }
             // A menu key cancels the capture and processes the menu; every
             // other non-character key is ignored (the capture stays).
@@ -661,7 +690,7 @@ pub fn native_key(
                 )
             {
                 if let Some(s) = &mut app.context_mode.session {
-                    s.state.end_await_char();
+                    s.state.cancel_await_args();
                 }
                 // Fall through to the delivered menu handling below.
             } else {
@@ -1436,6 +1465,27 @@ fn enter(app: &mut App, target: EditorTarget) {
     });
 }
 
+/// Enter AwaitArgs state for a command requiring character arguments (FEUX-0004 E-6).
+fn enter_await_args(app: &mut App, target: EditorTarget, pending: PendingCommand) {
+    use flavite_edit_context::session::AwaitArgs;
+    // Ensure we have an active session
+    if app.context_mode.session.is_none() {
+        enter(app, target.clone());
+    }
+    let (now_ms, burst_enabled) = chart_inputs(app);
+    let session = app.context_mode.session.as_mut().unwrap();
+    // Close any open menu
+    session.state.close_menu();
+    // Start awaiting the first argument based on the pending command
+    let args = match pending {
+        PendingCommand::FindChar { forward } => AwaitArgs::find_char(forward),
+        PendingCommand::SurroundAdd => AwaitArgs::surround_add(),
+        PendingCommand::SurroundChange => AwaitArgs::surround_change(),
+        PendingCommand::SurroundDelete => AwaitArgs::surround_delete(),
+    };
+    let _ = reduce(&mut session.state, &Event::EnterAwaitArgs(args), now_ms, burst_enabled);
+}
+
 fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Message> {
     use ContextCommand::*;
     app.context_mode.preview = None;
@@ -1690,7 +1740,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             if let Some(s) = &mut app.context_mode.session {
                 let _ = reduce(
                     &mut s.state,
-                    &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward }),
+                    &Event::EnterAwaitArgs(flavite_edit_context::session::AwaitArgs::find_char(forward)),
                     now_ms,
                     burst_enabled,
                 );
@@ -1929,9 +1979,24 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         }
         GotoLine => {
             // GotoLine requires a line number argument - open draft host
-            // For X03, use a placeholder max line count
-            // The actual line count will be validated when Apply is pressed
-            super::command_args::open_goto_line(app, target.clone(), 999_999);
+            // Fetches the actual line count from the target (FEUX-0004 E-12)
+            super::command_args::open_goto_line(app, target.clone());
+            iced::Task::none()
+        }
+        // FEUX-0004 X04: Surround family (E-6: AwaitArgs)
+        SurroundAdd => {
+            // SurroundAdd requires a single character argument - enter AwaitArgs
+            enter_await_args(app, target.clone(), PendingCommand::SurroundAdd);
+            iced::Task::none()
+        }
+        SurroundDelete => {
+            // SurroundDelete requires a single character argument - enter AwaitArgs
+            enter_await_args(app, target.clone(), PendingCommand::SurroundDelete);
+            iced::Task::none()
+        }
+        SurroundChange => {
+            // SurroundChange requires two character arguments - enter AwaitArgs
+            enter_await_args(app, target.clone(), PendingCommand::SurroundChange);
             iced::Task::none()
         }
         Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History

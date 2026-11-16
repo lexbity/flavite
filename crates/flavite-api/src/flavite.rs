@@ -1505,6 +1505,24 @@ impl Flavite {
                 crate::editor_commands::handle_goto_line,
             ),
             (
+                "editor.surround_add",
+                "Surround add",
+                ArgSchema::typed::<crate::editor_commands::EditorSurroundAddArgs>(),
+                crate::editor_commands::handle_surround_add,
+            ),
+            (
+                "editor.surround_delete",
+                "Surround delete",
+                ArgSchema::typed::<crate::editor_commands::EditorSurroundDeleteArgs>(),
+                crate::editor_commands::handle_surround_delete,
+            ),
+            (
+                "editor.surround_change",
+                "Surround change",
+                ArgSchema::typed::<crate::editor_commands::EditorSurroundChangeArgs>(),
+                crate::editor_commands::handle_surround_change,
+            ),
+            (
                 "buffer.history_page",
                 "List editing history",
                 ArgSchema::typed::<EditingHistoryArgs>(),

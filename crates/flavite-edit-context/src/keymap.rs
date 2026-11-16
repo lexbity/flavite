@@ -69,6 +69,7 @@ impl BindingId {
                 ContextMenu::More => "editor.menu_more",
                 ContextMenu::Transform => "editor.menu_transform",
                 ContextMenu::Lines => "editor.menu_lines",
+                ContextMenu::Surround => "editor.menu_surround",
             },
         }
     }
@@ -99,6 +100,7 @@ impl BindingId {
             "editor.menu_more" => Some(BindingId::MenuOpener(ContextMenu::More)),
             "editor.menu_transform" => Some(BindingId::MenuOpener(ContextMenu::Transform)),
             "editor.menu_lines" => Some(BindingId::MenuOpener(ContextMenu::Lines)),
+            "editor.menu_surround" => Some(BindingId::MenuOpener(ContextMenu::Surround)),
             _ => None,
         }
     }
@@ -618,6 +620,11 @@ pub const DEFAULT_ROOT: &[(BindingId, Slot)] = &[
         BindingId::MenuOpener(ContextMenu::Lines),
         Slot::shifted(KeyCode::KeyT),
     ),
+    // FEUX-0004 X04: Surround menu opener
+    (
+        BindingId::MenuOpener(ContextMenu::Surround),
+        Slot::bare(KeyCode::KeyZ),
+    ),
     // Motions (14 entries: 7 bare + 7 shifted, matching grammar::motion_key exactly)
     // Note: grammar::motion_key ignores shift, so we include both variants for equivalence
     (
@@ -805,6 +812,22 @@ pub const DEFAULT_MENUS: &[(ContextMenu, BindingId, KeyCode)] = &[
         BindingId::Command(ContextCommand::LinesAlign),
         KeyCode::KeyA,
     ),
+    // FEUX-0004 X04: Surround menu accelerators (E-2)
+    (
+        ContextMenu::Surround,
+        BindingId::Command(ContextCommand::SurroundAdd),
+        KeyCode::KeyA,
+    ),
+    (
+        ContextMenu::Surround,
+        BindingId::Command(ContextCommand::SurroundChange),
+        KeyCode::KeyC,
+    ),
+    (
+        ContextMenu::Surround,
+        BindingId::Command(ContextCommand::SurroundDelete),
+        KeyCode::KeyD,
+    ),
 ];
 
 #[cfg(test)]
@@ -818,7 +841,8 @@ mod tests {
         // FEUX-0004 X01: 20 command-key entries (18 commands + 2 find_char) + 14 motions (7 bare + 7 shifted) = 34 total
         // Plus 4 menu openers (V, G, T, Shift+T) = 38 total (E-3: shifted menu openers allowed)
         // FEUX-0004 X03: +1 binding (Shift+G for goto-line) = 39 total
-        assert_eq!(DEFAULT_ROOT.len(), 39); // 20 commands + 14 motions + 4 menu openers + 1 (goto-line) = 39
+        // FEUX-0004 X04: +1 binding (Z for surround) = 40 total
+        assert_eq!(DEFAULT_ROOT.len(), 40); // 20 commands + 14 motions + 5 menu openers + 1 (goto-line) = 40
 
         // Spot-check a few key bindings
         let has_insert_start = DEFAULT_ROOT.iter().any(|(bid, slot)| {
@@ -875,6 +899,12 @@ mod tests {
             bid.id() == "editor.menu_lines" && slot.position == KeyCode::KeyT && slot.shift
         });
         assert!(has_menu_lines, "menu_lines should map to Shift+KeyT");
+
+        // FEUX-0004 X04: Surround menu opener
+        let has_menu_surround = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_surround" && slot.position == KeyCode::KeyZ && !slot.shift
+        });
+        assert!(has_menu_surround, "menu_surround should map to bare KeyZ");
     }
 
     #[test]
@@ -927,6 +957,16 @@ mod tests {
                 Some(BindingId::MenuOpener(ContextMenu::Lines))
             ),
             "Shift+KeyT should map to MenuOpener(Lines)"
+        );
+
+        // FEUX-0004 X04: Surround menu opener
+        let z_slot = Slot::bare(KeyCode::KeyZ);
+        assert!(
+            matches!(
+                keymap.lookup_root(z_slot),
+                Some(BindingId::MenuOpener(ContextMenu::Surround))
+            ),
+            "KeyZ should map to MenuOpener(Surround)"
         );
 
         // Verify FindChar directions
