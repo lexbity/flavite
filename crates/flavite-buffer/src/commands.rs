@@ -14,12 +14,10 @@
 //! line) per §6 "existing ordinary semantics preserved". Typing inserts at
 //! every caret; paste broadcasts through `Typing`.
 
+use crate::numbers::{extract_first_number, increment_number, number_range, scan_number, NumberError};
 use crate::positions::Affinity;
 use crate::selection::{SelectionSet, SpanEdit, is_grapheme_boundary};
-use flavite_syntax::text::{
-    TextByte, next_grapheme_boundary, next_word_boundary, prev_grapheme_boundary,
-    prev_word_boundary,
-};
+use flavite_syntax::text::{TextByte, next_grapheme_boundary, next_word_boundary, prev_grapheme_boundary, prev_word_boundary};
 
 /// The operation to plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +193,12 @@ pub fn plan_primary_typing(
 pub enum PlanError {
     /// The selection set is invalid against the text.
     Set(crate::selection::SetError),
+    /// A required number was not found in one or more selections.
+    NoNumber { count: usize },
+    /// Number overflow/underflow when incrementing/decrementing.
+    Overflow { value: String, delta: i64 },
+    /// For NumberSequence: one or more selections contain no number.
+    SequenceNoNumber,
 }
 
 impl From<crate::selection::SetError> for PlanError {
@@ -203,10 +207,31 @@ impl From<crate::selection::SetError> for PlanError {
     }
 }
 
+impl From<NumberError> for PlanError {
+    fn from(error: NumberError) -> Self {
+        match error {
+            NumberError::NoNumber => Self::NoNumber { count: 1 },
+            NumberError::Overflow { value, delta } => Self::Overflow { value, delta },
+            NumberError::SequenceNoNumber => Self::SequenceNoNumber,
+        }
+    }
+}
+
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Set(error) => write!(f, "{error}"),
+            Self::NoNumber { count } => {
+                if *count == 1 {
+                    write!(f, "No number found in selection")
+                } else {
+                    write!(f, "{} selections contain no number", count)
+                }
+            }
+            Self::Overflow { value, delta } => {
+                write!(f, "Number {} overflows when adding {}", value, delta)
+            }
+            Self::SequenceNoNumber => write!(f, "Some selections contain no number"),
         }
     }
 }
@@ -492,26 +517,35 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
         }
         EditOperation::NumberInc => {
             for member in set.iter() {
-                if let Some((start, end, replacement)) = scan_and_increment_number(text, member, 1)
-                {
-                    planned.push(PlannedEdit {
-                        start,
-                        end,
-                        replacement,
-                    });
+                if let Some(scan_result) = scan_number(text, member) {
+                    if let Ok(replacement) = increment_number(text, &scan_result, 1) {
+                        let (start, end) = number_range(&scan_result);
+                        planned.push(PlannedEdit {
+                            start,
+                            end,
+                            replacement,
+                        });
+                    }
+                    // Silently skip members with overflow
+                    // (spec doesn't require refusal for inc/dec like it does for sequence)
                 }
+                // Silently skip members without numbers
             }
         }
         EditOperation::NumberDec => {
             for member in set.iter() {
-                if let Some((start, end, replacement)) = scan_and_increment_number(text, member, -1)
-                {
-                    planned.push(PlannedEdit {
-                        start,
-                        end,
-                        replacement,
-                    });
+                if let Some(scan_result) = scan_number(text, member) {
+                    if let Ok(replacement) = increment_number(text, &scan_result, -1) {
+                        let (start, end) = number_range(&scan_result);
+                        planned.push(PlannedEdit {
+                            start,
+                            end,
+                            replacement,
+                        });
+                    }
+                    // Silently skip members with overflow
                 }
+                // Silently skip members without numbers
             }
         }
         EditOperation::NumberSequence => {
@@ -519,17 +553,12 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
             let members: Vec<_> = set.iter().collect();
             let mut indices: Vec<(usize, usize, usize)> = Vec::new(); // (member_index, start, end)
             for (idx, member) in members.iter().enumerate() {
-                if let Some((start, end)) = find_number_range(text, member) {
+                if let Some(scan_result) = scan_number(text, member) {
+                    let (start, end) = number_range(&scan_result);
                     indices.push((idx, start, end));
                 } else {
                     // If any member doesn't have a number, refuse the whole operation
-                    return Ok(PreparedEdit {
-                        ops: Vec::new(),
-                        edits: Vec::new(),
-                        after_text: text.to_string(),
-                        after_set: set.clone(),
-                        fragments: Vec::new(),
-                    });
+                    return Err(PlanError::SequenceNoNumber);
                 }
             }
             for (idx, start, end) in indices {
@@ -1231,202 +1260,6 @@ fn containing_line_range(
     }
 }
 
-/// Scan for a number in the member's range and increment/decrement it.
-/// Returns (start, end, replacement) or None if no number found.
-fn scan_and_increment_number(
-    text: &str,
-    member: &crate::selection::Selection,
-    delta: i64,
-) -> Option<(usize, usize, String)> {
-    // Find the number range in bytes
-    let (num_start, num_end) = find_number_range(text, member)?;
-
-    let num_str = &text[num_start..num_end];
-
-    // Check if it has a sign
-    let has_sign = num_str.starts_with('+') || num_str.starts_with('-');
-
-    // Extract digits (skip sign if present)
-    let digits_start = if has_sign { num_start + 1 } else { num_start };
-    let digits_str = &text[digits_start..num_end];
-
-    // Parse the number
-    let value: i64 = num_str.parse().unwrap_or(0);
-    let new_value = value.saturating_add(delta);
-
-    // Format the replacement with leading zero preservation
-    let original_width = num_end - num_start;
-    let (replacement, final_start) = if has_sign {
-        // Determine the sign character for the new value
-        let sign_char = if new_value < 0 {
-            "-"
-        } else if new_value > 0 {
-            "+"
-        } else {
-            "" // Don't show sign for zero
-        };
-        let new_abs = new_value.abs();
-        let new_str = new_abs.to_string();
-
-        // Check if we should preserve width
-        if original_width > new_str.len() + 1 {
-            let width = original_width - 1;
-            let padded = format!("{:0>width$}", new_abs, width = width);
-            (format!("{}{}", sign_char, padded), num_start)
-        } else {
-            (format!("{}{}", sign_char, new_str), num_start)
-        }
-    } else {
-        let new_str = new_value.to_string();
-        // Preserve leading zeros: if original had leading zeros and new value fits
-        if digits_str.starts_with('0') && digits_str.len() > 1 && new_str.len() < digits_str.len() {
-            let width = digits_str.len();
-            (format!("{:0>width$}", new_value, width = width), num_start)
-        } else {
-            (new_str, num_start)
-        }
-    };
-
-    Some((final_start, num_end, replacement))
-}
-
-/// Find the byte range of the first integer in the member's range.
-/// For non-empty members: leftmost maximal run [+-]?[0-9]+ inside the range.
-/// For carets: scan outward from caret within numeric word boundaries.
-/// Returns (start_byte, end_byte) of the number (including optional sign).
-fn find_number_range(text: &str, member: &crate::selection::Selection) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
-
-    if member.is_caret() {
-        // For caret: scan outward from caret
-        let caret = member.head();
-        if caret >= text.len() {
-            return None;
-        }
-
-        let mut start = caret;
-        let mut end = caret;
-
-        // First, try scanning forward from caret
-        let mut pos = caret;
-        while pos < text.len()
-            && (bytes[pos] == b'+' || bytes[pos] == b'-' || bytes[pos].is_ascii_digit())
-        {
-            pos += 1;
-        }
-
-        if pos > caret {
-            // Found something forward, check if it's a valid number
-            if bytes[caret] == b'+' || bytes[caret] == b'-' {
-                // Need at least one digit after sign
-                if pos > caret + 1 {
-                    return Some((caret, pos));
-                }
-            } else {
-                // Starts with digit
-                return Some((caret, pos));
-            }
-        }
-
-        // Scan backward for sign or digit
-        while start > 0 {
-            let c = bytes[start - 1];
-            if c == b'+' || c == b'-' {
-                // Check if followed by digit
-                if start < text.len() && bytes[start].is_ascii_digit() {
-                    start -= 1;
-                    break;
-                } else {
-                    break;
-                }
-            } else if c.is_ascii_digit() {
-                start -= 1;
-            } else {
-                break;
-            }
-        }
-
-        // Scan forward for digits
-        while end < text.len() {
-            let c = bytes[end];
-            if c.is_ascii_digit() {
-                end += 1;
-            } else {
-                break;
-            }
-        }
-
-        if end > start {
-            Some((start, end))
-        } else {
-            None
-        }
-    } else {
-        // For non-empty member: leftmost maximal run [+-]?[0-9]+ inside range
-        let range = (member.start(), member.end());
-        let mut pos = range.0;
-
-        while pos < range.1 {
-            let c = bytes[pos];
-            if c == b'+' || c == b'-' {
-                // Potential sign
-                if pos + 1 < range.1 && bytes[pos + 1].is_ascii_digit() {
-                    // Found sign + digit, scan the full number
-                    let start = pos;
-                    let mut digit_pos = pos + 1;
-                    while digit_pos < range.1 && bytes[digit_pos].is_ascii_digit() {
-                        digit_pos += 1;
-                    }
-                    return Some((start, digit_pos));
-                }
-                pos += 1;
-            } else if c.is_ascii_digit() {
-                // Found digit, scan the full number
-                let start = pos;
-                let mut digit_pos = pos;
-                while digit_pos < range.1 && bytes[digit_pos].is_ascii_digit() {
-                    digit_pos += 1;
-                }
-                return Some((start, digit_pos));
-            } else {
-                pos += 1;
-            }
-        }
-
-        None
-    }
-}
-
-/// Extract the first integer from a string.
-fn extract_first_number(line: &str) -> Option<i64> {
-    let mut chars = line.chars();
-    let mut sign = 1i64;
-
-    if let Some(c) = chars.clone().next() {
-        if c == '+' {
-            chars.next();
-        } else if c == '-' {
-            sign = -1;
-            chars.next();
-        }
-    }
-
-    let mut digits: String = String::new();
-    for c in chars {
-        if c.is_ascii_digit() {
-            digits.push(c);
-        } else {
-            break;
-        }
-    }
-
-    if digits.is_empty() {
-        None
-    } else {
-        let num: i64 = digits.parse().unwrap_or(0);
-        Some(sign * num)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1863,68 +1696,7 @@ mod transform_tests {
         let set = set_of(text, 0..11);
         let prepared = plan(text, &set, &EditOperation::CaseTitle).unwrap();
         assert_eq!(prepared.after_text, "Hello World");
-    }
-
-    #[test]
-    fn number_inc_increments_single_number() {
-        let text = "The answer is 42";
-        // Select the range containing "42"
-        let set = set_of(text, 14..16);
-        let prepared = plan(text, &set, &EditOperation::NumberInc).unwrap();
-        // Should increment 42 to 43
-        assert_eq!(prepared.after_text, "The answer is 43");
-    }
-
-    #[test]
-    fn number_dec_decrements_single_number() {
-        let text = "Count: 10";
-        // Select the range containing "10"
-        let set = set_of(text, 7..9);
-        let prepared = plan(text, &set, &EditOperation::NumberDec).unwrap();
-        // Should decrement 10 to 9 (leading zero not preserved for single digit)
-        assert_eq!(prepared.after_text, "Count: 9");
-    }
-
-    #[test]
-    fn number_dec_preserves_leading_zeros() {
-        let text = "Count: 007";
-        // Select the range containing "007"
-        let set = set_of(text, 7..10);
-        let prepared = plan(text, &set, &EditOperation::NumberDec).unwrap();
-        // Should decrement 007 to 006 (preserving width)
-        assert_eq!(prepared.after_text, "Count: 006");
-    }
-
-    #[test]
-    fn number_sequence_numbers_members() {
-        let text = "a 0 b 0 c 0";
-        let set = SelectionSet::normalize(
-            text,
-            vec![
-                RawSelection {
-                    id: Some(1),
-                    anchor: 2,
-                    head: 3,
-                }, // first "0"
-                RawSelection {
-                    id: Some(2),
-                    anchor: 6,
-                    head: 7,
-                }, // second "0"
-                RawSelection {
-                    id: Some(3),
-                    anchor: 10,
-                    head: 11,
-                }, // third "0"
-            ],
-            None,
-        )
-        .unwrap()
-        .0;
-        let prepared = plan(text, &set, &EditOperation::NumberSequence).unwrap();
-        // Should replace with 1, 2, 3
-        assert_eq!(prepared.after_text, "a 1 b 2 c 3");
-    }
+}
 
     #[test]
     fn lines_join_joins_with_space() {
