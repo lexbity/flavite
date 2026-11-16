@@ -724,31 +724,49 @@ pub struct Flavite {
 /// [`Flavite::open_root`] production path). The graph service's wake loop
 /// consumes it; a `None` watch falls back to control-channel + sweep wakes
 /// (headless fixtures, CLI pools).
+///
+/// `vault_fs` lets hermetic fixtures back every vault-rooted store with an
+/// in-memory filesystem and skip OS migrations against virtual roots.
 fn attach_services(
     uuid: uuid::Uuid,
     root: &std::path::Path,
     session: &Arc<Session>,
     index_watch: Option<Arc<flavite_index::GenerationWatch>>,
     data_dir: Option<&std::path::Path>,
+    vault_fs: Option<flavite_fs::MemFs>,
 ) -> (
     flavite_vault::user_state::VaultUserStateStore,
     Arc<crate::graph_service::GraphService>,
     crate::settings_store::SettingsStore,
 ) {
-    let vault_user_state = flavite_vault::user_state::VaultUserStateStore::new(
-        Box::new(flavite_fs::OsFs::new()),
-        root,
-    );
+    let (vault_user_state, settings_vault_store): (
+        flavite_vault::user_state::VaultUserStateStore,
+        Arc<flavite_vault::user_state::VaultUserStateStore>,
+    ) = if let Some(fs) = vault_fs.clone() {
+        (
+            flavite_vault::user_state::VaultUserStateStore::new(Box::new(fs.clone()), root),
+            Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
+                Box::new(fs),
+                root,
+            )),
+        )
+    } else {
+        (
+            flavite_vault::user_state::VaultUserStateStore::new(
+                Box::new(flavite_fs::OsFs::new()),
+                root,
+            ),
+            Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
+                Box::new(flavite_fs::OsFs::new()),
+                root,
+            )),
+        )
+    };
     let graph = crate::graph_service::GraphService::start_with_index_watch(
         crate::doctor::cache_db_path(uuid),
         Some(Arc::clone(session)),
         index_watch,
     );
-    // Create a separate store instance for settings (shared fs not needed - same paths)
-    let settings_vault_store = Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
-        Box::new(flavite_fs::OsFs::new()),
-        root,
-    ));
     let settings_store =
         crate::settings_store::SettingsStore::new(settings_vault_store.clone(), true);
     // Initialize settings store with migration from legacy stores
@@ -760,73 +778,78 @@ fn attach_services(
         .load_or_migrate(&registry, root, data_dir, &vault_uuid)
         .map_err(|e| eprintln!("Failed to load or migrate settings: {}", e));
 
-    // Migrate workspace-layouts.json from device store to vault (RFC-0007 S4)
-    if let Some(data_dir) = data_dir {
-        let device_layout_path = data_dir
-            .join("flavite")
-            .join("workspace")
-            .join(&vault_uuid)
-            .join("workspace-layouts.json");
-        let vault_layout_path = root.join(".flavite").join("workspace-layouts.json");
+    // OS-backed vaults migrate legacy device-local layout/theme state into
+    // the vault root on disk. Hermetic fixtures own virtual roots and must
+    // not touch the real filesystem.
+    if vault_fs.is_none() {
+        // Migrate workspace-layouts.json from device store to vault (RFC-0007 S4)
+        if let Some(data_dir) = data_dir {
+            let device_layout_path = data_dir
+                .join("flavite")
+                .join("workspace")
+                .join(&vault_uuid)
+                .join("workspace-layouts.json");
+            let vault_layout_path = root.join(".flavite").join("workspace-layouts.json");
 
-        // Only copy if vault version doesn't exist yet
-        if device_layout_path.exists()
-            && !vault_layout_path.exists()
-            && std::fs::create_dir_all(vault_layout_path.parent().unwrap()).is_ok()
-            && std::fs::read(&device_layout_path)
-                .is_ok_and(|bytes| std::fs::write(&vault_layout_path, &bytes).is_ok())
-        {
-            eprintln!(
-                "Migrated workspace layout from {} to {}",
-                device_layout_path.display(),
-                vault_layout_path.display()
-            );
-        }
-    }
-
-    // Migrate themes from device store to vault (RFC-0007 S5)
-    if let Some(data_dir) = data_dir {
-        let device_themes_root = data_dir.join("flavite").join("themes");
-        let vault_themes_root = root.join(".flavite").join("themes");
-
-        if device_themes_root.exists()
-            && !vault_themes_root.exists()
-            && let Ok(entries) = std::fs::read_dir(&device_themes_root)
-            && std::fs::create_dir_all(&vault_themes_root).is_ok()
-        {
-            let mut copied = 0;
-            for entry in entries.flatten() {
-                if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-                    continue;
-                }
-                let theme_dir_name = entry.file_name();
-                let src_dir = device_themes_root.join(&theme_dir_name);
-                let dst_dir = vault_themes_root.join(&theme_dir_name);
-
-                // Skip if already exists in vault
-                if dst_dir.exists() {
-                    continue;
-                }
-
-                // Copy theme files
-                for file_name in ["theme.flavite.xpi", "theme.json"] {
-                    let src_file = src_dir.join(file_name);
-                    let dst_file = dst_dir.join(file_name);
-                    if src_file.exists()
-                        && let Ok(bytes) = std::fs::read(&src_file)
-                        && std::fs::create_dir_all(&dst_dir).is_ok()
-                    {
-                        let _ = std::fs::write(&dst_file, &bytes);
-                    }
-                }
-                copied += 1;
-            }
-            if copied > 0 {
+            // Only copy if vault version doesn't exist yet
+            if device_layout_path.exists()
+                && !vault_layout_path.exists()
+                && std::fs::create_dir_all(vault_layout_path.parent().unwrap()).is_ok()
+                && std::fs::read(&device_layout_path)
+                    .is_ok_and(|bytes| std::fs::write(&vault_layout_path, &bytes).is_ok())
+            {
                 eprintln!(
-                    "Migrated {copied} theme(s) from {} to {}",
-                    device_themes_root.display(),
-                    vault_themes_root.display()
+                    "Migrated workspace layout from {} to {}",
+                    device_layout_path.display(),
+                    vault_layout_path.display()
                 );
+            }
+        }
+
+        // Migrate themes from device store to vault (RFC-0007 S5)
+        if let Some(data_dir) = data_dir {
+            let device_themes_root = data_dir.join("flavite").join("themes");
+            let vault_themes_root = root.join(".flavite").join("themes");
+
+            if device_themes_root.exists()
+                && !vault_themes_root.exists()
+                && let Ok(entries) = std::fs::read_dir(&device_themes_root)
+                && std::fs::create_dir_all(&vault_themes_root).is_ok()
+            {
+                let mut copied = 0;
+                for entry in entries.flatten() {
+                    if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                        continue;
+                    }
+                    let theme_dir_name = entry.file_name();
+                    let src_dir = device_themes_root.join(&theme_dir_name);
+                    let dst_dir = vault_themes_root.join(&theme_dir_name);
+
+                    // Skip if already exists in vault
+                    if dst_dir.exists() {
+                        continue;
+                    }
+
+                    // Copy theme files
+                    for file_name in ["theme.flavite.xpi", "theme.json"] {
+                        let src_file = src_dir.join(file_name);
+                        let dst_file = dst_dir.join(file_name);
+                        if src_file.exists()
+                            && let Ok(bytes) = std::fs::read(&src_file)
+                            && std::fs::create_dir_all(&dst_dir).is_ok()
+                        {
+                            let _ = std::fs::write(&dst_file, &bytes);
+                        }
+                    }
+                    copied += 1;
+                }
+                if copied > 0 {
+                    eprintln!(
+                        "Migrated {copied} theme(s) from {} to {}",
+                        device_themes_root.display(),
+                        vault_themes_root.display()
+                    );
+                }
             }
         }
     }
@@ -846,16 +869,60 @@ impl Flavite {
         index_watch: Option<Arc<flavite_index::GenerationWatch>>,
         data_dir: Option<&Path>,
     ) -> Result<Self, FlaviteError> {
+        Self::with_services_inner(uuid, root, session, index_watch, data_dir, None)
+    }
+
+    fn with_services_inner(
+        uuid: uuid::Uuid,
+        root: PathBuf,
+        session: Arc<Session>,
+        index_watch: Option<Arc<flavite_index::GenerationWatch>>,
+        data_dir: Option<&Path>,
+        vault_fs: Option<flavite_fs::MemFs>,
+    ) -> Result<Self, FlaviteError> {
         let vault_ref = ApiVaultRef::new(uuid, root.clone());
         let vault_uuid = vault_ref.uuid.to_string();
         let generation_watch = index_watch.clone();
-        let (vault_user_state, graph, settings_store) =
-            attach_services(vault_ref.uuid, &root, &session, index_watch, data_dir);
+        let (vault_user_state, graph, settings_store) = attach_services(
+            vault_ref.uuid,
+            &root,
+            &session,
+            index_watch,
+            data_dir,
+            vault_fs.clone(),
+        );
         let queries = crate::query_service::QueryService::new(
             Arc::clone(&session),
             uuid::Uuid::now_v7().as_u128(),
             Arc::clone(&graph),
         );
+        let user_state = if let Some(dir) = data_dir {
+            flavite_vault::user_state::UserStateStore::open_at(
+                Box::new(flavite_fs::OsFs::new()),
+                dir,
+                &vault_uuid,
+            )
+            .ok()
+        } else {
+            flavite_vault::user_state::UserStateStore::open(
+                Box::new(flavite_fs::OsFs::new()),
+                &vault_uuid,
+            )
+            .ok()
+        };
+        let profiles = crate::profiles::ProfilesStore::at_vault(
+            if let Some(fs) = vault_fs.clone() {
+                Box::new(fs)
+            } else {
+                Box::new(flavite_fs::OsFs::new())
+            },
+            &root,
+        );
+        let themes = Some(if let Some(fs) = vault_fs {
+            crate::themes::ThemeStore::at_vault(Box::new(fs), &root)
+        } else {
+            crate::themes::ThemeStore::at_vault(Box::new(flavite_fs::OsFs::new()), &root)
+        });
         let flavite = Self {
             session,
             command_registry: CommandRegistry::new(),
@@ -871,19 +938,9 @@ impl Flavite {
             read_only: false,
             owned_vault: None,
             queries,
-            user_state: flavite_vault::user_state::UserStateStore::open(
-                Box::new(flavite_fs::OsFs::new()),
-                &vault_uuid,
-            )
-            .ok(),
-            themes: Some(crate::themes::ThemeStore::at_vault(
-                Box::new(flavite_fs::OsFs::new()),
-                &root,
-            )),
-            profiles: crate::profiles::ProfilesStore::at_vault(
-                Box::new(flavite_fs::OsFs::new()),
-                &root,
-            ),
+            user_state,
+            themes,
+            profiles,
             vault_user_state,
             graph,
             settings_store,
@@ -898,6 +955,27 @@ impl Flavite {
         flavite.register_builtin_commands()?;
 
         Ok(flavite)
+    }
+
+    /// Test-only constructor for fixtures backed by an in-memory vault
+    /// filesystem. Vault-rooted stores use `vault_fs` so virtual roots never
+    /// touch the real filesystem during construction.
+    #[doc(hidden)]
+    pub fn open_for_test(
+        identity: VaultIdentity,
+        session: Session,
+        _config: VaultConfig,
+        data_dir: Option<&Path>,
+        vault_fs: flavite_fs::MemFs,
+    ) -> Result<Self, FlaviteError> {
+        Self::with_services_inner(
+            identity.uuid,
+            identity.root,
+            Arc::new(session),
+            None,
+            data_dir,
+            Some(vault_fs),
+        )
     }
 
     /// Open a vault and create a Flavite facade.

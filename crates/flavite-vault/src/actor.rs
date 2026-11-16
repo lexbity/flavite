@@ -1510,8 +1510,8 @@ impl VaultActor {
     /// runs to completion on the sole SQL-owner thread, so no generation
     /// commit can interleave between the worker's generation read and the
     /// ordered Capture(G) enqueue: the capture lands after envelope G and
-    /// before envelope G+1. The 50 ms handshake budget returns Busy; it
-    /// never includes Tantivy commit or evaluation.
+    /// before envelope G+1. The handshake budget (HANDSHAKE_TIMEOUT)
+    /// returns Busy; it never includes Tantivy commit or evaluation.
     fn search_capture_handshake(
         &mut self,
         establish: Sender<()>,

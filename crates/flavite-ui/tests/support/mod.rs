@@ -173,6 +173,7 @@ pub fn vault_stack(
         .start()
         .expect("start");
     let channels = ChannelSet::new();
+    let data_dir = cache.path().join("device");
     let session = Session::new_with_data_dir(
         identity.clone(),
         actor,
@@ -180,14 +181,16 @@ pub fn vault_stack(
         channels.pulse,
         channels.notice,
         VaultConfig::default(),
-        Some(cache.path().join("device")),
+        Some(data_dir.clone()),
     );
-    let mut flavite = Flavite::open(identity, session, VaultConfig::default()).expect("facade");
-    flavite.set_user_state_root_for_test(cache.path().join("device"));
-    // Vault-rooted stores (settings, themes, layout) live on the fixture's
-    // MemFs too: the vault identity root is a virtual path, and persistence
-    // through the vault must be exercised hermetically (RFC-0007).
-    flavite.set_vault_store_fs_for_test((*fs).clone());
+    let flavite = Flavite::open_for_test(
+        identity,
+        session,
+        VaultConfig::default(),
+        Some(&data_dir),
+        (*fs).clone(),
+    )
+    .expect("facade");
     (flavite, fs, cache)
 }
 
