@@ -964,12 +964,13 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                 if let Some(pair_match) = crate::pairs::find_enclosing_pair(
                     text,
                     member,
-                    &crate::pairs::Pair::from_open(open.chars().next().unwrap_or('('))
-                        .unwrap_or_else(|| crate::pairs::Pair {
+                    &crate::pairs::Pair::from_open(open.chars().next().unwrap_or('(')).unwrap_or(
+                        crate::pairs::Pair {
                             open: '(',
                             close: ')',
                             is_nesting: true,
-                        }),
+                        },
+                    ),
                 ) {
                     // Delete both delimiters - two separate edits
                     planned.push(PlannedEdit {
@@ -996,23 +997,21 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                 // Find the enclosing pair
                 if let Some(old_pair) =
                     crate::pairs::Pair::from_open(old_open.chars().next().unwrap_or('('))
-                {
-                    if let Some(pair_match) =
+                    && let Some(pair_match) =
                         crate::pairs::find_enclosing_pair(text, member, &old_pair)
-                    {
-                        // Replace old open with new open
-                        planned.push(PlannedEdit {
-                            start: pair_match.open_start,
-                            end: pair_match.open_end,
-                            replacement: new_open.clone(),
-                        });
-                        // Replace old close with new close
-                        planned.push(PlannedEdit {
-                            start: pair_match.close_start,
-                            end: pair_match.close_end,
-                            replacement: new_close.clone(),
-                        });
-                    }
+                {
+                    // Replace old open with new open
+                    planned.push(PlannedEdit {
+                        start: pair_match.open_start,
+                        end: pair_match.open_end,
+                        replacement: new_open.clone(),
+                    });
+                    // Replace old close with new close
+                    planned.push(PlannedEdit {
+                        start: pair_match.close_start,
+                        end: pair_match.close_end,
+                        replacement: new_close.clone(),
+                    });
                 }
             }
         }

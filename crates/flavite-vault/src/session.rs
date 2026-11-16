@@ -482,6 +482,12 @@ pub enum SessionCommand {
         request_id: u64,
         request: crate::text_select::SelectMatchesRequest,
     },
+    /// Keep-matching collection (FEUX-0006 E-4): filter selections to those
+    /// containing at least one match, read-only.
+    KeepMatching {
+        request_id: u64,
+        request: crate::text_select::KeepMatchingRequest,
+    },
     /// Cancel one pending match collection (E-11): the worker stops, the
     /// result is dropped, and no completion is recorded.
     TextCancel {
@@ -832,6 +838,14 @@ pub enum CommandResult {
         spans: Vec<(u64, u64)>,
         total_matches: u64,
         zero_width_count: u64,
+    },
+    /// A keep-matching collection completed (FEUX-0006 E-4): indices of
+    /// selections to keep and the total match count. Read-only.
+    KeepMatchingCollected {
+        buffer_id: BufferId,
+        revision: Revision,
+        selection_indices: Vec<usize>,
+        match_count: u64,
     },
     /// A pending match collection was cancelled (FEUX-0002 E-11): its
     /// outcome is dropped and no completion is recorded for it.
@@ -1257,6 +1271,8 @@ enum TextWork {
     /// Document-wide match collection for `editor.select_matches` /
     /// `editor.split_selection` (FEUX-0002 E-10).
     SelectMatches(crate::text_select::SelectMatchesRequest),
+    /// Keep-matching collection for `editor.keep_matching` (FEUX-0006 E-4).
+    KeepMatching(crate::text_select::KeepMatchingRequest),
 }
 
 /// One finished preparation awaiting registry installation or completion
@@ -1279,6 +1295,12 @@ enum TextOutcomeMessage {
         buffer_id: BufferId,
         revision: Revision,
         outcome: Result<crate::text_select::MatchCollectionOutcome, crate::text_edit::PrepareError>,
+    },
+    KeepMatching {
+        request_id: u64,
+        buffer_id: BufferId,
+        revision: Revision,
+        outcome: Result<crate::text_select::KeepMatchingOutcome, crate::text_edit::PrepareError>,
     },
     /// The job was cancelled before (or while) it ran; its outcome is
     /// dropped and no completion is recorded (E-11).
@@ -1782,6 +1804,18 @@ impl Session {
                                         buffer_id: request.buffer_id,
                                         revision: request.revision,
                                         outcome: crate::text_select::collect_matches(
+                                            &job.text,
+                                            &request,
+                                            &job.cancelled,
+                                        ),
+                                    }
+                                }
+                                TextWork::KeepMatching(request) => {
+                                    TextOutcomeMessage::KeepMatching {
+                                        request_id: job.request_id,
+                                        buffer_id: request.buffer_id,
+                                        revision: request.revision,
+                                        outcome: crate::text_select::collect_keep_matches(
                                             &job.text,
                                             &request,
                                             &job.cancelled,
@@ -2835,6 +2869,10 @@ impl Session {
                 request_id,
                 request,
             } => self.text_select_matches(request_id, request),
+            SessionCommand::KeepMatching {
+                request_id,
+                request,
+            } => self.text_keep_matching(request_id, request),
             SessionCommand::TextCancel { request_id } => self.text_cancel(request_id),
             SessionCommand::ApplyReplace {
                 buffer_id,
@@ -4190,6 +4228,51 @@ impl Session {
                         request_id,
                         text,
                         work: TextWork::SelectMatches(request),
+                        cancelled: cancelled.clone(),
+                    })
+                    .is_ok() =>
+            {
+                self.pending_text.lock_recovering().insert(request_id);
+                self.text_cancels
+                    .lock_recovering()
+                    .insert(request_id, cancelled);
+                SessionResult::Pending { request_id }
+            }
+            _ => SessionResult::Error {
+                message: "find workers are unavailable".into(),
+            },
+        }
+    }
+
+    /// `editor.keep_matching` (FEUX-0006 E-4): filter selections to those
+    /// containing at least one match.
+    fn text_keep_matching(
+        &self,
+        request_id: u64,
+        request: crate::text_select::KeepMatchingRequest,
+    ) -> SessionResult {
+        if request.query.is_empty()
+            && request.mode == flavite_text_search::matcher::MatchMode::Literal
+        {
+            return SessionResult::Error {
+                message: crate::text_edit::IDLE_QUERY.to_owned(),
+            };
+        }
+        let text = match self.snapshot_for_revision(request.buffer_id, request.revision) {
+            Ok(text) => text,
+            Err(result) => return result,
+        };
+        if self.text_queue_full() {
+            return SessionResult::Busy;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        match &self.text_jobs {
+            Some(jobs)
+                if jobs
+                    .send(TextJob {
+                        request_id,
+                        text,
+                        work: TextWork::KeepMatching(request),
                         cancelled: cancelled.clone(),
                     })
                     .is_ok() =>
@@ -5815,6 +5898,27 @@ impl Session {
                                 spans,
                                 total_matches: collected.total_matches,
                                 zero_width_count: collected.zero_width_count,
+                            })
+                        }
+                        Err(error) => SessionResult::Error {
+                            message: error.message(),
+                        },
+                    };
+                    (request_id, result)
+                }
+                TextOutcomeMessage::KeepMatching {
+                    request_id,
+                    buffer_id,
+                    revision,
+                    outcome,
+                } => {
+                    let result = match outcome {
+                        Ok(collected) => {
+                            SessionResult::Success(CommandResult::KeepMatchingCollected {
+                                buffer_id,
+                                revision,
+                                selection_indices: collected.selection_indices,
+                                match_count: collected.match_count,
                             })
                         }
                         Err(error) => SessionResult::Error {

@@ -20,8 +20,8 @@ use flavite_buffer::selection::MAX_SELECTIONS;
 use flavite_text_search::matcher::{MatchLimits, MatchMode, MatchOptions, Matcher};
 use flavite_text_search::protocol::RequestKind;
 
-/// One match-collection request: the same options as `text.find`, document
-/// wide (no scope), against one frozen revision.
+/// One match-collection request: the same options as `text.find`, with
+/// optional scope spans (FEUX-0006 E-2), against one frozen revision.
 #[derive(Debug, Clone)]
 pub struct SelectMatchesRequest {
     pub buffer_id: BufferId,
@@ -30,6 +30,30 @@ pub struct SelectMatchesRequest {
     pub mode: MatchMode,
     pub case_sensitive: bool,
     pub whole_word: bool,
+    /// Optional scope spans for in-selections search (FEUX-0006 E-2).
+    /// Empty vec means whole document.
+    pub scope_spans: Vec<(usize, usize)>,
+}
+
+/// One keep-matching request (FEUX-0006 E-4): filter selections to those
+/// containing at least one match of the query.
+#[derive(Debug, Clone)]
+pub struct KeepMatchingRequest {
+    pub buffer_id: BufferId,
+    pub revision: Revision,
+    pub query: String,
+    pub mode: MatchMode,
+    pub case_sensitive: bool,
+    pub keep: bool,
+    /// Scope spans are the current selection spans to filter.
+    pub scope_spans: Vec<(usize, usize)>,
+}
+
+/// A completed keep-matching collection: indices of selections to keep.
+#[derive(Debug, Clone)]
+pub struct KeepMatchingOutcome {
+    pub selection_indices: Vec<usize>,
+    pub match_count: u64,
 }
 
 /// A completed collection: ascending, in-order spans (at most
@@ -77,7 +101,7 @@ pub fn collect_matches(
                     mode: MatchMode::Regex,
                     case_sensitive: request.case_sensitive,
                     whole_word: request.whole_word,
-                    scope_spans: Vec::new(),
+                    scope_spans: request.scope_spans.clone(),
                     max_matches: crate::text_edit::MAX_MATCHES_PER_JOB,
                     report_matches: MAX_SELECTION_SPANS,
                     skip_matches: 0,
@@ -135,11 +159,15 @@ pub fn collect_matches(
             // next match boundary (E-11).
             let mut spans = Vec::new();
             let mut total = 0u64;
-            for item in matcher.iter_matches(text, None).map_err(matcher_error)? {
-                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                    return Err(PrepareError::Cancelled);
-                }
-                let hit = item.map_err(matcher_error)?;
+            // Use matcher.find_in_spans which handles both cases internally
+            let results = if request.scope_spans.is_empty() {
+                matcher.find(text).map_err(matcher_error)?
+            } else {
+                matcher
+                    .find_in_spans(text, &request.scope_spans)
+                    .map_err(matcher_error)?
+            };
+            for hit in results {
                 total = total.saturating_add(1);
                 if spans.len() < MAX_SELECTION_SPANS {
                     spans.push((hit.span.start.0, hit.span.end.0));
@@ -157,6 +185,71 @@ fn collection(spans: Vec<(usize, usize)>, total_matches: u64) -> MatchCollection
         total_matches,
         zero_width_count: u64::try_from(zero_width_count).unwrap_or(u64::MAX),
     }
+}
+
+/// Collect matches for keep-matching: filter selections to those containing
+/// at least one match (FEUX-0006 E-4). Returns indices of selections to keep
+/// and the total match count.
+pub fn collect_keep_matches(
+    text: &str,
+    request: &KeepMatchingRequest,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<KeepMatchingOutcome, crate::text_edit::PrepareError> {
+    use crate::text_edit::PrepareError;
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(PrepareError::Cancelled);
+    }
+
+    if request.scope_spans.is_empty() {
+        // No selections to filter - return empty (will refuse in API)
+        return Ok(KeepMatchingOutcome {
+            selection_indices: Vec::new(),
+            match_count: 0,
+        });
+    }
+
+    // Build matcher
+    let options = MatchOptions {
+        mode: request.mode,
+        case_sensitive: request.case_sensitive,
+        whole_word: false, // keep_matching doesn't use whole_word per spec
+    };
+    let matcher = Matcher::new(
+        &request.query,
+        options,
+        MatchLimits {
+            max_matches: crate::text_edit::MAX_MATCHES_PER_JOB,
+        },
+    )
+    .map_err(matcher_error)?;
+
+    // For each selection span, check if it contains at least one match
+    let mut keep_indices = Vec::new();
+    let mut total_matches = 0u64;
+
+    for (index, &(sel_start, sel_end)) in request.scope_spans.iter().enumerate() {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(PrepareError::Cancelled);
+        }
+
+        // Collect all matches within this selection span
+        // Use find_in_spans with a single span
+        let span_vec = vec![(sel_start, sel_end)];
+        let results = matcher
+            .find_in_spans(text, &span_vec)
+            .map_err(matcher_error)?;
+        let has_match = !results.is_empty();
+        total_matches = total_matches.saturating_add(results.len() as u64);
+
+        if request.keep == has_match {
+            keep_indices.push(index);
+        }
+    }
+
+    Ok(KeepMatchingOutcome {
+        selection_indices: keep_indices,
+        match_count: total_matches,
+    })
 }
 
 fn source_bounds_valid(text: &str, start: usize, end: usize) -> bool {
@@ -182,6 +275,7 @@ mod tests {
             mode,
             case_sensitive: false,
             whole_word: false,
+            scope_spans: vec![],
         }
     }
 

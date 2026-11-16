@@ -19,13 +19,13 @@ use std::collections::VecDeque;
 /// The generalization of `AwaitChar` to support per-command argument specs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingCommand {
-    /// FindChar with direction (forward/backward).
+    /// `FindChar` with direction (forward/backward).
     FindChar { forward: bool },
-    /// SurroundAdd: awaiting a single character to wrap with.
+    /// `SurroundAdd`: awaiting a single character to wrap with.
     SurroundAdd,
-    /// SurroundChange: awaiting first character of the pair.
+    /// `SurroundChange`: awaiting first character of the pair.
     SurroundChange,
-    /// SurroundDelete: awaiting the character of the pair to delete.
+    /// `SurroundDelete`: awaiting the character of the pair to delete.
     SurroundDelete,
 }
 
@@ -34,10 +34,10 @@ impl PendingCommand {
     #[must_use]
     pub const fn arg_count(&self) -> usize {
         match self {
-            PendingCommand::FindChar { .. } => 1,
-            PendingCommand::SurroundAdd => 1,
+            PendingCommand::FindChar { .. }
+            | PendingCommand::SurroundAdd
+            | PendingCommand::SurroundDelete => 1,
             PendingCommand::SurroundChange => 2,
-            PendingCommand::SurroundDelete => 1,
         }
     }
 
@@ -45,12 +45,14 @@ impl PendingCommand {
     #[must_use]
     pub fn message_for_index(&self, index: usize) -> &'static str {
         match (self, index) {
-            (PendingCommand::FindChar { forward: true }, 0) => AWAIT_CHAR_HINT,
-            (PendingCommand::FindChar { forward: false }, 0) => AWAIT_CHAR_HINT,
-            (PendingCommand::SurroundAdd, 0) => AWAIT_CHAR_HINT,
-            (PendingCommand::SurroundChange, 0) => AWAIT_CHAR_HINT,
             (PendingCommand::SurroundChange, 1) => AWAIT_SECOND_CHAR_HINT,
-            (PendingCommand::SurroundDelete, 0) => AWAIT_CHAR_HINT,
+            (
+                PendingCommand::FindChar { .. }
+                | PendingCommand::SurroundAdd
+                | PendingCommand::SurroundChange,
+                0,
+            )
+            | (PendingCommand::SurroundDelete, 0) => AWAIT_CHAR_HINT,
             _ => AWAIT_CHAR_HINT,
         }
     }
@@ -746,7 +748,7 @@ mod tests {
         );
         assert_eq!(
             state.menu_command(),
-            Some(ContextCommand::SplitSelection),
+            Some(ContextCommand::KeepMatching { keep: false }),
             "wrap backward lands on the last row"
         );
 

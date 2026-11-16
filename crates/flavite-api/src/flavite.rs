@@ -1393,6 +1393,12 @@ impl Flavite {
                 ArgSchema::typed::<crate::editor_commands::EditorSelectMatchesArgs>(),
                 crate::editor_commands::handle_split_selection,
             ),
+            (
+                "editor.keep_matching",
+                "Keep selections containing matches",
+                ArgSchema::typed::<crate::editor_commands::EditorKeepMatchingArgs>(),
+                crate::editor_commands::handle_keep_matching,
+            ),
             // FEUX-0004 X01: Transform family
             (
                 "editor.case_upper",
@@ -2800,6 +2806,9 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::MatchesCollected { .. }) => {
                 "editor.select_matches"
             }
+            SessionResult::Success(crate::session::CommandResult::KeepMatchingCollected {
+                ..
+            }) => "editor.keep_matching",
             SessionResult::Success(
                 crate::session::CommandResult::SelectionCollectionCancelled { .. },
             ) => "editor.cancel_selection",
@@ -3138,6 +3147,19 @@ impl Flavite {
                                 .collect::<Vec<[u64; 2]>>(),
                             "total_matches": total_matches,
                             "zero_width_count": zero_width_count,
+                        })
+                    }
+                    crate::session::CommandResult::KeepMatchingCollected {
+                        buffer_id,
+                        revision,
+                        selection_indices,
+                        match_count,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "selection_indices": selection_indices,
+                            "match_count": match_count,
                         })
                     }
                     crate::session::CommandResult::SelectionCollectionCancelled { request_id } => {

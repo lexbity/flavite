@@ -74,6 +74,7 @@ impl MatchOptions {
 
 /// Compute a digest for a list of scope spans (FEUX-0006 §5.4).
 /// Empty spans = whole source, which is the same as no scope.
+#[must_use]
 pub fn scope_spans_digest(spans: &[(usize, usize)]) -> u64 {
     if spans.is_empty() {
         return 0;

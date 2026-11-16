@@ -26,6 +26,10 @@ const MAX_QUERY_BYTES: usize = 8192;
 pub enum ApplyKind {
     Select,
     Split,
+    /// Keep only selections containing a match (FEUX-0006 E-4).
+    Keep {
+        keep: bool,
+    },
 }
 
 impl ApplyKind {
@@ -34,6 +38,7 @@ impl ApplyKind {
         match self {
             Self::Select => "editor.select_matches",
             Self::Split => "editor.split_selection",
+            Self::Keep { .. } => "editor.keep_matching",
         }
     }
 }
@@ -90,6 +95,8 @@ pub struct SelectionSearchState {
     pub query: String,
     pub regex: bool,
     pub case_sensitive: bool,
+    /// Whether to scope the search to the current selections (FEUX-0006 E-2).
+    pub in_selections: bool,
     /// The in-flight draft request, if any.
     pub pending: Option<u64>,
     /// Bumped on every query/option edit; completions carry it.
@@ -113,6 +120,7 @@ impl SelectionSearchState {
             query: String::new(),
             regex: false,
             case_sensitive: false,
+            in_selections: false,
             pending: None,
             query_version: 0,
             overlay: None,
@@ -161,6 +169,7 @@ pub enum SelectionSearchMessage {
     },
     ToggleRegex(TabId),
     ToggleCase(TabId),
+    ToggleInSelections(TabId),
     Apply(TabId),
     /// The mounted row rectangle; also the mount signal for the deferred
     /// focus of the query input.
@@ -295,6 +304,21 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
             app.refresh_semantics();
             iced::Task::none()
         }
+        SelectionSearchMessage::ToggleInSelections(tab) => {
+            let mut changed = false;
+            if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+                state.in_selections = !state.in_selections;
+                state.query_version = state.query_version.wrapping_add(1);
+                state.overlay = None;
+                state.error = None;
+                changed = true;
+            }
+            if changed {
+                request_collection(app, tab);
+            }
+            app.refresh_semantics();
+            iced::Task::none()
+        }
         SelectionSearchMessage::Apply(tab) => apply(app, tab),
         SelectionSearchMessage::InputBounds { tab, rect } => {
             if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
@@ -353,11 +377,34 @@ pub fn caption(app: &App, tab: TabId) -> Option<String> {
     }
     let overlay = state.overlay.as_ref()?;
     let total = overlay.total_matches;
+    let scope = if state.in_selections {
+        " (selections)"
+    } else {
+        ""
+    };
     Some(match state.kind {
-        ApplyKind::Select => format!("{total} match{}", if total == 1 { "" } else { "es" }),
+        ApplyKind::Select => format!(
+            "{total} match{} in scope{}",
+            if total == 1 { "" } else { "es" },
+            scope
+        ),
         ApplyKind::Split => {
             let gaps = overlay.spans.len();
-            format!("{gaps} gap{}", if gaps == 1 { "" } else { "s" })
+            format!(
+                "{gaps} gap{} in scope{}",
+                if gaps == 1 { "" } else { "s" },
+                scope
+            )
+        }
+        ApplyKind::Keep { keep } => {
+            let kept = overlay.spans.len();
+            let verb = if keep { "kept" } else { "dropped" };
+            format!(
+                "{kept} selection{} {} in scope{}",
+                if kept == 1 { "" } else { "s" },
+                verb,
+                scope
+            )
         }
     })
 }
@@ -473,12 +520,12 @@ fn request_collection(app: &mut App, tab: TabId) {
         .get(&tab)
         .map(|s| s.query.clone())
         .unwrap_or_default();
-    let (regex, case_sensitive) = app
+    let (regex, case_sensitive, in_selections) = app
         .selection_search
         .tabs
         .get(&tab)
-        .map(|s| (s.regex, s.case_sensitive))
-        .unwrap_or((false, false));
+        .map(|s| (s.regex, s.case_sensitive, s.in_selections))
+        .unwrap_or((false, false, false));
     let kind = app
         .selection_search
         .tabs
@@ -486,6 +533,14 @@ fn request_collection(app: &mut App, tab: TabId) {
         .map(|s| s.kind)
         .unwrap_or(ApplyKind::Select);
     let request_id = api.command_registry().next_request_id();
+
+    // Build scope_spans from current selections if in_selections is true
+    let scope_spans: Option<Vec<(usize, usize)>> = if in_selections {
+        Some(target.selections.clone())
+    } else {
+        None
+    };
+
     let result = api.execute(Invocation::new(
         request_id,
         kind.command_id(),
@@ -498,6 +553,8 @@ fn request_collection(app: &mut App, tab: TabId) {
                 "regex": regex,
                 "case_sensitive": case_sensitive,
             },
+            "in_selections": in_selections,
+            "scope_spans": scope_spans,
         }),
         Origin::Gui,
     ));
@@ -639,6 +696,7 @@ fn apply(app: &mut App, tab: TabId) -> iced::Task<Message> {
     let regex = state.regex;
     let case_sensitive = state.case_sensitive;
     let kind = state.kind;
+    let in_selections = state.in_selections;
     let spans: Vec<(usize, usize)> = overlay.spans.to_vec();
     // The exact observed totals ride the apply (E-10/R13): the span list is
     // capped, so the totals are the authority for oversize/zero-width
@@ -655,6 +713,7 @@ fn apply(app: &mut App, tab: TabId) -> iced::Task<Message> {
                 "regex": regex,
                 "case_sensitive": case_sensitive,
             },
+            "in_selections": in_selections,
             "apply": true,
             "spans": spans,
             "total_matches": total_matches,

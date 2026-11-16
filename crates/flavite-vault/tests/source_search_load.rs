@@ -53,7 +53,7 @@ fn source_search_reference() {
                 case_sensitive: pattern.case_sensitive,
                 whole_word: pattern.whole_word,
                 offset: 0,
-                scope: None,
+                scope_spans: vec![],
             };
             let mut samples = Vec::new();
             let mut expected = None;
@@ -83,7 +83,7 @@ fn source_search_reference() {
                 case_sensitive: false,
                 whole_word: false,
                 mode: MatchMode::Literal,
-                scope: None,
+                scope_spans: vec![],
             };
             let mut samples = Vec::new();
             for _ in 0..1000 {

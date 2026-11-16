@@ -287,7 +287,7 @@ fn text_find(session: &Session, buffer_id: u64, revision: u64, query: &str) -> u
                 mode: flavite_text_search::matcher::MatchMode::Literal,
                 case_sensitive: false,
                 whole_word: false,
-                scope: None,
+                scope_spans: vec![],
                 offset: 0,
             },
         }),

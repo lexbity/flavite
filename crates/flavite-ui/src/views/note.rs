@@ -539,6 +539,13 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         let row_title = match search.kind {
             crate::host::selection_search::ApplyKind::Select => "Select matches…",
             crate::host::selection_search::ApplyKind::Split => "Split on matches…",
+            crate::host::selection_search::ApplyKind::Keep { keep } => {
+                if keep {
+                    "Keep matching…"
+                } else {
+                    "Drop non-matching…"
+                }
+            }
         };
         let caption = crate::host::selection_search::caption(app, tab);
         let apply_enabled = crate::host::selection_search::apply_enabled(app, tab);
@@ -580,6 +587,13 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                             .style(style::ghost())
                             .on_press(Message::SelectionSearch(
                                 crate::host::selection_search::SelectionSearchMessage::ToggleCase(
+                                    tab,
+                                ),
+                            )),
+                        button(if search.in_selections { "Selections" } else { "Document" })
+                            .style(style::ghost())
+                            .on_press(Message::SelectionSearch(
+                                crate::host::selection_search::SelectionSearchMessage::ToggleInSelections(
                                     tab,
                                 ),
                             )),

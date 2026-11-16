@@ -75,6 +75,11 @@ pub enum ContextCommand {
     SelectMatches,
     /// Document-wide gap selection between matches (E-10).
     SplitSelection,
+    /// Filter selections to those containing a match (FEUX-0006 E-4).
+    /// `keep: false` means drop (complement).
+    KeepMatching {
+        keep: bool,
+    },
     LineStart,
     LineEnd,
     DocumentStart,
@@ -255,6 +260,7 @@ impl ContextCommand {
             Self::InvertSelections => "editor.invert_selections",
             Self::SelectMatches => "editor.select_matches",
             Self::SplitSelection => "editor.split_selection",
+            Self::KeepMatching { .. } => "editor.keep_matching",
             Self::FindChar { .. } => "editor.find_char",
             Self::LineStart => "workspace.caret_start_line",
             Self::LineEnd => "workspace.caret_end_line",
@@ -333,6 +339,8 @@ impl ContextCommand {
             Self::InvertSelections => "Invert selections",
             Self::SelectMatches => "Select matches…",
             Self::SplitSelection => "Split on matches…",
+            Self::KeepMatching { keep: true } => "Keep matching…",
+            Self::KeepMatching { keep: false } => "Drop non-matching…",
             Self::FindChar { forward: true } => "Find character forward",
             Self::FindChar { forward: false } => "Find character backward",
             Self::LineStart => "Line start",
@@ -483,6 +491,8 @@ impl ContextMenu {
                 C::InvertSelections,
                 C::SelectMatches,
                 C::SplitSelection,
+                C::KeepMatching { keep: true },
+                C::KeepMatching { keep: false },
             ],
             Self::Go => &[
                 C::LineStart,

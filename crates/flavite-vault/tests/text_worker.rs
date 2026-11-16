@@ -214,7 +214,7 @@ fn replace_request<'a>(source: &'a str, pattern: &'a str, template: &'a str) -> 
         mode: MatchMode::Regex,
         case_sensitive: false,
         whole_word: false,
-        scope: None,
+        scope_spans: vec![],
         max_matches: 1_000_000,
         report_matches: usize::MAX,
         skip_matches: 0,
@@ -308,14 +308,14 @@ fn scoped_regex_find_uses_whole_text_boundaries_and_freezes_the_range() {
     request.whole_word = true;
     // Frozen scope covering "world" inside "helloworld": whole-word
     // filtering consults the FULL text, so this match is not whole-word.
-    request.scope = Some((5, 10));
+    request.scope_spans = vec![(5, 10)];
     let scoped_run = run(&request).expect("scoped run");
     assert_eq!(scoped_run.total_matches, 0, "inside a larger word");
     // The second "world" is a real whole word; the scope excludes it.
-    request.scope = Some((1, 12));
+    request.scope_spans = vec![(1, 12)];
     let first_scope_run = run(&request).expect("first-scope run");
     assert_eq!(first_scope_run.total_matches, 0);
-    request.scope = Some((15, 20));
+    request.scope_spans = vec![(15, 20)];
     let second_scope_run = run(&request).expect("second-scope run");
     assert_eq!(second_scope_run.total_matches, 1);
     assert_eq!(
@@ -522,7 +522,7 @@ fn stale_scope_is_refused_locally_before_the_helper_sees_it() {
     let _lock = acquire_sibling_lock();
     install_helper();
     let mut request = find_request("abc", "b");
-    request.scope = Some((2, 1)); // reversed: not a legal frozen range
+    request.scope_spans = vec![(2, 1)]; // reversed: not a legal frozen range
     let error = run(&request).expect_err("reversed scope");
     assert_eq!(
         error,
@@ -530,7 +530,7 @@ fn stale_scope_is_refused_locally_before_the_helper_sees_it() {
     );
     // A mid-scalar endpoint is refused the same way (é starts at 0 here).
     let mut request = find_request("é", ".");
-    request.scope = Some((1, 1));
+    request.scope_spans = vec![(1, 1)];
     let error = run(&request).expect_err("mid-scalar scope start");
     assert_eq!(
         error,

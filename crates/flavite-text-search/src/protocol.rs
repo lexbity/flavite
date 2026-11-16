@@ -46,7 +46,7 @@ pub const MATCHES_PER_PAGE: usize = 128;
 /// Maximum number of scope spans (Context Mode selection cap).
 pub const MAX_SCOPE_SPANS: usize = 10_000;
 
-/// Maximum spans per SpanFrame (to stay within FRAME_MAX_BYTES).
+/// Maximum spans per `SpanFrame` (to stay within `FRAME_MAX_BYTES`).
 /// 4000 spans * 16 bytes = 64 KiB exactly.
 pub const SPANS_PER_FRAME: usize = 4000;
 
@@ -1031,7 +1031,7 @@ mod tests {
     fn span_frame_exceeds_max_spans_is_malformed() {
         let mut out = vec![TAG_SPAN_FRAME];
         out.extend_from_slice(&1u64.to_le_bytes()); // request id
-        out.extend_from_slice(&((MAX_SCOPE_SPANS as u32) + 1).to_le_bytes()); // count > max
+        out.extend_from_slice(&(u32::try_from(MAX_SCOPE_SPANS).unwrap() + 1).to_le_bytes()); // count > max
         assert_eq!(decode(&out), Err(FrameError::Malformed));
     }
 

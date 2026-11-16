@@ -139,17 +139,20 @@ fn find_enclosing_self_pair(text: &str, member: &Selection, pair: &Pair) -> Opti
         }
     }
 
-    let Some(open_pos) = open_pos else {
-        return None;
-    };
+    let open_pos = open_pos?;
 
     // Find the matching close after the member
     let mut depth = 0;
     let mut found_open = false;
     let mut close_pos: Option<usize> = None;
 
-    for pos in open_pos..text.len() {
-        if bytes[pos] == quote_char as u8 && !is_escaped(text, pos) {
+    for (pos, &byte) in bytes
+        .iter()
+        .enumerate()
+        .skip(open_pos)
+        .take(text.len() - open_pos)
+    {
+        if byte == quote_char as u8 && !is_escaped(text, pos) {
             if !found_open && pos == open_pos {
                 found_open = true;
                 depth = 1;
@@ -166,9 +169,7 @@ fn find_enclosing_self_pair(text: &str, member: &Selection, pair: &Pair) -> Opti
         }
     }
 
-    let Some(close_pos) = close_pos else {
-        return None;
-    };
+    let close_pos = close_pos?;
 
     // Verify the pair encloses the member
     if open_pos < member_start && close_pos >= member_end {
@@ -224,16 +225,19 @@ fn find_enclosing_nesting_pair(text: &str, member: &Selection, pair: &Pair) -> O
         }
     }
 
-    let Some(open_pos) = open_pos else {
-        return None;
-    };
+    let open_pos = open_pos?;
 
     // Scan forward from member end to find matching close at depth 0
     let mut depth = 0;
     let mut close_pos: Option<usize> = None;
 
-    for pos in member_end..text.len() {
-        let c = bytes[pos] as char;
+    for (pos, &byte) in bytes
+        .iter()
+        .enumerate()
+        .skip(member_end)
+        .take(text.len() - member_end)
+    {
+        let c = byte as char;
         if c == open_char {
             depth += 1;
         } else if c == close_char {
@@ -246,9 +250,7 @@ fn find_enclosing_nesting_pair(text: &str, member: &Selection, pair: &Pair) -> O
         }
     }
 
-    let Some(close_pos) = close_pos else {
-        return None;
-    };
+    let close_pos = close_pos?;
 
     Some(PairMatch {
         open_start: open_pos,
@@ -291,7 +293,7 @@ pub fn validate_enclosing_pairs(text: &str, set: &SelectionSet, pair: &Pair) -> 
 /// Get the pair for a character (used when user provides a single char).
 #[must_use]
 pub fn pair_for_char(c: char) -> Pair {
-    Pair::from_open(c).unwrap_or_else(|| Pair {
+    Pair::from_open(c).unwrap_or(Pair {
         open: c,
         close: c,
         is_nesting: false,
@@ -317,6 +319,7 @@ mod tests {
         .0
     }
 
+    #[allow(dead_code)]
     fn set_caret(text: &str, pos: usize) -> SelectionSet {
         SelectionSet::normalize(
             text,

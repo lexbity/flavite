@@ -649,6 +649,7 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
     );
 }
 
+#[allow(dead_code)]
 fn preflight_output(
     source: &str,
     scope: Option<Span<TextByte>>,

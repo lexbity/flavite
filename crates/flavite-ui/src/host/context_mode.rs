@@ -1794,6 +1794,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     if let Some(kind) = match command {
         SelectMatches => Some(super::selection_search::ApplyKind::Select),
         SplitSelection => Some(super::selection_search::ApplyKind::Split),
+        KeepMatching { keep } => Some(super::selection_search::ApplyKind::Keep { keep }),
         _ => None,
     } {
         return super::selection_search::handle(
@@ -2226,8 +2227,19 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             // FEUX-0004 X06: if count is present, replay count times
             replay_last_with_count(app, target.clone(), count)
         }
-        Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History
-        | SelectMatches | SplitSelection => {
+        Toggle
+        | Exit
+        | Escape
+        | Paste
+        | Undo
+        | Redo
+        | Commands
+        | Find
+        | Replace
+        | History
+        | SelectMatches
+        | SplitSelection
+        | KeepMatching { .. } => {
             unreachable!("handled before planning")
         }
     };
