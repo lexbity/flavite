@@ -122,6 +122,16 @@ fn ensure_pillow() -> Result<()> {
             println!("  ✓ python3-Pillow already installed");
             return Ok(());
         }
+        // Refresh apt lists first: runner images ship stale lists, and
+        // installing from them can 404 on the current archive pool (seen on
+        // ubuntu-26.04 runners for python3-pil).
+        let update = Command::new("sudo")
+            .args(["apt-get", "update"])
+            .status()
+            .context("failed to spawn apt-get update")?;
+        if !update.success() {
+            anyhow::bail!("apt-get update failed with {update}");
+        }
         let status = Command::new("sudo")
             .args(["apt-get", "install", "-y", "python3-pil"])
             .status()
