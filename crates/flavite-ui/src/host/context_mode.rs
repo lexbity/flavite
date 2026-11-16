@@ -3,7 +3,6 @@
 use crate::app::{App, Message};
 use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, Origin};
-use flavite_buffer::indent::{detect_unit, Unit};
 use flavite_edit_context::{
     BindingId, ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event,
     PendingCommand, reduce,

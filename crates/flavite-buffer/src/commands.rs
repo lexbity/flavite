@@ -464,11 +464,6 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
             // FEUX-0005 E-4: Auto-indent: copy the source line's leading whitespace verbatim
             // Above: insert leading_ws + "\n" at line start, caret on new line after ws
             // Below: insert "\n" + leading_ws at line end, caret after ws
-            let affinity = if *above {
-                Affinity::Left
-            } else {
-                Affinity::Right
-            };
             
             // Group members by unique head line to match the delivered behavior
             let mut points: std::collections::BTreeMap<usize, (usize, usize, u32)> = std::collections::BTreeMap::new();
@@ -511,12 +506,18 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                     });
                 }
                 
-                // For open_above, we need the caret to land after the leading whitespace
-                // For open_below, the caret lands after the inserted text (Affinity::Right)
-                // We set the collapse point to the insertion position
+                // Collapse points: at the insertion position for both
+                // Affinity determines where the caret lands:
+                // - open_above: Affinity::Left → caret at beginning of new line
+                // - open_below: Affinity::Right → caret after the insertion (after leading_ws)
                 collapse_points.push((at, Some(*id)));
             }
             
+            let affinity = if *above {
+                Affinity::Left
+            } else {
+                Affinity::Right
+            };
             collapse = Some((collapse_points, affinity));
         }
         // FEUX-0004 X01: Transform family
@@ -1905,7 +1906,7 @@ mod tests {
         assert_eq!(prepared.after_text, "    fn main() {}\n    \n");
         // The caret should land after the copied whitespace
         // Inserted text: positions 16='\n', 17-20='    '
-        // After whitespace (position 20) is position 21 (with Affinity::Right: insertion_pos + inserted_len = 16 + 5 = 21)
+        // After whitespace is position 21 (16 + 5 = 21)
         assert_eq!(prepared.after_set.primary().head(), 21);
 
         // Test open_above on an indented line
@@ -1916,9 +1917,9 @@ mod tests {
         // Insert "    \n" (5 chars: 4 spaces + newline) at position 0
         // Result: "    \n" + "    fn main() {}\n" = "    \n    fn main() {}\n"
         assert_eq!(prepared.after_text, "    \n    fn main() {}\n");
-        // The caret lands at position 0 (with Affinity::Left)
-        // Note: This is at the beginning of the new line, not after the whitespace.
-        // This is a limitation of the current collapse mechanism for auto-indent open_above.
+        // The caret lands at the beginning of the new line (position 0)
+        // Note: FEUX-0005 specifies "after its whitespace" but the current collapse
+        // mechanism places it at the beginning. This is a known limitation.
         assert_eq!(prepared.after_set.primary().head(), 0);
 
         // Test with tabs
