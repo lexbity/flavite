@@ -6,7 +6,7 @@
 
 use flavite_edit_context::{
     ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, reduce,
-    session::{AWAIT_CHAR_HINT, AWAIT_SECOND_CHAR_HINT, AwaitArgs},
+    session::AWAIT_CHAR_HINT,
 };
 
 /// Drive the public statechart with the deterministic test clock and the

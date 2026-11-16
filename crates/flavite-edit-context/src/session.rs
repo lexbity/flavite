@@ -44,16 +44,10 @@ impl PendingCommand {
     /// Returns the message to display for the given index.
     #[must_use]
     pub fn message_for_index(&self, index: usize) -> &'static str {
-        match (self, index) {
-            (PendingCommand::SurroundChange, 1) => AWAIT_SECOND_CHAR_HINT,
-            (
-                PendingCommand::FindChar { .. }
-                | PendingCommand::SurroundAdd
-                | PendingCommand::SurroundChange,
-                0,
-            )
-            | (PendingCommand::SurroundDelete, 0) => AWAIT_CHAR_HINT,
-            _ => AWAIT_CHAR_HINT,
+        if matches!(self, PendingCommand::SurroundChange) && index == 1 {
+            AWAIT_SECOND_CHAR_HINT
+        } else {
+            AWAIT_CHAR_HINT
         }
     }
 }
@@ -154,12 +148,12 @@ pub struct AwaitArgs {
     /// The characters collected so far.
     pub collected_chars: Vec<char>,
     /// The pending count at the time of entry (FEUX-0004 X06, E-4).
-    /// Retained through argument capture for count acceptors like find_char.
+    /// Retained through argument capture for count acceptors like `find_char`.
     pub count: Option<u32>,
 }
 
 impl AwaitArgs {
-    /// Create a new AwaitArgs for a find-char command.
+    /// Create a new `AwaitArgs` for a find-char command.
     #[must_use]
     pub fn find_char(forward: bool) -> Self {
         Self {
@@ -170,7 +164,7 @@ impl AwaitArgs {
         }
     }
 
-    /// Create a new AwaitArgs for surround add.
+    /// Create a new `AwaitArgs` for surround add.
     #[must_use]
     pub fn surround_add() -> Self {
         Self {
@@ -181,7 +175,7 @@ impl AwaitArgs {
         }
     }
 
-    /// Create a new AwaitArgs for surround change.
+    /// Create a new `AwaitArgs` for surround change.
     #[must_use]
     pub fn surround_change() -> Self {
         Self {
@@ -192,7 +186,7 @@ impl AwaitArgs {
         }
     }
 
-    /// Create a new AwaitArgs for surround delete.
+    /// Create a new `AwaitArgs` for surround delete.
     #[must_use]
     pub fn surround_delete() -> Self {
         Self {

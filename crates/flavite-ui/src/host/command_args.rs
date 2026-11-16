@@ -180,11 +180,6 @@ impl CommandArgsState {
         self.fields.get_mut(self.active_field)
     }
 
-    /// Get all non-empty field values.
-    fn get_all_values(&self) -> Vec<String> {
-        self.fields.iter().map(|f| f.text.clone()).collect()
-    }
-
     /// Validate a single field.
     fn validate_field(&self, field_idx: usize) -> Result<Option<String>, String> {
         let field_state = self
@@ -449,13 +444,13 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
             iced::Task::none()
         }
         CommandArgsMessage::DraftAction { tab, action } => {
-            if let Some(state) = app.command_args.tabs.get_mut(&tab) {
-                if let Some(field_state) = state.active_field_state_mut() {
-                    field_state.input.perform(action.clone());
-                    field_state.text = field_state.input.text();
-                    // Clear error on edit
-                    field_state.error = None;
-                }
+            if let Some(state) = app.command_args.tabs.get_mut(&tab)
+                && let Some(field_state) = state.active_field_state_mut()
+            {
+                field_state.input.perform(action.clone());
+                field_state.text = field_state.input.text();
+                // Clear error on edit
+                field_state.error = None;
             }
             iced::Task::none()
         }
@@ -503,15 +498,15 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
             iced::Task::none()
         }
         CommandArgsMessage::AdjustDown(tab) => {
-            if let Some(state) = app.command_args.tabs.get_mut(&tab) {
-                if let Some(field_state) = state.active_field_state_mut() {
-                    if let Ok(n) = field_state.text.trim().parse::<u32>() {
-                        let new_n = n.saturating_sub(1).max(1);
-                        *field_state = FieldState::with_text(&new_n.to_string());
-                    } else {
-                        // Parse failed, try starting from 1
-                        *field_state = FieldState::with_text("1");
-                    }
+            if let Some(state) = app.command_args.tabs.get_mut(&tab)
+                && let Some(field_state) = state.active_field_state_mut()
+            {
+                if let Ok(n) = field_state.text.trim().parse::<u32>() {
+                    let new_n = n.saturating_sub(1).max(1);
+                    *field_state = FieldState::with_text(&new_n.to_string());
+                } else {
+                    // Parse failed, try starting from 1
+                    *field_state = FieldState::with_text("1");
                 }
             }
             iced::Task::none()
@@ -527,28 +522,27 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                         // Check that required fields are not empty
                         let mut has_error = false;
                         for (idx, spec) in state.draft.fields.iter().enumerate() {
-                            if let Some(value) = values.get(idx) {
-                                if value.is_none() {
-                                    // Field is empty - check if it's required
-                                    match spec {
-                                        FieldSpec::Regex { .. } | FieldSpec::Text { .. } => {
-                                            // These are required for replace_regex
-                                            if command == ContextCommand::ReplaceRegex {
-                                                if let Some(field_state) = state.fields.get_mut(idx)
-                                                {
-                                                    field_state.error =
-                                                        Some("Field cannot be empty".to_string());
-                                                }
-                                                has_error = true;
-                                            }
-                                        }
-                                        FieldSpec::Number { .. } => {
+                            if let Some(value) = values.get(idx)
+                                && value.is_none()
+                            {
+                                // Field is empty - check if it's required
+                                match spec {
+                                    FieldSpec::Regex { .. } | FieldSpec::Text { .. } => {
+                                        // These are required for replace_regex
+                                        if command == ContextCommand::ReplaceRegex {
                                             if let Some(field_state) = state.fields.get_mut(idx) {
                                                 field_state.error =
                                                     Some("Field cannot be empty".to_string());
                                             }
                                             has_error = true;
                                         }
+                                    }
+                                    FieldSpec::Number { .. } => {
+                                        if let Some(field_state) = state.fields.get_mut(idx) {
+                                            field_state.error =
+                                                Some("Field cannot be empty".to_string());
+                                        }
+                                        has_error = true;
                                     }
                                 }
                             }
@@ -560,7 +554,8 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
 
                         // For ReplaceRegex, handle specially (FEUX-0006 E-5)
                         if command == ContextCommand::ReplaceRegex {
-                            let pattern = values.get(0).and_then(|v| v.clone()).unwrap_or_default();
+                            let pattern =
+                                values.first().and_then(|v| v.clone()).unwrap_or_default();
                             let template =
                                 values.get(1).and_then(|v| v.clone()).unwrap_or_default();
 
@@ -597,8 +592,8 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                                         flavite_api::LocalResult::Success(success),
                                     ) => {
                                         // Extract ops from the result
-                                        if let Some(plan) = success.data.get("plan") {
-                                            if let (Some(_), Some(_), Some(ops)) = (
+                                        if let Some(plan) = success.data.get("plan")
+                                            && let (Some(_), Some(_), Some(ops)) = (
                                                 plan.get("match_count").and_then(|v| v.as_u64()),
                                                 plan.get("output_len").and_then(|v| v.as_u64()),
                                                 plan.get("ops").and_then(|v| {
@@ -609,24 +604,24 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                                                         )
                                                         .ok()
                                                 }),
-                                            ) {
-                                                // Now commit via apply_edits
-                                                let _ = super::context_mode::kernel_mutate(
-                                                    app,
-                                                    &target,
-                                                    "editor.apply_edits",
-                                                    serde_json::json!({
-                                                        "buffer_id": target.buffer,
-                                                        "revision": target.revision,
-                                                        "ops": ops,
-                                                        "undo_policy": "Isolated",
-                                                    }),
-                                                    "Replace was refused; source changed",
-                                                );
+                                            )
+                                        {
+                                            // Now commit via apply_edits
+                                            let _ = super::context_mode::kernel_mutate(
+                                                app,
+                                                &target,
+                                                "editor.apply_edits",
+                                                serde_json::json!({
+                                                    "buffer_id": target.buffer,
+                                                    "revision": target.revision,
+                                                    "ops": ops,
+                                                    "undo_policy": "Isolated",
+                                                }),
+                                                "Replace was refused; source changed",
+                                            );
 
-                                                // Close the draft
-                                                app.command_args.tabs.remove(&tab);
-                                            }
+                                            // Close the draft
+                                            app.command_args.tabs.remove(&tab);
                                         }
                                     }
                                     _ => {
@@ -637,7 +632,7 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                             }
                         } else {
                             // For single-field commands (LinesAlign, GotoLine)
-                            if let Some(Some(arg)) = values.get(0) {
+                            if let Some(Some(arg)) = values.first() {
                                 let mut json_args = serde_json::Map::new();
                                 match &state.draft.fields[0] {
                                     FieldSpec::Text { .. } => {
@@ -857,6 +852,14 @@ mod tests {
         let state = FieldState::with_text("test");
         assert_eq!(state.text, "test");
         assert!(state.error.is_none());
+    }
+
+    #[cfg(test)]
+    impl CommandArgsState {
+        /// Get all non-empty field values (test-only).
+        fn get_all_values(&self) -> Vec<String> {
+            self.fields.iter().map(|f| f.text.clone()).collect()
+        }
     }
 
     #[test]

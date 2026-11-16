@@ -806,12 +806,12 @@ pub fn native_key(
                     .context_mode
                     .session
                     .as_ref()
-                    .map_or(true, |s| s.state.menu().is_none());
+                    .is_none_or(|s| s.state.menu().is_none());
                 let no_await_args = app
                     .context_mode
                     .session
                     .as_ref()
-                    .map_or(true, |s| s.state.await_args().is_none());
+                    .is_none_or(|s| s.state.await_args().is_none());
 
                 if no_menu && no_await_args {
                     // Check if this is a digit
@@ -2274,12 +2274,6 @@ pub(crate) fn record_invocation(
         let record = InvocationRecord { command_id, args };
         let _ = reduce(&mut s.state, &Event::Record(record), now_ms, burst_enabled);
     }
-}
-
-/// Replay the last recorded invocation (FEUX-0004 E-5).
-/// Re-dispatches the recorded command with its arguments against the current selection set.
-fn replay_last(app: &mut App, target: EditorTarget) -> Task<Message> {
-    replay_last_with_count(app, target, None)
 }
 
 /// Replay the last recorded invocation with optional count (FEUX-0004 E-5/X06).
