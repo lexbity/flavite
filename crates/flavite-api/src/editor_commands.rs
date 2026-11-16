@@ -506,6 +506,19 @@ pub struct EditorIndentArgs {
     amount: u32,
 }
 
+// FEUX-0005 X02: Whitespace conversion
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorReWhitespaceArgs {
+    buffer_id: u64,
+    revision: u64,
+    operation: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+    #[serde(default)]
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
+}
+
 // FEUX-0004 X03: GotoLine command with line number argument
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1776,6 +1789,49 @@ pub(crate) fn handle_editor_dedent(
         args.origin,
         args.selections,
         flavite_buffer::commands::EditOperation::DedentLines { amount },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+// FEUX-0005 X02: Whitespace conversion handlers
+pub(crate) fn handle_editor_tabs_to_spaces(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorReWhitespaceArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::ReWhitespace { to_tabs: false },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_editor_spaces_to_tabs(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorReWhitespaceArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::ReWhitespace { to_tabs: true },
         flavite_buffer::history::EditKind::Format,
         args.undo_policy
             .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))

@@ -134,6 +134,11 @@ pub enum ContextCommand {
     Indent,
     /// Dedent each selection's containing line block by one unit.
     Dedent,
+    // FEUX-0005 X02: Whitespace conversion family
+    /// Convert leading tabs to spaces in each selection's containing line block.
+    TabsToSpaces,
+    /// Convert leading spaces to tabs in each selection's containing line block.
+    SpacesToTabs,
 }
 
 impl ContextCommand {
@@ -206,6 +211,9 @@ impl ContextCommand {
         // FEUX-0005 X01: Indent family
         Self::Indent,
         Self::Dedent,
+        // FEUX-0005 X02: Whitespace conversion family
+        Self::TabsToSpaces,
+        Self::SpacesToTabs,
     ];
 
     #[must_use]
@@ -282,6 +290,9 @@ impl ContextCommand {
             // FEUX-0005 X01: Indent family
             Self::Indent => "editor.indent",
             Self::Dedent => "editor.dedent",
+            // FEUX-0005 X02: Whitespace conversion family
+            Self::TabsToSpaces => "editor.tabs_to_spaces",
+            Self::SpacesToTabs => "editor.spaces_to_tabs",
         }
     }
 
@@ -358,6 +369,9 @@ impl ContextCommand {
             // FEUX-0005 X01: Indent family
             Self::Indent => "Indent",
             Self::Dedent => "Dedent",
+            // FEUX-0005 X02: Whitespace conversion family
+            Self::TabsToSpaces => "Tabs → Spaces",
+            Self::SpacesToTabs => "Spaces → Tabs",
         }
     }
 
@@ -401,6 +415,9 @@ impl ContextCommand {
                 // FEUX-0005 X01: Indent family - all mutate
                 | Self::Indent
                 | Self::Dedent
+                // FEUX-0005 X02: Whitespace conversion family - all mutate
+                | Self::TabsToSpaces
+                | Self::SpacesToTabs
                 // FEUX-0004 X05: RepeatLast may mutate (replays a command that may mutate)
                 | Self::RepeatLast
         )
@@ -520,6 +537,9 @@ impl ContextMenu {
                 C::NumberInc,
                 C::NumberDec,
                 C::NumberSequence,
+                // FEUX-0005 X02: Whitespace conversion
+                C::TabsToSpaces,
+                C::SpacesToTabs,
             ],
             // FEUX-0004 X01/X03: Lines menu
             Self::Lines => &[

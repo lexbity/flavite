@@ -54,7 +54,7 @@ in the toolbar badge; the detail row shows selection counts and messages.
 |---|---|---|
 | `i` / `Shift+I` | `editor.insert_start` / `editor.insert_line_start` | insert at each caret / at each line start (typing group) |
 | `a` / `Shift+A` | `editor.insert_end` / `editor.insert_line_end` | insert after each caret / at each line end (typing group) |
-| `o` / `Shift+O` | `editor.open_below` / `editor.open_above` | open a new line below/above each member (typing group) |
+| `o` / `Shift+O` | `editor.open_below` / `editor.open_above` | open a new line below/above each member (typing group); **auto-indent: copies source line's leading whitespace** |
 | `c` | `editor.change` | delete each member's range and enter typing |
 | `d` / `Shift+D` | `editor.delete` / `editor.cut` | delete each member / cut each member (copy joins with LF, then delete) |
 | `y` | `editor.copy` | copy each member; fragments join with LF in document order |
@@ -66,6 +66,8 @@ in the toolbar badge; the detail row shows selection counts and messages.
 | `f` / `Shift+F` | `editor.find_char` | **find character** forward / backward (see below) |
 | `.` | `editor.repeat_last` | replay the last recorded command against the current selection set |
 | `⇧G` | `editor.goto_line` | open line number draft or jump to line with pending count |
+| `⇧.` | `editor.indent` | indent each member's containing line block by one unit (count: units) |
+| `⇧,` | `editor.dedent` | dedent each member's containing line block by one unit (count: units) |
 | `T` | `editor.menu_transform` | open **Transform** menu |
 | `⇧T` | `editor.menu_lines` | open **Lines** menu |
 | `Z` | `editor.menu_surround` | open **Surround** menu |
@@ -99,6 +101,7 @@ Count acceptors (commands that multiply by the count):
 - `.` (`editor.repeat_last`) — replays the last command `count` times
   (sequential replays; each replay is its own undo node)
 - `⇧G` (`editor.goto_line`) — with pending count, jumps to line `count`
+- `⇧.` / `⇧,` (`editor.indent` / `editor.dedent`) — applies `count` indentation units
 
 Clearing: the count clears on escape, menu open, entering typing, unbound
 key, and after any command dispatch (even if refused).
@@ -126,6 +129,8 @@ each selection independently as pure planners (one atomic undo node each).
 | `n` | `editor.number_inc` | increment the first number in each selection; leading-zero width preserved |
 | `d` | `editor.number_dec` | decrement the first number in each selection; leading-zero width preserved |
 | `q` | `editor.number_sequence` | replace each selection's number with its document-order index (1-based); whole command refused if any selection has no number |
+| `e` | `editor.tabs_to_spaces` | convert leading tabs to spaces (per line block; unit: detected tab width) |
+| `r` | `editor.spaces_to_tabs` | convert leading spaces to tabs (per line block; unit: detected tab width) |
 
 **Number scanning**: the first (leftmost) maximal run `[+-]?[0-9]+` fully inside
 the selection range. For an empty selection (caret), scans outward from the
@@ -138,6 +143,15 @@ named.
 
 **Empty selection behavior**: uses the grapheme policy — the first grapheme
 forward or the preceding non-newline grapheme.
+
+**Indentation unit detection** (for indent/dedent and tabs↔spaces): a pure,
+deterministic detector analyzes non-blank lines' leading whitespace.
+Style is determined by majority vote of first whitespace character (tab vs
+space); width is the smallest mode of all-space runs of 1–8 spaces; ties
+use the smallest width; no signal defaults to `(Space, 4)`. The chosen unit
+is reported in the completion message (e.g., "Indent · unit: 4 spaces").
+Blank/whitespace-only lines are untouched by indent/dedent; conversion
+commands include them (their entire content is indentation).
 
 ### Lines menu (`⇧T`)
 

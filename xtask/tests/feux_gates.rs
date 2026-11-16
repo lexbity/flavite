@@ -1272,3 +1272,89 @@ fn feux0005_x01_gate_passes_clean_tree_and_rejects_regressions() {
     let missing = run_gate(temp.path(), "FEUX0005-X01");
     assert!(!missing.status.success());
 }
+
+fn seed_feux0005_x02_inputs(root: &Path) {
+    seed_feux0005_x01_inputs(root);
+    // FEUX-0005 X02: Whitespace conversion family
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/indent.rs",
+        "pub fn tabs_to_spaces_line(line: &str, width: u8)\npub fn spaces_to_tabs_line(line: &str, width: u8)\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/commands.rs",
+        "ReWhitespace { to_tabs: bool },\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/vocabulary.rs",
+        "TabsToSpaces,\nSpacesToTabs,\n\"editor.tabs_to_spaces\",\n\"editor.spaces_to_tabs\",\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/keymap.rs",
+        "BindingId::Command(ContextCommand::TabsToSpaces),\nKeyCode::KeyE,\nBindingId::Command(ContextCommand::SpacesToTabs),\nKeyCode::KeyR,\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/src/editor_commands.rs",
+        "pub struct EditorReWhitespaceArgs\nhandle_editor_tabs_to_spaces\nhandle_editor_spaces_to_tabs\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/src/flavite.rs",
+        "\"editor.tabs_to_spaces\"\n\"editor.spaces_to_tabs\"\nhandle_editor_tabs_to_spaces\nhandle_editor_spaces_to_tabs\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/context_mode.rs",
+        "TabsToSpaces =>\nSpacesToTabs =>\n",
+    );
+}
+
+#[test]
+fn feux0005_x02_gate_passes_clean_tree_and_rejects_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_feux0005_x02_inputs(temp.path());
+    let clean = run_gate(temp.path(), "FEUX0005-X02");
+    assert!(
+        clean.status.success(),
+        "FEUX0005-X02 gate should pass on clean tree: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Missing conversion functions should fail
+    fs::remove_file(temp.path().join("crates/flavite-buffer/src/indent.rs")).unwrap();
+    let missing = run_gate(temp.path(), "FEUX0005-X02");
+    assert!(!missing.status.success());
+}
+
+fn seed_feux0005_x03_inputs(root: &Path) {
+    seed_feux0005_x02_inputs(root);
+    // FEUX-0005 X03: Auto-indent for OpenLine
+    // The OpenLine operation should copy leading whitespace
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/commands.rs",
+        "OpenLine { above: bool },\nleading_whitespace\n",
+    );
+}
+
+#[test]
+fn feux0005_x03_gate_passes_clean_tree_and_rejects_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_feux0005_x03_inputs(temp.path());
+    let clean = run_gate(temp.path(), "FEUX0005-X03");
+    assert!(
+        clean.status.success(),
+        "FEUX0005-X03 gate should pass on clean tree: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Missing leading_whitespace usage in OpenLine should fail
+    // Remove the OpenLine handling
+    fs::remove_file(temp.path().join("crates/flavite-buffer/src/commands.rs")).unwrap();
+    let missing = run_gate(temp.path(), "FEUX0005-X03");
+    assert!(!missing.status.success());
+}

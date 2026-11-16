@@ -3,6 +3,7 @@
 use crate::app::{App, Message};
 use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, Origin};
+use flavite_buffer::indent::{detect_unit, Unit};
 use flavite_edit_context::{
     BindingId, ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event,
     PendingCommand, reduce,
@@ -1181,6 +1182,25 @@ fn kernel_task(
     match kernel_mutate(app, target, api_id, args, refused) {
         Some(success) => {
             install_receipt(app, target, &success);
+            // FEUX-0005 E-9: Report unit in completion message for width-consuming commands
+            if matches!(
+                api_id,
+                "editor.indent" | "editor.dedent" | "editor.tabs_to_spaces" | "editor.spaces_to_tabs"
+            ) {
+                // Detect unit from the current buffer text
+                if let Some(view) = app.note_editor_view(target.tab) {
+                    let detected_unit = flavite_buffer::indent::detect_unit(&view.text);
+                    let message = match api_id {
+                        "editor.indent" => format!("Indent · unit: {}", detected_unit.display()),
+                        "editor.dedent" => format!("Dedent · unit: {}", detected_unit.display()),
+                        "editor.tabs_to_spaces" => format!("Tabs → Spaces · unit: {}", detected_unit.display()),
+                        "editor.spaces_to_tabs" => format!("Spaces → Tabs · unit: {}", detected_unit.display()),
+                        _ => String::new(),
+                    };
+                    app.context_mode.notice(&message);
+                }
+            }
+
             // FEUX-0004 X05: Record successful mutations for `.` repeat
             // Exclude non-mutating commands and commands that shouldn't be repeated
             let should_record = !matches!(
@@ -2177,6 +2197,25 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 "editor.dedent",
                 args,
                 "Dedent was refused; source changed",
+            )
+        }
+        // FEUX-0005 X02: Whitespace conversion (E-9: unit display in message)
+        TabsToSpaces => {
+            kernel_task(
+                app,
+                &target,
+                "editor.tabs_to_spaces",
+                serde_json::json!({}),
+                "Tabs → Spaces was refused; source changed",
+            )
+        }
+        SpacesToTabs => {
+            kernel_task(
+                app,
+                &target,
+                "editor.spaces_to_tabs",
+                serde_json::json!({}),
+                "Spaces → Tabs was refused; source changed",
             )
         }
         // FEUX-0004 X05/X06: Repeat last command (count· for sequential replays)

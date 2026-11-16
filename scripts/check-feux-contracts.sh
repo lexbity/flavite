@@ -619,6 +619,48 @@ run_feux0005_x01_gates() {
     gate assert_present 'Slot::shifted.*Comma' "$root/crates/flavite-edit-context/src/keymap.rs"
 }
 
+run_feux0005_x02_gates() {
+    # FEUX-0005 X02: Whitespace conversion family presence gates
+    # Core module exists (already checked by X01)
+    gate assert_nonempty "$root/crates/flavite-buffer/src/indent.rs"
+    # Conversion functions exist
+    gate assert_present 'tabs_to_spaces_line' "$root/crates/flavite-buffer/src/indent.rs"
+    gate assert_present 'spaces_to_tabs_line' "$root/crates/flavite-buffer/src/indent.rs"
+    # Planner op exists
+    gate assert_present 'ReWhitespace' "$root/crates/flavite-buffer/src/commands.rs"
+    # Vocabulary commands exist
+    gate assert_present 'TabsToSpaces' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'SpacesToTabs' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'editor.tabs_to_spaces' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'editor.spaces_to_tabs' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    # Keymap bindings (Transform menu)
+    gate assert_present 'BindingId::Command.*TabsToSpaces' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'BindingId::Command.*SpacesToTabs' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'ContextMenu::Transform' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'KeyCode::KeyE' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'KeyCode::KeyR' "$root/crates/flavite-edit-context/src/keymap.rs"
+    # API handlers
+    gate assert_present 'handle_editor_tabs_to_spaces' "$root/crates/flavite-api/src/editor_commands.rs"
+    gate assert_present 'handle_editor_spaces_to_tabs' "$root/crates/flavite-api/src/editor_commands.rs"
+    gate assert_present 'editor.tabs_to_spaces' "$root/crates/flavite-api/src/flavite.rs"
+    gate assert_present 'editor.spaces_to_tabs' "$root/crates/flavite-api/src/flavite.rs"
+    # UI dispatch arms
+    gate assert_present 'TabsToSpaces =>' "$root/crates/flavite-ui/src/host/context_mode.rs"
+    gate assert_present 'SpacesToTabs =>' "$root/crates/flavite-ui/src/host/context_mode.rs"
+}
+
+run_feux0005_x03_gates() {
+    # FEUX-0005 X03: Auto-indent for OpenLine
+    # Core module exists (already checked by X01/X02)
+    gate assert_nonempty "$root/crates/flavite-buffer/src/indent.rs"
+    # OpenLine operation exists (already checked by X01)
+    gate assert_present 'OpenLine' "$root/crates/flavite-buffer/src/commands.rs"
+    # leading_whitespace function exists and is used
+    gate assert_present 'leading_whitespace' "$root/crates/flavite-buffer/src/commands.rs"
+    # import of leading_whitespace in commands.rs
+    gate assert_present 'leading_whitespace' "$root/crates/flavite-buffer/src/commands.rs"
+}
+
 case "$slice" in
     X01) run_x01_gates ;;
     X02) run_x02_gates ;;
@@ -629,6 +671,8 @@ case "$slice" in
     X07) run_x07_gates ;;
     X08) run_x08_gates ;;
     FEUX0005-X01) run_feux0005_x01_gates ;;
+    FEUX0005-X02) run_feux0005_x02_gates ;;
+    FEUX0005-X03) run_feux0005_x03_gates ;;
     FEUX0004-X07) run_feux0004_x07_gates ;;
     FEUX0003-X01) run_feux0003_x01_gates ;;
     FEUX0003-X02) run_feux0003_x02_gates ;;

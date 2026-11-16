@@ -823,6 +823,17 @@ pub const DEFAULT_MENUS: &[(ContextMenu, BindingId, KeyCode)] = &[
         BindingId::Command(ContextCommand::NumberSequence),
         KeyCode::KeyQ,
     ),
+    // FEUX-0005 X02: Whitespace conversion in Transform menu
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::TabsToSpaces),
+        KeyCode::KeyE,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::SpacesToTabs),
+        KeyCode::KeyR,
+    ),
     // FEUX-0004 X01: Lines menu accelerators (E-2)
     (
         ContextMenu::Lines,

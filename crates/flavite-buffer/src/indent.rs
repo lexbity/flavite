@@ -293,6 +293,127 @@ pub fn leading_whitespace(line: &str) -> String {
         .collect()
 }
 
+/// Convert leading tabs to spaces in a line.
+///
+/// Normative algorithm from FEUX-0005 §5.3:
+/// Every `\t` in the leading whitespace run expands to `width` spaces.
+/// Spaces pass through unchanged. Content tabs (non-leading) are untouched.
+///
+/// # Arguments
+/// * `line` - The input line
+/// * `width` - The number of spaces each tab should expand to
+///
+/// # Returns
+/// The line with leading tabs converted to spaces.
+#[must_use]
+pub fn tabs_to_spaces_line(line: &str, width: u8) -> String {
+    let leading = leading_whitespace(line);
+    let content = line[leading.len()..].to_string();
+    
+    let converted: String = leading
+        .chars()
+        .map(|c| if c == '\t' {
+            " ".repeat(width as usize)
+        } else {
+            c.to_string()
+        })
+        .collect();
+    
+    converted + &content
+}
+
+/// Convert leading spaces to tabs in a line.
+///
+/// Normative algorithm from FEUX-0005 §5.3:
+/// Greedy conversion: each consecutive `width` spaces becomes one tab.
+/// Existing tabs pass through unchanged.
+/// A remainder shorter than `width` stays as spaces.
+/// Content spaces (non-leading) are untouched.
+///
+/// # Arguments
+/// * `line` - The input line
+/// * `width` - The tab width (number of spaces per tab)
+///
+/// # Returns
+/// The line with leading spaces converted to tabs (where possible).
+#[must_use]
+pub fn spaces_to_tabs_line(line: &str, width: u8) -> String {
+    let leading = leading_whitespace(line);
+    let content = line[leading.len()..].to_string();
+    
+    // Process the leading whitespace: greedy conversion
+    // We need to handle the entire leading string as a sequence
+    let w = width as usize;
+    let mut result = String::new();
+    let mut i = 0;
+    let chars: Vec<char> = leading.chars().collect();
+    
+    while i < chars.len() {
+        if chars[i] == '\t' {
+            // Existing tab passes through
+            result.push('\t');
+            i += 1;
+        } else if chars[i] == ' ' {
+            // Count consecutive spaces
+            let mut j = i;
+            while j < chars.len() && chars[j] == ' ' {
+                j += 1;
+            }
+            let space_count = j - i;
+            
+            // Convert as many full tabs as possible
+            let tabs = space_count / w;
+            let remainder = space_count % w;
+            
+            result.push_str(&"\t".repeat(tabs));
+            result.push_str(&" ".repeat(remainder));
+            
+            i = j;
+        } else {
+            // Should not happen
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    
+    result + &content
+}
+
+/// Check if converting a line would produce any changes.
+#[must_use]
+pub fn conversion_would_change(line: &str, to_tabs: bool, width: u8) -> bool {
+    let leading = leading_whitespace(line);
+    if leading.is_empty() {
+        return false;
+    }
+    
+    if to_tabs {
+        // Check if there are any spaces that could be converted
+        // We need at least `width` consecutive spaces somewhere in the leading whitespace
+        let mut consecutive_spaces = 0;
+        for c in leading.chars() {
+            match c {
+                ' ' => {
+                    consecutive_spaces += 1;
+                    if consecutive_spaces >= width as usize {
+                        return true;
+                    }
+                }
+                '\t' => {
+                    consecutive_spaces = 0;
+                }
+                _ => {
+                    consecutive_spaces = 0;
+                }
+            }
+        }
+        false
+    } else {
+        // Check if there are any tabs
+        leading.contains('\t')
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +565,84 @@ mod tests {
         let unit = detect_unit(text);
         assert_eq!(unit.style, Style::Space);
         assert_eq!(unit.width, 4); // fallback
+    }
+
+    // Conversion tests (FEUX-0005 §5.3)
+    #[test]
+    fn test_tabs_to_spaces_line() {
+        // Leading tabs only
+        assert_eq!(
+            tabs_to_spaces_line("\tfn main()", 4),
+            "    fn main()"
+        );
+        assert_eq!(
+            tabs_to_spaces_line("\t\tfn main()", 4),
+            "        fn main()"
+        );
+        // Content tabs untouched
+        assert_eq!(
+            tabs_to_spaces_line("    fn main() {\tprintln!();}", 4),
+            "    fn main() {\tprintln!();}"
+        );
+        // Mixed leading
+        assert_eq!(
+            tabs_to_spaces_line("\t  fn main()", 4),
+            "      fn main()"  // tab=4 spaces + 2 spaces = 6 spaces
+        );
+    }
+
+    #[test]
+    fn test_spaces_to_tabs_line() {
+        // Exact multiples
+        assert_eq!(
+            spaces_to_tabs_line("    fn main()", 4),
+            "\tfn main()"
+        );
+        assert_eq!(
+            spaces_to_tabs_line("        fn main()", 4),
+            "\t\tfn main()"
+        );
+        // With remainder
+        assert_eq!(
+            spaces_to_tabs_line("   fn main()", 4),
+            "   fn main()"  // 3 < 4, stays as spaces
+        );
+        assert_eq!(
+            spaces_to_tabs_line("     fn main()", 4),
+            "\t fn main()"  // 5 = 4 + 1, so tab + 1 space
+        );
+        assert_eq!(
+            spaces_to_tabs_line("      fn main()", 4),
+            "\t  fn main()"  // 6 = 4 + 2, so tab + 2 spaces
+        );
+        assert_eq!(
+            spaces_to_tabs_line("       fn main()", 4),
+            "\t   fn main()"  // 7 = 4 + 3, so tab + 3 spaces
+        );
+        // Content spaces untouched
+        assert_eq!(
+            spaces_to_tabs_line("    fn main() { let x = 1; }", 4),
+            "\tfn main() { let x = 1; }"
+        );
+        // Mixed leading (spaces then tab)
+        assert_eq!(
+            spaces_to_tabs_line("  \tfn main()", 4),
+            "  \tfn main()"  // existing tab passes through, spaces stay
+        );
+    }
+
+    #[test]
+    fn test_conversion_would_change() {
+        // tabs_to_spaces: to_tabs = false, check for tabs
+        assert!(conversion_would_change("\tfn", false, 4));
+        assert!(!conversion_would_change("    fn", false, 4));
+        assert!(!conversion_would_change("fn", false, 4));
+        
+        // spaces_to_tabs: to_tabs = true, check for convertible spaces
+        assert!(!conversion_would_change("\tfn", true, 4));
+        assert!(conversion_would_change("    fn", true, 4));
+        assert!(!conversion_would_change("fn", true, 4));
+        assert!(conversion_would_change("     fn", true, 4)); // 5 spaces, at least 4
+        assert!(!conversion_would_change("   fn", true, 4)); // 3 spaces, less than 4
     }
 }

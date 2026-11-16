@@ -1504,6 +1504,19 @@ impl Flavite {
                 ArgSchema::typed::<crate::editor_commands::EditorIndentArgs>(),
                 crate::editor_commands::handle_editor_dedent,
             ),
+            // FEUX-0005 X02: Whitespace conversion
+            (
+                "editor.tabs_to_spaces",
+                "Tabs → Spaces",
+                ArgSchema::typed::<crate::editor_commands::EditorReWhitespaceArgs>(),
+                crate::editor_commands::handle_editor_tabs_to_spaces,
+            ),
+            (
+                "editor.spaces_to_tabs",
+                "Spaces → Tabs",
+                ArgSchema::typed::<crate::editor_commands::EditorReWhitespaceArgs>(),
+                crate::editor_commands::handle_editor_spaces_to_tabs,
+            ),
             // FEUX-0004 X03: Align and Goto-line
             (
                 "editor.lines_align",
