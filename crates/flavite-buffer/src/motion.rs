@@ -154,14 +154,14 @@ pub fn apply_with_count(
         // Count of 0 means no motion - return the original set
         return Ok(set.clone());
     }
-    
+
     // For visual motions, we need to apply the count to the editor-computed targets
     // This is done by the editor, not here
     if motion.is_visual() {
         // For now, just apply once - visual motion count support needs editor changes
         return apply(text, set, motion, extend, targets);
     }
-    
+
     // For text-pure motions, apply the motion count times iteratively
     let mut result = set.clone();
     for _ in 0..count {

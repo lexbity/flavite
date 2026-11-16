@@ -129,6 +129,11 @@ pub enum ContextCommand {
     SurroundChange,
     /// Delete surrounding delimiters from each selection.
     SurroundDelete,
+    // FEUX-0005 X01: Indent family
+    /// Indent each selection's containing line block by one unit.
+    Indent,
+    /// Dedent each selection's containing line block by one unit.
+    Dedent,
 }
 
 impl ContextCommand {
@@ -198,6 +203,9 @@ impl ContextCommand {
         Self::SurroundAdd,
         Self::SurroundChange,
         Self::SurroundDelete,
+        // FEUX-0005 X01: Indent family
+        Self::Indent,
+        Self::Dedent,
     ];
 
     #[must_use]
@@ -271,6 +279,9 @@ impl ContextCommand {
             Self::SurroundAdd => "editor.surround_add",
             Self::SurroundChange => "editor.surround_change",
             Self::SurroundDelete => "editor.surround_delete",
+            // FEUX-0005 X01: Indent family
+            Self::Indent => "editor.indent",
+            Self::Dedent => "editor.dedent",
         }
     }
 
@@ -344,6 +355,9 @@ impl ContextCommand {
             Self::SurroundAdd => "Surround add",
             Self::SurroundChange => "Surround change",
             Self::SurroundDelete => "Surround delete",
+            // FEUX-0005 X01: Indent family
+            Self::Indent => "Indent",
+            Self::Dedent => "Dedent",
         }
     }
 
@@ -384,6 +398,9 @@ impl ContextCommand {
                 | Self::SurroundAdd
                 | Self::SurroundChange
                 | Self::SurroundDelete
+                // FEUX-0005 X01: Indent family - all mutate
+                | Self::Indent
+                | Self::Dedent
                 // FEUX-0004 X05: RepeatLast may mutate (replays a command that may mutate)
                 | Self::RepeatLast
         )
@@ -518,11 +535,7 @@ impl ContextMenu {
                 C::LinesAlign,
             ],
             // FEUX-0004 X04: Surround menu (E-2)
-            Self::Surround => &[
-                C::SurroundAdd,
-                C::SurroundChange,
-                C::SurroundDelete,
-            ],
+            Self::Surround => &[C::SurroundAdd, C::SurroundChange, C::SurroundDelete],
         }
     }
 }

@@ -112,11 +112,7 @@ pub struct PairMatch {
 ///
 /// Returns `Some(PairMatch)` if a matching pair is found, `None` otherwise.
 #[must_use]
-pub fn find_enclosing_pair(
-    text: &str,
-    member: &Selection,
-    pair: &Pair,
-) -> Option<PairMatch> {
+pub fn find_enclosing_pair(text: &str, member: &Selection, pair: &Pair) -> Option<PairMatch> {
     if pair.is_self_pair() {
         find_enclosing_self_pair(text, member, pair)
     } else {
@@ -125,11 +121,7 @@ pub fn find_enclosing_pair(
 }
 
 /// Find enclosing self-pair (quotes).
-fn find_enclosing_self_pair(
-    text: &str,
-    member: &Selection,
-    pair: &Pair,
-) -> Option<PairMatch> {
+fn find_enclosing_self_pair(text: &str, member: &Selection, pair: &Pair) -> Option<PairMatch> {
     let quote_char = pair.open;
     let bytes = text.as_bytes();
     let member_start = member.start();
@@ -207,11 +199,7 @@ fn is_escaped(text: &str, pos: usize) -> bool {
 }
 
 /// Find enclosing nesting pair (parentheses, braces, brackets, angle brackets).
-fn find_enclosing_nesting_pair(
-    text: &str,
-    member: &Selection,
-    pair: &Pair,
-) -> Option<PairMatch> {
+fn find_enclosing_nesting_pair(text: &str, member: &Selection, pair: &Pair) -> Option<PairMatch> {
     let open_char = pair.open;
     let close_char = pair.close;
     let bytes = text.as_bytes();
@@ -283,11 +271,7 @@ pub enum SurroundValidation {
 ///
 /// Returns `Valid` if all have pairs, or `MissingPairs` with counts if any don't.
 #[must_use]
-pub fn validate_enclosing_pairs(
-    text: &str,
-    set: &SelectionSet,
-    pair: &Pair,
-) -> SurroundValidation {
+pub fn validate_enclosing_pairs(text: &str, set: &SelectionSet, pair: &Pair) -> SurroundValidation {
     let mut missing_count = 0;
     for member in set.iter() {
         if find_enclosing_pair(text, member, pair).is_none() {

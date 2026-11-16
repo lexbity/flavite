@@ -9,6 +9,7 @@ pub mod budget;
 pub mod commands;
 pub mod eol;
 pub mod history;
+pub mod indent;
 pub mod manager;
 pub mod model;
 pub mod motion;

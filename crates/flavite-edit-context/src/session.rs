@@ -54,7 +54,6 @@ impl PendingCommand {
             _ => AWAIT_CHAR_HINT,
         }
     }
-
 }
 
 /// Message constants for argument capture (FEUX-0004 E-6).
@@ -207,7 +206,6 @@ impl AwaitArgs {
     pub fn message(&self) -> &'static str {
         self.command.message_for_index(self.index)
     }
-
 }
 
 /// Statechart events the host forwards after its admission classification.
@@ -334,7 +332,7 @@ impl ContextState {
         let current = self.await_args.take()?;
         let mut collected_chars = current.collected_chars;
         collected_chars.push(char);
-        
+
         if collected_chars.len() >= current.command.arg_count() {
             // All arguments collected
             self.await_args = None;
@@ -357,7 +355,9 @@ impl ContextState {
     /// Get the collected characters without consuming.
     #[must_use]
     pub fn collected_chars(&self) -> Option<&[char]> {
-        self.await_args.as_ref().map(|args| args.collected_chars.as_slice())
+        self.await_args
+            .as_ref()
+            .map(|args| args.collected_chars.as_slice())
     }
 
     /// The current message and whether it demands attention (an error
@@ -883,10 +883,7 @@ mod tests {
             false,
         );
         assert!(state.await_args().is_some());
-        assert_eq!(
-            state.message(),
-            (AWAIT_CHAR_HINT, false)
-        );
+        assert_eq!(state.message(), (AWAIT_CHAR_HINT, false));
 
         // Escape cancels it
         let _ = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
@@ -904,10 +901,7 @@ mod tests {
         let args = state.await_args().unwrap();
         assert_eq!(args.index, 0);
         assert_eq!(args.command, PendingCommand::SurroundChange);
-        assert_eq!(
-            state.message(),
-            (AWAIT_CHAR_HINT, false)
-        );
+        assert_eq!(state.message(), (AWAIT_CHAR_HINT, false));
 
         // Collect first char - should advance to second arg
         let collected = state.collect_char('(');
@@ -915,10 +909,7 @@ mod tests {
         let args = state.await_args().unwrap();
         assert_eq!(args.index, 1);
         assert_eq!(args.collected_chars, vec!['(']);
-        assert_eq!(
-            state.message(),
-            (AWAIT_SECOND_CHAR_HINT, false)
-        );
+        assert_eq!(state.message(), (AWAIT_SECOND_CHAR_HINT, false));
 
         // Collect second char - should complete
         let collected = state.collect_char('[');
@@ -929,7 +920,6 @@ mod tests {
 
     #[test]
     fn collect_char_advances_and_completes() {
-
         // Test single-char command (SurroundAdd)
         let mut state = ContextState::activated();
         let _ = r(
@@ -972,7 +962,7 @@ mod tests {
     }
 
     // FEUX-0004 X06: Count state machine tests (E-4 §5.2)
-    
+
     #[test]
     fn count_digit_starts_and_extends_count() {
         // Starting from Command mode with no count
@@ -1065,7 +1055,12 @@ mod tests {
         let _ = r(&mut state, &Event::CountDigit(5), 0, false);
         assert_eq!(state.count(), Some(5));
 
-        let _ = r(&mut state, &Event::RunAdmitted(ContextCommand::Delete), 0, false);
+        let _ = r(
+            &mut state,
+            &Event::RunAdmitted(ContextCommand::Delete),
+            0,
+            false,
+        );
         assert_eq!(state.count(), None);
     }
 
@@ -1076,7 +1071,12 @@ mod tests {
         assert_eq!(state.count(), Some(5));
 
         // Enter AwaitArgs - count should be retained
-        let _ = r(&mut state, &Event::EnterAwaitArgs(AwaitArgs::find_char(true)), 0, false);
+        let _ = r(
+            &mut state,
+            &Event::EnterAwaitArgs(AwaitArgs::find_char(true)),
+            0,
+            false,
+        );
         assert_eq!(state.count(), Some(5));
         assert!(state.await_args().is_some());
     }
@@ -1084,14 +1084,14 @@ mod tests {
     #[test]
     fn count_methods_work() {
         let mut state = ContextState::activated();
-        
+
         // Initially no count
         assert_eq!(state.count(), None);
-        
+
         // Set count
         state.set_count(Some(42));
         assert_eq!(state.count(), Some(42));
-        
+
         // Clear count
         state.clear_count();
         assert_eq!(state.count(), None);

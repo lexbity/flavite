@@ -1215,3 +1215,60 @@ fn feux0004_x07_gate_passes_clean_tree_and_rejects_regressions() {
         "pub struct CommandArgsState {}\npub enum FieldSpec { Text { placeholder: String, literal_only: true }, Number }\n",
     );
 }
+
+fn seed_feux0005_x01_inputs(root: &Path) {
+    seed_feux0004_x07_inputs(root);
+    // FEUX-0005 X01: Indent family
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/indent.rs",
+        "pub enum Style { Tab, Space }\npub struct Unit { pub style: Style, pub width: u8 }\npub fn detect_unit(text: &str) -> Unit { Unit { style: Style::Space, width: 4 } }\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/commands.rs",
+        "IndentLines { amount: u32 },\nDedentLines { amount: u32 },\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/vocabulary.rs",
+        "Indent,\nDedent,\n\"editor.indent\",\n\"editor.dedent\",\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/keymap.rs",
+        "BindingId::Command(ContextCommand::Indent),\nSlot::shifted(KeyCode::Period),\nBindingId::Command(ContextCommand::Dedent),\nSlot::shifted(KeyCode::Comma),\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/src/editor_commands.rs",
+        "pub struct EditorIndentArgs\nhandle_editor_indent\nhandle_editor_dedent\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/src/flavite.rs",
+        "\"editor.indent\"\n\"editor.dedent\"\nhandle_editor_indent\nhandle_editor_dedent\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/context_mode.rs",
+        "Indent =>\nDedent =>\n",
+    );
+}
+
+#[test]
+fn feux0005_x01_gate_passes_clean_tree_and_rejects_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_feux0005_x01_inputs(temp.path());
+    let clean = run_gate(temp.path(), "FEUX0005-X01");
+    assert!(
+        clean.status.success(),
+        "FEUX0005-X01 gate should pass on clean tree: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Missing indent.rs should fail
+    fs::remove_file(temp.path().join("crates/flavite-buffer/src/indent.rs")).unwrap();
+    let missing = run_gate(temp.path(), "FEUX0005-X01");
+    assert!(!missing.status.success());
+}

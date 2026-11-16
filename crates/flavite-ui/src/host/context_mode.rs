@@ -4,8 +4,8 @@ use crate::app::{App, Message};
 use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, Origin};
 use flavite_edit_context::{
-    BindingId, ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, PendingCommand,
-    reduce,
+    BindingId, ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event,
+    PendingCommand, reduce,
 };
 use flavite_editor::{
     context::{native_code, native_modifiers},
@@ -696,7 +696,7 @@ pub fn native_key(
                                     app,
                                     &target,
                                     "editor.surround_change",
-                                    serde_json::json!({ 
+                                    serde_json::json!({
                                         "old_char": collected[0].to_string(),
                                         "new_char": collected[1].to_string()
                                     }),
@@ -812,7 +812,7 @@ pub fn native_key(
                     .session
                     .as_ref()
                     .map_or(true, |s| s.state.await_args().is_none());
-                
+
                 if no_menu && no_await_args {
                     // Check if this is a digit
                     if let Some(digit_value) = digit_value(code) {
@@ -1199,7 +1199,7 @@ fn kernel_task(
                 // Repeat itself (would be recursive)
                 "editor.repeat_last"
             );
-            
+
             if should_record {
                 // Extract args as BTreeMap for recording
                 let mut args_map = std::collections::BTreeMap::new();
@@ -1607,7 +1607,12 @@ fn enter_await_args(app: &mut App, target: &EditorTarget, pending: PendingComman
             args
         }
     };
-    let _ = reduce(&mut session.state, &Event::EnterAwaitArgs(args), now_ms, burst_enabled);
+    let _ = reduce(
+        &mut session.state,
+        &Event::EnterAwaitArgs(args),
+        now_ms,
+        burst_enabled,
+    );
 }
 
 fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Message> {
@@ -1697,7 +1702,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         .session
         .as_ref()
         .and_then(|s| s.state.count());
-    
+
     let (now_ms, burst_enabled) = chart_inputs(app);
     let effects = if let Some(s) = &mut app.context_mode.session {
         s.menu_target = None;
@@ -2145,6 +2150,35 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             enter_await_args(app, &target, PendingCommand::SurroundChange);
             iced::Task::none()
         }
+        // FEUX-0005 X01: Indent family (E-3: count = units)
+        Indent => {
+            let args = if let Some(n) = count {
+                serde_json::json!({"amount": n})
+            } else {
+                serde_json::json!({})
+            };
+            kernel_task(
+                app,
+                &target,
+                "editor.indent",
+                args,
+                "Indent was refused; source changed",
+            )
+        }
+        Dedent => {
+            let args = if let Some(n) = count {
+                serde_json::json!({"amount": n})
+            } else {
+                serde_json::json!({})
+            };
+            kernel_task(
+                app,
+                &target,
+                "editor.dedent",
+                args,
+                "Dedent was refused; source changed",
+            )
+        }
         // FEUX-0004 X05/X06: Repeat last command (count· for sequential replays)
         RepeatLast => {
             // Replay the last recorded invocation against the current selection set
@@ -2176,13 +2210,10 @@ pub(crate) fn record_invocation(
     args: std::collections::BTreeMap<String, String>,
 ) {
     use flavite_edit_context::session::InvocationRecord;
-    
+
     let (now_ms, burst_enabled) = chart_inputs(app);
     if let Some(s) = &mut app.context_mode.session {
-        let record = InvocationRecord {
-            command_id,
-            args,
-        };
+        let record = InvocationRecord { command_id, args };
         let _ = reduce(&mut s.state, &Event::Record(record), now_ms, burst_enabled);
     }
 }
@@ -2199,30 +2230,56 @@ fn replay_last(app: &mut App, target: EditorTarget) -> Task<Message> {
 /// Returns Task::none() after synchronous execution; all replay work happens
 /// in the current frame against the live state, so the UI will refresh with
 /// the final result in one pass.
-fn replay_last_with_count(app: &mut App, target: EditorTarget, count: Option<u32>) -> Task<Message> {
+fn replay_last_with_count(
+    app: &mut App,
+    target: EditorTarget,
+    count: Option<u32>,
+) -> Task<Message> {
     // Get the last recorded invocation - clone it to avoid borrow issues
-    let record = app.context_mode.session.as_ref().and_then(|s| s.state.repeat_last().cloned());
-    
+    let record = app
+        .context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.repeat_last().cloned());
+
     let Some(record) = record else {
         app.context_mode.notice("No command to repeat");
-        diag(app, target.tab, EventKind::RepeatOutcome, Outcome::NoRegister, None);
+        diag(
+            app,
+            target.tab,
+            EventKind::RepeatOutcome,
+            Outcome::NoRegister,
+            None,
+        );
         return focus(app, target.tab);
     };
-    
+
     // FEUX-0004 X06: if count is present, replay count times sequentially
     let count = count.unwrap_or(1);
-    
+
     // Build args object once
-    let args = serde_json::Value::Object(record.args.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect());
-    
+    let args = serde_json::Value::Object(
+        record
+            .args
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect(),
+    );
+
     // Synchronous replay loop: kernel_mutate is synchronous, so we apply each
     // replay in sequence against the live app state. After each successful
     // replay, we re-capture the target to get the updated revision/selection.
     let mut current_target = target;
-    
+
     for _ in 0..count {
         // Dispatch through kernel_mutate
-        let result = kernel_mutate(app, &current_target, record.command_id, args.clone(), "Repeat was refused; source changed");
+        let result = kernel_mutate(
+            app,
+            &current_target,
+            record.command_id,
+            args.clone(),
+            "Repeat was refused; source changed",
+        );
         match result {
             Some(success) => {
                 install_receipt(app, &current_target, &success);
@@ -2232,23 +2289,42 @@ fn replay_last_with_count(app: &mut App, target: EditorTarget, count: Option<u32
                 } else {
                     // If we can't capture, the tab might be closed - stop here
                     app.context_mode.notice("Tab closed during repeat");
-                    diag(app, current_target.tab, EventKind::RepeatOutcome, Outcome::Refused, Some(current_target.selections.len() as u32));
+                    diag(
+                        app,
+                        current_target.tab,
+                        EventKind::RepeatOutcome,
+                        Outcome::Refused,
+                        Some(current_target.selections.len() as u32),
+                    );
                     return Task::none();
                 }
             }
             None => {
-                app.context_mode.notice("Repeat was refused; source changed");
-                diag(app, current_target.tab, EventKind::RepeatOutcome, Outcome::Refused, Some(current_target.selections.len() as u32));
+                app.context_mode
+                    .notice("Repeat was refused; source changed");
+                diag(
+                    app,
+                    current_target.tab,
+                    EventKind::RepeatOutcome,
+                    Outcome::Refused,
+                    Some(current_target.selections.len() as u32),
+                );
                 return Task::none();
             }
         }
-        
+
         // The spec says: "a replay that refuses stops the run with its reason
         // (no rollback across replays — each replay is its own undo node, which
         // is also the recovery)". Since kernel_mutate returned Some, it succeeded.
     }
-    
-    diag(app, current_target.tab, EventKind::RepeatOutcome, Outcome::Replayed, Some(current_target.selections.len() as u32));
+
+    diag(
+        app,
+        current_target.tab,
+        EventKind::RepeatOutcome,
+        Outcome::Replayed,
+        Some(current_target.selections.len() as u32),
+    );
     // Return focus to ensure UI updates
     focus(app, current_target.tab)
 }

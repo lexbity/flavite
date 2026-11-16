@@ -1102,12 +1102,18 @@ pub fn find_char_with_count(
 /// Helper function to find the nth occurrence of a character in text.
 /// If forward is true, searches forward from start_pos.
 /// If forward is false, searches backward from start_pos.
-fn find_nth_char(text: &str, start_pos: usize, target: char, count: u32, forward: bool) -> Option<usize> {
+fn find_nth_char(
+    text: &str,
+    start_pos: usize,
+    target: char,
+    count: u32,
+    forward: bool,
+) -> Option<usize> {
     if count == 0 {
         return None;
     }
     let mut found_count = 0u32;
-    
+
     if forward {
         // Search forward
         let mut pos = start_pos;
@@ -1122,13 +1128,19 @@ fn find_nth_char(text: &str, start_pos: usize, target: char, count: u32, forward
         // Search backward
         let text_before = &text[..start_pos];
         let chars: Vec<_> = text_before.chars().collect();
-        
+
         for (i, c) in chars.iter().enumerate().rev() {
             if *c == target {
                 found_count += 1;
                 if found_count == count {
                     // Calculate the byte position from the index
-                    return Some(text_before.char_indices().nth(i).map(|(idx, _)| idx).unwrap_or(0));
+                    return Some(
+                        text_before
+                            .char_indices()
+                            .nth(i)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0),
+                    );
                 }
             }
         }

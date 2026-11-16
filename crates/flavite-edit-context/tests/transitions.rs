@@ -5,7 +5,8 @@
 //! every matrix row is reachable without touching private fields.
 
 use flavite_edit_context::{
-    ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, reduce, session::{AwaitArgs, AWAIT_CHAR_HINT, AWAIT_SECOND_CHAR_HINT},
+    ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, reduce,
+    session::{AWAIT_CHAR_HINT, AWAIT_SECOND_CHAR_HINT, AwaitArgs},
 };
 
 /// Drive the public statechart with the deterministic test clock and the

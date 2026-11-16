@@ -589,6 +589,36 @@ run_feux0003_x07_gates() {
     gate assert_present 'Rebindable Context Mode keys' "$root/docs/APP-FEATURES.md"
 }
 
+run_feux0005_x01_gates() {
+    # FEUX-0005 X01: Indent family presence gates
+    # Core module exists
+    gate assert_nonempty "$root/crates/flavite-buffer/src/indent.rs"
+    # Planner ops exist
+    gate assert_present 'IndentLines' "$root/crates/flavite-buffer/src/commands.rs"
+    gate assert_present 'DedentLines' "$root/crates/flavite-buffer/src/commands.rs"
+    # Vocabulary commands exist
+    gate assert_present 'Indent' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'Dedent' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'editor.indent' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'editor.dedent' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    # Keymap bindings
+    gate assert_present 'BindingId::Command.*Indent' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'BindingId::Command.*Dedent' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'Slot::shifted.*Period' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'Slot::shifted.*Comma' "$root/crates/flavite-edit-context/src/keymap.rs"
+    # API handlers
+    gate assert_present 'handle_editor_indent' "$root/crates/flavite-api/src/editor_commands.rs"
+    gate assert_present 'handle_editor_dedent' "$root/crates/flavite-api/src/editor_commands.rs"
+    gate assert_present 'editor.indent' "$root/crates/flavite-api/src/flavite.rs"
+    gate assert_present 'editor.dedent' "$root/crates/flavite-api/src/flavite.rs"
+    # UI dispatch arms
+    gate assert_present 'Indent =>' "$root/crates/flavite-ui/src/host/context_mode.rs"
+    gate assert_present 'Dedent =>' "$root/crates/flavite-ui/src/host/context_mode.rs"
+    # UI keymap classification
+    gate assert_present 'Slot::shifted.*Period' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'Slot::shifted.*Comma' "$root/crates/flavite-edit-context/src/keymap.rs"
+}
+
 case "$slice" in
     X01) run_x01_gates ;;
     X02) run_x02_gates ;;
@@ -598,6 +628,7 @@ case "$slice" in
     X06) run_x06_gates ;;
     X07) run_x07_gates ;;
     X08) run_x08_gates ;;
+    FEUX0005-X01) run_feux0005_x01_gates ;;
     FEUX0004-X07) run_feux0004_x07_gates ;;
     FEUX0003-X01) run_feux0003_x01_gates ;;
     FEUX0003-X02) run_feux0003_x02_gates ;;
@@ -606,7 +637,7 @@ case "$slice" in
     FEUX0003-X05) run_feux0003_x05_gates ;;
     FEUX0003-X06) run_feux0003_x06_gates ;;
     FEUX0003-X07) run_feux0003_x07_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08 FEUX0004-X07 FEUX0003-X01 FEUX0003-X02 FEUX0003-X03 FEUX0003-X04 FEUX0003-X05 FEUX0003-X06 FEUX0003-X07)" >&2; exit 2 ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08 FEUX0005-X01 FEUX0004-X07 FEUX0003-X01 FEUX0003-X02 FEUX0003-X03 FEUX0003-X04 FEUX0003-X05 FEUX0003-X06 FEUX0003-X07)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

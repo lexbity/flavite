@@ -1491,6 +1491,19 @@ impl Flavite {
                 ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
                 crate::editor_commands::handle_lines_move_down,
             ),
+            // FEUX-0005 X01: Indent family
+            (
+                "editor.indent",
+                "Indent",
+                ArgSchema::typed::<crate::editor_commands::EditorIndentArgs>(),
+                crate::editor_commands::handle_editor_indent,
+            ),
+            (
+                "editor.dedent",
+                "Dedent",
+                ArgSchema::typed::<crate::editor_commands::EditorIndentArgs>(),
+                crate::editor_commands::handle_editor_dedent,
+            ),
             // FEUX-0004 X03: Align and Goto-line
             (
                 "editor.lines_align",

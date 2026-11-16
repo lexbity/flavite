@@ -14,6 +14,7 @@
 //! line) per §6 "existing ordinary semantics preserved". Typing inserts at
 //! every caret; paste broadcasts through `Typing`.
 
+use crate::indent::{dedent_step, detect_unit, is_blank_or_ws, leading_whitespace};
 use crate::numbers::{
     NumberError, extract_first_number, increment_number, number_range, scan_number,
 };
@@ -117,10 +118,23 @@ pub enum EditOperation {
     SurroundAdd { open: String, close: String },
     /// Change surrounding delimiters of each member's range.
     /// The pair must exist and enclose each member.
-    SurroundChange { old_open: String, old_close: String, new_open: String, new_close: String },
+    SurroundChange {
+        old_open: String,
+        old_close: String,
+        new_open: String,
+        new_close: String,
+    },
     /// Delete surrounding delimiters from each member's range.
     /// The pair must exist and enclose each member.
     SurroundDelete { open: String, close: String },
+    // FEUX-0005 X01: Indent family
+    /// Indent each member's containing line block by `amount` units.
+    /// Blank/whitespace-only lines are left untouched.
+    IndentLines { amount: u32 },
+    /// Dedent each member's containing line block by `amount` units.
+    /// Dedent uses tab-stop alignment (previous tab stop per line).
+    /// Lines at column 0 are unchanged; all-at-0 invocation is a zero-effect no-op.
+    DedentLines { amount: u32 },
 }
 
 /// A planned edit batch.
@@ -894,11 +908,12 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                 if let Some(pair_match) = crate::pairs::find_enclosing_pair(
                     text,
                     member,
-                    &crate::pairs::Pair::from_open(open.chars().next().unwrap_or('(')).unwrap_or_else(|| crate::pairs::Pair {
-                        open: '(',
-                        close: ')',
-                        is_nesting: true,
-                    }),
+                    &crate::pairs::Pair::from_open(open.chars().next().unwrap_or('('))
+                        .unwrap_or_else(|| crate::pairs::Pair {
+                            open: '(',
+                            close: ')',
+                            is_nesting: true,
+                        }),
                 ) {
                     // Delete both delimiters - two separate edits
                     planned.push(PlannedEdit {
@@ -923,8 +938,12 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
             // Must validate that all members have the enclosing pair
             for member in set.iter() {
                 // Find the enclosing pair
-                if let Some(old_pair) = crate::pairs::Pair::from_open(old_open.chars().next().unwrap_or('(')) {
-                    if let Some(pair_match) = crate::pairs::find_enclosing_pair(text, member, &old_pair) {
+                if let Some(old_pair) =
+                    crate::pairs::Pair::from_open(old_open.chars().next().unwrap_or('('))
+                {
+                    if let Some(pair_match) =
+                        crate::pairs::find_enclosing_pair(text, member, &old_pair)
+                    {
                         // Replace old open with new open
                         planned.push(PlannedEdit {
                             start: pair_match.open_start,
@@ -936,6 +955,108 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                             start: pair_match.close_start,
                             end: pair_match.close_end,
                             replacement: new_close.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // FEUX-0005 X01: Indent family
+        EditOperation::IndentLines { amount } => {
+            // Detect unit from the entire text (per E-2: per invocation)
+            let unit = detect_unit(text);
+            let unit_text = unit.unit_text();
+
+            for member in set.iter() {
+                if let Some((block_start, block_end, lines, has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    // Build new lines with indentation added to non-blank lines
+                    let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
+                    let mut any_change = false;
+
+                    for line in &lines {
+                        if is_blank_or_ws(line) {
+                            // Blank/whitespace-only lines untouched (E-3)
+                            new_lines.push(line.to_string());
+                        } else {
+                            // Prepend `amount` units
+                            new_lines.push(format!(
+                                "{}{}",
+                                unit_text.repeat(*amount as usize),
+                                line
+                            ));
+                            any_change = true;
+                        }
+                    }
+
+                    if any_change {
+                        let replacement = new_lines.join("\n");
+                        let replacement = if has_trailing_newline && !replacement.ends_with('\n') {
+                            replacement + "\n"
+                        } else {
+                            replacement
+                        };
+                        planned.push(PlannedEdit {
+                            start: block_start,
+                            end: block_end,
+                            replacement,
+                        });
+                    }
+                }
+            }
+        }
+        EditOperation::DedentLines { amount } => {
+            // Detect unit from the entire text (per E-2: per invocation)
+            let unit = detect_unit(text);
+
+            for member in set.iter() {
+                if let Some((block_start, block_end, lines, has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    // Build new lines with indentation removed
+                    let mut new_lines: Vec<String> = Vec::with_capacity(lines.len());
+                    let mut any_change = false;
+
+                    for line in &lines {
+                        let leading = leading_whitespace(line);
+                        if leading.is_empty() {
+                            // No leading whitespace, cannot dedent
+                            new_lines.push(line.to_string());
+                        } else {
+                            // Dedent by `amount` units using tab-stop rule
+                            let mut remaining = *amount as usize;
+                            let mut new_leading = leading.to_string();
+
+                            while remaining > 0 && !new_leading.is_empty() {
+                                let old_leading = new_leading.clone();
+                                new_leading = dedent_step(&new_leading, unit.width);
+                                if new_leading == old_leading {
+                                    // No change means we're at column 0
+                                    break;
+                                }
+                                remaining -= 1;
+                            }
+
+                            if new_leading != leading {
+                                any_change = true;
+                                new_lines.push(format!("{}{}", new_leading, line.trim_start()));
+                            } else {
+                                new_lines.push(line.to_string());
+                            }
+                        }
+                    }
+
+                    if any_change {
+                        let replacement = new_lines.join("\n");
+                        let replacement = if has_trailing_newline && !replacement.ends_with('\n') {
+                            replacement + "\n"
+                        } else {
+                            replacement
+                        };
+                        planned.push(PlannedEdit {
+                            start: block_start,
+                            end: block_end,
+                            replacement,
                         });
                     }
                 }
@@ -1944,9 +2065,13 @@ mod transform_tests {
         )
         .unwrap()
         .0;
-        let prepared = plan(text, &set, &EditOperation::LinesAlign {
-            delimiter: "=".to_string(),
-        })
+        let prepared = plan(
+            text,
+            &set,
+            &EditOperation::LinesAlign {
+                delimiter: "=".to_string(),
+            },
+        )
         .unwrap();
         // Should align on '=' with padding
         // "a=1\nb=22\nc=333" -> "a =1\nb =22\nc=333" (widest prefix is "c" at 1 char, but wait...)
@@ -1980,9 +2105,13 @@ mod transform_tests {
         )
         .unwrap()
         .0;
-        let prepared = plan(text, &set, &EditOperation::LinesAlign {
-            delimiter: "=".to_string(),
-        })
+        let prepared = plan(
+            text,
+            &set,
+            &EditOperation::LinesAlign {
+                delimiter: "=".to_string(),
+            },
+        )
         .unwrap();
         // The line "c" doesn't contain '=' so it should be unchanged
         assert!(prepared.after_text.contains("c"));
@@ -1994,9 +2123,13 @@ mod transform_tests {
         let set = set_of(text, 0..3);
         // Empty delimiter should be a no-op (handled by the API layer)
         // But the planner itself doesn't refuse empty delimiter
-        let prepared = plan(text, &set, &EditOperation::LinesAlign {
-            delimiter: "".to_string(),
-        })
+        let prepared = plan(
+            text,
+            &set,
+            &EditOperation::LinesAlign {
+                delimiter: "".to_string(),
+            },
+        )
         .unwrap();
         // With empty delimiter, no lines will be aligned
         assert_eq!(prepared.after_text, text);

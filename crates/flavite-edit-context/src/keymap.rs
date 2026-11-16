@@ -730,6 +730,15 @@ pub const DEFAULT_ROOT: &[(BindingId, Slot)] = &[
         BindingId::Command(ContextCommand::GotoLine),
         Slot::shifted(KeyCode::KeyG),
     ),
+    // FEUX-0005 X01: Indent family (E-6)
+    (
+        BindingId::Command(ContextCommand::Indent),
+        Slot::shifted(KeyCode::Period),
+    ),
+    (
+        BindingId::Command(ContextCommand::Dedent),
+        Slot::shifted(KeyCode::Comma),
+    ),
 ];
 
 /// Default menu accelerator bindings: menu -> binding id -> position.
@@ -897,7 +906,8 @@ mod tests {
         // FEUX-0004 X03: +1 binding (Shift+G for goto-line) = 39 total
         // FEUX-0004 X04: +1 binding (Z for surround) = 40 total
         // FEUX-0004 X05: +1 binding (Period for repeat_last) = 41 total
-        assert_eq!(DEFAULT_ROOT.len(), 41); // 20 commands + 14 motions + 5 menu openers + 1 (goto-line) + 1 (repeat) = 41
+        // FEUX-0005 X01: +2 bindings (shifted Period/Comma for indent/dedent) = 43 total
+        assert_eq!(DEFAULT_ROOT.len(), 43); // 20 commands + 14 motions + 5 menu openers + 1 (goto-line) + 1 (repeat) + 2 (indent/dedent) = 43
 
         // Spot-check a few key bindings
         let has_insert_start = DEFAULT_ROOT.iter().any(|(bid, slot)| {
