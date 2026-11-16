@@ -8,6 +8,7 @@
 pub mod appearance;
 pub mod catalog;
 pub mod closing;
+pub mod command_args;
 pub mod commands;
 pub mod context;
 pub mod context_mode;

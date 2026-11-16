@@ -664,6 +664,11 @@ pub const DEFAULT_ROOT: &[(BindingId, Slot)] = &[
         BindingId::Motion(Motion::PreviousWord),
         Slot::shifted(KeyCode::KeyB),
     ),
+    // FEUX-0004 X03: GotoLine binding (E-12)
+    (
+        BindingId::Command(ContextCommand::GotoLine),
+        Slot::shifted(KeyCode::KeyG),
+    ),
 ];
 
 /// Default menu accelerator bindings: menu -> binding id -> position.
@@ -705,6 +710,12 @@ pub const DEFAULT_MENUS: &[(ContextMenu, BindingId, KeyCode)] = &[
         ContextMenu::Go,
         BindingId::Command(ContextCommand::DocumentEnd),
         KeyCode::KeyB,
+    ),
+    // FEUX-0004 X03: Goto-line in Go menu (E-12)
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::GotoLine),
+        KeyCode::KeyG,
     ),
     // FEUX-0004 X01: Transform menu accelerators (E-2)
     (
@@ -788,6 +799,12 @@ pub const DEFAULT_MENUS: &[(ContextMenu, BindingId, KeyCode)] = &[
         BindingId::Command(ContextCommand::LinesMoveDown),
         KeyCode::KeyK,
     ),
+    // FEUX-0004 X03: Lines align
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesAlign),
+        KeyCode::KeyA,
+    ),
 ];
 
 #[cfg(test)]
@@ -800,7 +817,8 @@ mod tests {
         // This is the drift gate for X02/X04.
         // FEUX-0004 X01: 20 command-key entries (18 commands + 2 find_char) + 14 motions (7 bare + 7 shifted) = 34 total
         // Plus 4 menu openers (V, G, T, Shift+T) = 38 total (E-3: shifted menu openers allowed)
-        assert_eq!(DEFAULT_ROOT.len(), 38); // 20 commands + 14 motions + 4 menu openers = 38
+        // FEUX-0004 X03: +1 binding (Shift+G for goto-line) = 39 total
+        assert_eq!(DEFAULT_ROOT.len(), 39); // 20 commands + 14 motions + 4 menu openers + 1 (goto-line) = 39
 
         // Spot-check a few key bindings
         let has_insert_start = DEFAULT_ROOT.iter().any(|(bid, slot)| {

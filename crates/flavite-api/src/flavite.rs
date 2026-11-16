@@ -1491,6 +1491,19 @@ impl Flavite {
                 ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
                 crate::editor_commands::handle_lines_move_down,
             ),
+            // FEUX-0004 X03: Align and Goto-line
+            (
+                "editor.lines_align",
+                "Align lines",
+                ArgSchema::typed::<crate::editor_commands::EditorLinesAlignArgs>(),
+                crate::editor_commands::handle_lines_align,
+            ),
+            (
+                "editor.goto_line",
+                "Go to line",
+                ArgSchema::typed::<crate::editor_commands::EditorGotoLineArgs>(),
+                crate::editor_commands::handle_goto_line,
+            ),
             (
                 "buffer.history_page",
                 "List editing history",

@@ -181,12 +181,13 @@ pub fn increment_number(
     delta: i64,
 ) -> Result<String, NumberError> {
     // Check for overflow
-    let new_value = scan_result.value.checked_add(delta).ok_or_else(|| {
-        NumberError::Overflow {
+    let new_value = scan_result
+        .value
+        .checked_add(delta)
+        .ok_or_else(|| NumberError::Overflow {
             value: text[scan_result.start..scan_result.end].to_string(),
             delta,
-        }
-    })?;
+        })?;
 
     // Format with leading zero preservation
     let sign_char = if scan_result.has_sign {

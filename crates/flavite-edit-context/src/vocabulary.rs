@@ -94,6 +94,12 @@ pub enum ContextCommand {
     NumberDec,
     /// Replace each selection's number with its document-order index (1-based).
     NumberSequence,
+    // FEUX-0004 X03: Align command
+    /// Align lines in each selection's containing line block on a literal delimiter.
+    LinesAlign,
+    // FEUX-0004 X03: Goto-line command
+    /// Go to line N (opens draft if no count pending).
+    GotoLine,
     // FEUX-0004 X01: Lines family
     /// Sort lines in each selection's containing line block (byte-lexicographic, stable).
     LinesSortAsc,
@@ -163,6 +169,9 @@ impl ContextCommand {
         Self::NumberInc,
         Self::NumberDec,
         Self::NumberSequence,
+        // FEUX-0004 X03: Align and Goto-line
+        Self::LinesAlign,
+        Self::GotoLine,
         // FEUX-0004 X01: Lines family
         Self::LinesSortAsc,
         Self::LinesSortDesc,
@@ -227,6 +236,9 @@ impl ContextCommand {
             Self::NumberInc => "editor.number_inc",
             Self::NumberDec => "editor.number_dec",
             Self::NumberSequence => "editor.number_sequence",
+            // FEUX-0004 X03: Align and Goto-line
+            Self::LinesAlign => "editor.lines_align",
+            Self::GotoLine => "editor.goto_line",
             // FEUX-0004 X01: Lines family
             Self::LinesSortAsc => "editor.lines_sort_asc",
             Self::LinesSortDesc => "editor.lines_sort_desc",
@@ -291,6 +303,9 @@ impl ContextCommand {
             Self::NumberInc => "Increment number",
             Self::NumberDec => "Decrement number",
             Self::NumberSequence => "Number sequence",
+            // FEUX-0004 X03: Align and Goto-line
+            Self::LinesAlign => "Align lines",
+            Self::GotoLine => "Go to line…",
             // FEUX-0004 X01: Lines family
             Self::LinesSortAsc => "Sort lines ascending",
             Self::LinesSortDesc => "Sort lines descending",
@@ -324,6 +339,9 @@ impl ContextCommand {
                 | Self::NumberInc
                 | Self::NumberDec
                 | Self::NumberSequence
+                // FEUX-0004 X03: Align mutates
+                | Self::LinesAlign
+                // FEUX-0004 X03: GotoLine does NOT mutate (selection-only)
                 // FEUX-0004 X01: Lines family - all mutate
                 | Self::LinesSortAsc
                 | Self::LinesSortDesc
@@ -395,7 +413,13 @@ impl ContextMenu {
                 C::SelectMatches,
                 C::SplitSelection,
             ],
-            Self::Go => &[C::LineStart, C::LineEnd, C::DocumentStart, C::DocumentEnd],
+            Self::Go => &[
+                C::LineStart,
+                C::LineEnd,
+                C::DocumentStart,
+                C::DocumentEnd,
+                C::GotoLine,
+            ],
             Self::More => &[
                 C::Cut,
                 C::Copy,
@@ -443,7 +467,7 @@ impl ContextMenu {
                 C::NumberDec,
                 C::NumberSequence,
             ],
-            // FEUX-0004 X01: Lines menu
+            // FEUX-0004 X01/X03: Lines menu
             Self::Lines => &[
                 C::LinesSortAsc,
                 C::LinesSortDesc,
@@ -454,6 +478,7 @@ impl ContextMenu {
                 C::LinesShuffle,
                 C::LinesMoveUp,
                 C::LinesMoveDown,
+                C::LinesAlign,
             ],
         }
     }

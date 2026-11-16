@@ -14,10 +14,15 @@
 //! line) per §6 "existing ordinary semantics preserved". Typing inserts at
 //! every caret; paste broadcasts through `Typing`.
 
-use crate::numbers::{extract_first_number, increment_number, number_range, scan_number, NumberError};
+use crate::numbers::{
+    NumberError, extract_first_number, increment_number, number_range, scan_number,
+};
 use crate::positions::Affinity;
 use crate::selection::{SelectionSet, SpanEdit, is_grapheme_boundary};
-use flavite_syntax::text::{TextByte, next_grapheme_boundary, next_word_boundary, prev_grapheme_boundary, prev_word_boundary};
+use flavite_syntax::text::{
+    TextByte, next_grapheme_boundary, next_word_boundary, prev_grapheme_boundary,
+    prev_word_boundary,
+};
 
 /// The operation to plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +106,11 @@ pub enum EditOperation {
     LinesMoveUp,
     /// Move each member's containing line block down by one position.
     LinesMoveDown,
+    // FEUX-0004 X03: Align command
+    /// Align lines in each member's containing line block on a literal delimiter.
+    /// The delimiter is the first occurrence on each line; prefixes are padded
+    /// with spaces so all delimiters align to the widest prefix column.
+    LinesAlign { delimiter: String },
 }
 
 /// A planned edit batch.
@@ -517,35 +527,33 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
         }
         EditOperation::NumberInc => {
             for member in set.iter() {
-                if let Some(scan_result) = scan_number(text, member) {
-                    if let Ok(replacement) = increment_number(text, &scan_result, 1) {
-                        let (start, end) = number_range(&scan_result);
-                        planned.push(PlannedEdit {
-                            start,
-                            end,
-                            replacement,
-                        });
-                    }
-                    // Silently skip members with overflow
-                    // (spec doesn't require refusal for inc/dec like it does for sequence)
+                if let Some(scan_result) = scan_number(text, member)
+                    && let Ok(replacement) = increment_number(text, &scan_result, 1)
+                {
+                    let (start, end) = number_range(&scan_result);
+                    planned.push(PlannedEdit {
+                        start,
+                        end,
+                        replacement,
+                    });
                 }
-                // Silently skip members without numbers
+                // Silently skip members without numbers or with overflow
+                // (spec doesn't require refusal for inc/dec like it does for sequence)
             }
         }
         EditOperation::NumberDec => {
             for member in set.iter() {
-                if let Some(scan_result) = scan_number(text, member) {
-                    if let Ok(replacement) = increment_number(text, &scan_result, -1) {
-                        let (start, end) = number_range(&scan_result);
-                        planned.push(PlannedEdit {
-                            start,
-                            end,
-                            replacement,
-                        });
-                    }
-                    // Silently skip members with overflow
+                if let Some(scan_result) = scan_number(text, member)
+                    && let Ok(replacement) = increment_number(text, &scan_result, -1)
+                {
+                    let (start, end) = number_range(&scan_result);
+                    planned.push(PlannedEdit {
+                        start,
+                        end,
+                        replacement,
+                    });
                 }
-                // Silently skip members without numbers
+                // Silently skip members without numbers or with overflow
             }
         }
         EditOperation::NumberSequence => {
@@ -794,6 +802,60 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                             });
                         }
                     }
+                }
+            }
+        }
+        // FEUX-0004 X03: Align command
+        EditOperation::LinesAlign { delimiter } => {
+            for member in set.iter() {
+                if let Some((block_start, block_end, lines, has_trailing_newline)) =
+                    containing_line_block(text, member)
+                {
+                    // Find the maximum prefix width before the delimiter
+                    let max_prefix_width = lines
+                        .iter()
+                        .filter_map(|line| line.find(delimiter.as_str()))
+                        .max()
+                        .map_or(0, |max_pos| max_pos + delimiter.len());
+
+                    // If no lines contain the delimiter, skip this block
+                    if max_prefix_width == 0
+                        && !lines.iter().any(|line| line.contains(delimiter.as_str()))
+                    {
+                        // No delimiter found in any line of this block
+                        // This is a no-op for this block
+                        continue;
+                    }
+
+                    // Build the aligned lines
+                    let aligned_lines: Vec<String> = lines
+                        .iter()
+                        .map(|line| {
+                            if let Some(delim_pos) = line.find(delimiter.as_str()) {
+                                let prefix = &line[..delim_pos];
+                                let padding =
+                                    " ".repeat(max_prefix_width - prefix.len() - delimiter.len());
+                                format!("{}{}{}", prefix, padding, delimiter)
+                                    + &line[delim_pos + delimiter.len()..]
+                            } else {
+                                // Line doesn't contain delimiter - leave unchanged
+                                line.to_string()
+                            }
+                        })
+                        .collect();
+
+                    let replacement = aligned_lines.join("\n");
+                    let replacement = if has_trailing_newline && !replacement.ends_with('\n') {
+                        replacement + "\n"
+                    } else {
+                        replacement
+                    };
+
+                    planned.push(PlannedEdit {
+                        start: block_start,
+                        end: block_end,
+                        replacement,
+                    });
                 }
             }
         }
@@ -1260,7 +1322,6 @@ fn containing_line_range(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1696,7 +1757,7 @@ mod transform_tests {
         let set = set_of(text, 0..11);
         let prepared = plan(text, &set, &EditOperation::CaseTitle).unwrap();
         assert_eq!(prepared.after_text, "Hello World");
-}
+    }
 
     #[test]
     fn lines_join_joins_with_space() {

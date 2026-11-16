@@ -380,6 +380,7 @@ pub fn resume_focus(app: &mut App) -> Task<Message> {
         || app.strip_menu.is_some()
         || super::note_search::blocks_typing(app, &s.tab)
         || super::selection_search::blocks_typing(app, &s.tab)
+        || super::command_args::blocks_typing(app, &s.tab)
     {
         return Task::none();
     }
@@ -403,6 +404,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
         || app.has_composition()
         || super::note_search::blocks_typing(app, &s.tab)
         || super::selection_search::blocks_typing(app, &s.tab)
+        || super::command_args::blocks_typing(app, &s.tab)
     {
         return None;
     }
@@ -503,6 +505,8 @@ fn exit(app: &mut App) {
         // overlay.
         super::selection_search::cancel_tab(app, session.tab);
         app.selection_search.detach(session.tab);
+        super::command_args::cancel_tab(app, session.tab);
+        app.command_args.detach(session.tab);
         app.palette_open = false;
         app.picker = Default::default();
     }
@@ -1917,6 +1921,19 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             serde_json::json!({}),
             "Move lines down was refused; source changed",
         ),
+        // FEUX-0004 X03: LinesAlign and GotoLine
+        LinesAlign => {
+            // LinesAlign requires a delimiter argument - open draft host
+            super::command_args::open_lines_align(app, target.clone());
+            iced::Task::none()
+        }
+        GotoLine => {
+            // GotoLine requires a line number argument - open draft host
+            // For X03, use a placeholder max line count
+            // The actual line count will be validated when Apply is pressed
+            super::command_args::open_goto_line(app, target.clone(), 999_999);
+            iced::Task::none()
+        }
         Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History
         | SelectMatches | SplitSelection => {
             unreachable!("handled before planning")

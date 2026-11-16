@@ -5,6 +5,7 @@
 //! failed loads render honest retry/close states.
 
 use crate::app::{App, Message};
+use crate::host::command_args::{CommandArgsMessage, FieldSpec};
 use crate::style;
 use crate::views::empty_state;
 use crate::workspace::{
@@ -13,7 +14,7 @@ use crate::workspace::{
     tab_strip,
 };
 use flavite_workspace::{LayoutAction, NoteLoad, TabId};
-use iced::widget::{button, column, container, row, rule, text, text_editor};
+use iced::widget::{Space, button, column, container, row, rule, text, text_editor};
 use iced::{Element, Length, alignment};
 
 /// Render one note tab for the active view slot.
@@ -607,6 +608,64 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             content = content.push(text(error).size(12));
         }
     }
+    // FEUX-0004 X03: command-args draft row
+    if let Some(args) = app.command_args.tabs.get(&tab) {
+        let placeholder = match args.draft.fields.get(args.active_field) {
+            Some(FieldSpec::Text { placeholder, .. }) => *placeholder,
+            Some(FieldSpec::Number { .. }) => "Line number",
+            None => "",
+        };
+        let error_widget: Element<Message> = if let Some(ref error) = args.error {
+            use iced::widget::Text;
+            Text::new(error.as_str()).size(12).into()
+        } else {
+            Space::new().width(Length::Fixed(0.0)).into()
+        };
+        content = content.push(bounds::observe(
+            container(
+                row![
+                    text(args.draft.command.title()).size(12),
+                    bounds::observe(
+                        text_editor(&args.input)
+                            .id(command_args_id(tab).clone())
+                            .placeholder(placeholder)
+                            .height(48)
+                            .on_action(move |action| Message::CommandArgs(
+                                crate::host::command_args::CommandArgsMessage::DraftAction {
+                                    tab,
+                                    action,
+                                }
+                            ))
+                            .key_binding(move |key| { command_args_draft_binding(tab, key) }),
+                        move |rect| {
+                            Message::CommandArgs(
+                                crate::host::command_args::CommandArgsMessage::Bounds { tab, rect },
+                            )
+                        },
+                    ),
+                    button("Apply")
+                        .style(style::ghost())
+                        .on_press(Message::CommandArgs(
+                            crate::host::command_args::CommandArgsMessage::Apply(tab),
+                        )),
+                    button("Close")
+                        .style(style::ghost())
+                        .on_press(Message::CommandArgs(
+                            crate::host::command_args::CommandArgsMessage::Cancel(tab),
+                        )),
+                    error_widget,
+                ]
+                .spacing(8),
+            )
+            .padding(8),
+            move |rect| {
+                Message::CommandArgs(crate::host::command_args::CommandArgsMessage::Bounds {
+                    tab,
+                    rect,
+                })
+            },
+        ));
+    }
     content
         .push(editor)
         .push(rule::horizontal(1))
@@ -614,6 +673,43 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+/// FEUX-0004 X03: command-args draft helpers
+fn command_args_id(tab: TabId) -> iced::widget::Id {
+    iced::widget::Id::from(format!("command_args_query_{:032x}", tab.raw()))
+}
+
+fn command_args_draft_binding(
+    tab: TabId,
+    key: iced::widget::text_editor::KeyPress,
+) -> Option<iced::widget::text_editor::Binding<Message>> {
+    use iced::keyboard::{Key, key::Named};
+    use iced::widget::text_editor::Binding;
+    if !matches!(
+        key.status,
+        iced::widget::text_editor::Status::Focused { .. }
+    ) {
+        return None;
+    }
+    match key.key {
+        Key::Named(Named::Enter) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::Apply(tab),
+        ))),
+        Key::Named(Named::Escape) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::Cancel(tab),
+        ))),
+        Key::Named(Named::Tab) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::NextField(tab),
+        ))),
+        Key::Named(Named::ArrowUp) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::AdjustUp(tab),
+        ))),
+        Key::Named(Named::ArrowDown) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::AdjustDown(tab),
+        ))),
+        _ => Binding::from_key_press(key),
+    }
 }
 
 /// The pending encoding banner for a tab, when the core requires a typed

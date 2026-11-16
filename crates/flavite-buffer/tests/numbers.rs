@@ -2,7 +2,7 @@
 //!
 //! Tests the number scanner and operations as specified in E-9.
 
-use flavite_buffer::commands::{plan, EditOperation, PlanError};
+use flavite_buffer::commands::{EditOperation, PlanError, plan};
 use flavite_buffer::selection::{RawSelection, SelectionSet};
 
 fn set_of(text: &str, range: std::ops::Range<usize>) -> SelectionSet {
@@ -77,8 +77,8 @@ fn number_sequence_numbers_members() {
     let set = multi_set(
         text,
         &[
-            [1, 2, 3], // first "0"
-            [2, 6, 7], // second "0"
+            [1, 2, 3],   // first "0"
+            [2, 6, 7],   // second "0"
             [3, 10, 11], // third "0"
         ],
     );
@@ -136,8 +136,8 @@ fn number_sequence_refuses_when_member_lacks_number() {
     let set = multi_set(
         text,
         &[
-            [1, 2, 3],  // first "0"
-            [2, 6, 7],  // "X" - no number
+            [1, 2, 3],   // first "0"
+            [2, 6, 7],   // "X" - no number
             [3, 10, 11], // third "0"
         ],
     );

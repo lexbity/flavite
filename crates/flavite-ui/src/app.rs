@@ -81,6 +81,8 @@ pub struct App {
     pub note_search: crate::host::note_search::NoteSearchHost,
     /// FEUX-0002 X06: match-driven selection drafts/previews (E-10/E-11).
     pub selection_search: crate::host::selection_search::SelectionSearchHost,
+    /// FEUX-0004 X03: command argument drafts (E-11).
+    pub command_args: crate::host::command_args::CommandArgsHost,
     /// FEUX-0002 X07: the content-free diagnostics ring and the burst-hint
     /// banner state (E-15).
     pub diagnostics: crate::host::editor_diagnostics::DiagnosticsHost,
@@ -324,6 +326,8 @@ pub enum Message {
     NoteSearch(crate::host::note_search::NoteSearchMessage),
     /// FEUX-0002 X06: match-selection host messages.
     SelectionSearch(crate::host::selection_search::SelectionSearchMessage),
+    /// FEUX-0004 X03: command-args draft host messages.
+    CommandArgs(crate::host::command_args::CommandArgsMessage),
     /// FEUX-0002 X07: diagnostics ring and burst-hint host messages.
     EditorDiagnostics(crate::host::editor_diagnostics::DiagnosticsMessage),
     ToggleNoteMode(TabId),
@@ -718,6 +722,7 @@ impl App {
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             selection_search: crate::host::selection_search::SelectionSearchHost::default(),
+            command_args: crate::host::command_args::CommandArgsHost::default(),
             diagnostics: crate::host::editor_diagnostics::DiagnosticsHost::default(),
             started_at: std::time::Instant::now(),
             replace: crate::host::replace::ReplaceHost::default(),
@@ -2643,6 +2648,9 @@ impl App {
             }
             Message::SelectionSearch(message) => {
                 return crate::host::selection_search::handle(self, message);
+            }
+            Message::CommandArgs(message) => {
+                return crate::host::command_args::handle(self, message);
             }
             Message::EditorDiagnostics(message) => {
                 return crate::host::editor_diagnostics::handle(self, message);
@@ -5114,6 +5122,7 @@ mod tests {
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             selection_search: crate::host::selection_search::SelectionSearchHost::default(),
+            command_args: crate::host::command_args::CommandArgsHost::default(),
             diagnostics: crate::host::editor_diagnostics::DiagnosticsHost::default(),
             started_at: std::time::Instant::now(),
             replace: crate::host::replace::ReplaceHost::default(),
