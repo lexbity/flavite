@@ -9,6 +9,25 @@ use crate::key::{KeyCode, Motion};
 use crate::vocabulary::{ContextCommand, ContextMenu};
 use std::collections::HashMap;
 
+/// Check if a position is a digit (grammar-owned, cannot be bound).
+/// FEUX-0004 E-4.
+#[must_use]
+fn is_digit_position(position: KeyCode) -> bool {
+    matches!(
+        position,
+        KeyCode::Digit0
+            | KeyCode::Digit1
+            | KeyCode::Digit2
+            | KeyCode::Digit3
+            | KeyCode::Digit4
+            | KeyCode::Digit5
+            | KeyCode::Digit6
+            | KeyCode::Digit7
+            | KeyCode::Digit8
+            | KeyCode::Digit9
+    )
+}
+
 /// A physical binding slot: a position with an optional Shift modifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Slot {
@@ -185,6 +204,17 @@ impl BindingToken {
             "BracketRight" => KeyCode::BracketRight,
             "Minus" => KeyCode::Minus,
             "Equal" => KeyCode::Equal,
+            // FEUX-0004 X06: Digits (grammar-owned, E-4)
+            "Digit0" => KeyCode::Digit0,
+            "Digit1" => KeyCode::Digit1,
+            "Digit2" => KeyCode::Digit2,
+            "Digit3" => KeyCode::Digit3,
+            "Digit4" => KeyCode::Digit4,
+            "Digit5" => KeyCode::Digit5,
+            "Digit6" => KeyCode::Digit6,
+            "Digit7" => KeyCode::Digit7,
+            "Digit8" => KeyCode::Digit8,
+            "Digit9" => KeyCode::Digit9,
             _ => return None,
         };
 
@@ -223,6 +253,9 @@ pub enum KeymapError {
         first: String,
         second: String,
     },
+    /// A binding attempts to use a digit position (FEUX-0004 E-4).
+    /// Digits are grammar-owned and cannot be bound.
+    ReservedPosition { id: String, position: KeyCode },
 }
 
 impl std::fmt::Display for KeymapError {
@@ -270,6 +303,13 @@ impl std::fmt::Display for KeymapError {
                     "Duplicate in {} menu: '{first}' and '{second}' both map to {}",
                     menu.title(),
                     position.token()
+                )
+            }
+            KeymapError::ReservedPosition { id, position } => {
+                write!(
+                    f,
+                    "Position {pos} is reserved for counts and cannot be bound (binding '{id}')",
+                    pos = position.token()
                 )
             }
         }
@@ -384,6 +424,15 @@ impl ContextKeymap {
                     }
                     if binding_id.is_menu_opener() && slot.shift {
                         errors.push(KeymapError::ShiftOnMenuOpener { id: id_str.clone() });
+                        continue;
+                    }
+
+                    // FEUX-0004 E-4: Digits are grammar-owned and cannot be bound
+                    if is_digit_position(slot.position) {
+                        errors.push(KeymapError::ReservedPosition {
+                            id: id_str.clone(),
+                            position: slot.position,
+                        });
                         continue;
                     }
 

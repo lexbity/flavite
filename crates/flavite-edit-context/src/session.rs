@@ -61,6 +61,12 @@ impl PendingCommand {
 pub const AWAIT_CHAR_HINT: &str = "Waiting for character…";
 pub const AWAIT_SECOND_CHAR_HINT: &str = "Waiting for second character…";
 
+/// Count cap (FEUX-0004 E-4).
+pub const COUNT_CAP: u32 = 10_000;
+
+/// Message constants for count state (FEUX-0004 E-4).
+pub const COUNT_CAP_REFUSAL: &str = "Count is capped at 10000";
+
 /// Burst-hint thresholds (FEUX-0002 E-15, X07): the hint offers Exit
 /// Context Mode and Open history after ≥5 accelerator activations within
 /// 1.5 s of which ≥4 are mutating or typing-entry, at most once per 30 s
@@ -114,6 +120,10 @@ pub struct ContextState {
     /// The last recorded invocation for `.` repeat (FEUX-0004 E-5).
     /// Lives and dies with the CM session; never persisted.
     pub repeat_last: Option<InvocationRecord>,
+    /// Pending numeric prefix count (FEUX-0004 E-4).
+    /// Grammar-owned digits accumulate here before being consumed by an acceptor command.
+    /// Cap: 10,000; leading 0 is not a count (dispatches as unbound).
+    pub count: Option<u32>,
 }
 
 /// What [`ContextState::escape`] resolved to (FEUX-0002 §5.4 rows 9-10 and
@@ -142,6 +152,9 @@ pub struct AwaitArgs {
     pub index: usize,
     /// The characters collected so far.
     pub collected_chars: Vec<char>,
+    /// The pending count at the time of entry (FEUX-0004 X06, E-4).
+    /// Retained through argument capture for count acceptors like find_char.
+    pub count: Option<u32>,
 }
 
 impl AwaitArgs {
@@ -152,6 +165,7 @@ impl AwaitArgs {
             command: PendingCommand::FindChar { forward },
             index: 0,
             collected_chars: Vec::new(),
+            count: None,
         }
     }
 
@@ -162,6 +176,7 @@ impl AwaitArgs {
             command: PendingCommand::SurroundAdd,
             index: 0,
             collected_chars: Vec::new(),
+            count: None,
         }
     }
 
@@ -172,6 +187,7 @@ impl AwaitArgs {
             command: PendingCommand::SurroundChange,
             index: 0,
             collected_chars: Vec::new(),
+            count: None,
         }
     }
 
@@ -182,6 +198,7 @@ impl AwaitArgs {
             command: PendingCommand::SurroundDelete,
             index: 0,
             collected_chars: Vec::new(),
+            count: None,
         }
     }
 
@@ -225,6 +242,10 @@ pub enum Event {
     MenuTargetInvalid,
     /// The OS window lost input focus (typing seals, mode retained).
     Blur,
+    /// A digit key was pressed in Command mode (FEUX-0004 E-4).
+    /// The host pre-classifies digits before keymap lookup; this event carries
+    /// the resolved digit value for the statechart to accumulate.
+    CountDigit(u32),
 }
 
 /// Pure outcomes the host interprets against the app.
@@ -369,6 +390,22 @@ impl ContextState {
         self.repeat_last.as_ref()
     }
 
+    /// Get the current pending count (FEUX-0004 E-4).
+    #[must_use]
+    pub const fn count(&self) -> Option<u32> {
+        self.count
+    }
+
+    /// Set the pending count (FEUX-0004 E-4).
+    pub fn set_count(&mut self, count: Option<u32>) {
+        self.count = count;
+    }
+
+    /// Clear the pending count (FEUX-0004 E-4).
+    pub fn clear_count(&mut self) {
+        self.count = None;
+    }
+
     /// The command the open menu's selection points at.
     #[must_use]
     pub fn menu_command(&self) -> Option<ContextCommand> {
@@ -480,10 +517,14 @@ pub fn reduce(
             Vec::new()
         }
         Event::RunAdmitted(command) => {
+            // FEUX-0004 E-4: dispatch consumes/clears the count even when refused.
+            state.clear_count();
             state.admit_run(*command);
             burst_effect(state, Some(*command), now_ms, burst_enabled)
         }
         Event::EnterTyping => {
+            // FEUX-0004 E-4: EnterTyping clears the count.
+            state.clear_count();
             state.begin_typing();
             // Every typing entry arrives through an admitted Run first (the
             // host contract), so the activation was already recorded there;
@@ -504,6 +545,8 @@ pub fn reduce(
             // Delivered Escape: invalidate history, pop, show the exit hint,
             // seal, refocus — regardless of which level was popped. Row 10
             // adds the keep-primary recovery for a multi-member set.
+            // FEUX-0004 E-4: Escape clears the count.
+            state.clear_count();
             let mut effects = effects;
             if outcome == EscapeOutcome::KeptPrimary {
                 effects.push(Effect::KeepPrimary);
@@ -514,6 +557,8 @@ pub fn reduce(
             effects
         }
         Event::OpenMenu(menu) => {
+            // FEUX-0004 E-4: opening a menu clears the count.
+            state.clear_count();
             state.open_menu(*menu);
             vec![Effect::ClearPreview, Effect::SealTypingGroup]
         }
@@ -546,6 +591,28 @@ pub fn reduce(
             } else {
                 Vec::new()
             }
+        }
+        Event::CountDigit(d) => {
+            // FEUX-0004 E-4: count state machine
+            // - 0 only extends (leading 0 is not a count)
+            // - Cap at COUNT_CAP (10,000)
+            // - A digit that would exceed the cap refuses with the cap named and clears
+            let current = state.count.unwrap_or(0);
+            let new_count = if current == 0 && *d == 0 {
+                // Leading 0 is not a count - treat as unbound
+                None
+            } else {
+                let next = current * 10 + d;
+                if next > COUNT_CAP {
+                    // Cap reached - refuse and clear
+                    state.set_message(COUNT_CAP_REFUSAL, true);
+                    None
+                } else {
+                    Some(next)
+                }
+            };
+            state.set_count(new_count);
+            Vec::new()
         }
     }
 }
@@ -902,5 +969,131 @@ mod tests {
         assert!(collected.is_some());
         assert_eq!(collected.unwrap(), vec!['(', '[']);
         assert!(state.await_args().is_none());
+    }
+
+    // FEUX-0004 X06: Count state machine tests (E-4 §5.2)
+    
+    #[test]
+    fn count_digit_starts_and_extends_count() {
+        // Starting from Command mode with no count
+        let mut state = ContextState::activated();
+        assert_eq!(state.count(), None);
+
+        // Digit 1 starts the count
+        let _ = r(&mut state, &Event::CountDigit(1), 0, false);
+        assert_eq!(state.count(), Some(1));
+
+        // Digit 2 extends to 12
+        let _ = r(&mut state, &Event::CountDigit(2), 0, false);
+        assert_eq!(state.count(), Some(12));
+
+        // Digit 3 extends to 123
+        let _ = r(&mut state, &Event::CountDigit(3), 0, false);
+        assert_eq!(state.count(), Some(123));
+    }
+
+    #[test]
+    fn count_digit_zero_only_extends() {
+        // Start with a count of 1
+        let mut state = ContextState::activated();
+        let _ = r(&mut state, &Event::CountDigit(1), 0, false);
+        assert_eq!(state.count(), Some(1));
+
+        // Digit 0 extends to 10
+        let _ = r(&mut state, &Event::CountDigit(0), 0, false);
+        assert_eq!(state.count(), Some(10));
+    }
+
+    #[test]
+    fn count_digit_leading_zero_is_not_a_count() {
+        // Leading 0 is not a count - should stay None
+        let mut state = ContextState::activated();
+        let _ = r(&mut state, &Event::CountDigit(0), 0, false);
+        assert_eq!(state.count(), None);
+    }
+
+    #[test]
+    fn count_cap_refuses_and_clears() {
+        // Build up to 10000 (cap is 10000, not 1000)
+        let mut state = ContextState::activated();
+        let _ = r(&mut state, &Event::CountDigit(1), 0, false);
+        let _ = r(&mut state, &Event::CountDigit(0), 0, false);
+        let _ = r(&mut state, &Event::CountDigit(0), 0, false);
+        let _ = r(&mut state, &Event::CountDigit(0), 0, false);
+        let _ = r(&mut state, &Event::CountDigit(0), 0, false);
+        assert_eq!(state.count(), Some(10000));
+
+        // One more digit would exceed the cap
+        let _ = r(&mut state, &Event::CountDigit(1), 0, false);
+        assert_eq!(state.count(), None);
+        assert_eq!(state.message(), (COUNT_CAP_REFUSAL, true));
+    }
+
+    #[test]
+    fn count_clears_on_escape() {
+        let mut state = ContextState::activated();
+        let _ = r(&mut state, &Event::CountDigit(5), 0, false);
+        assert_eq!(state.count(), Some(5));
+
+        let _ = r(&mut state, &Event::Escape { selections: 1 }, 0, false);
+        assert_eq!(state.count(), None);
+    }
+
+    #[test]
+    fn count_clears_on_open_menu() {
+        let mut state = ContextState::activated();
+        let _ = r(&mut state, &Event::CountDigit(5), 0, false);
+        assert_eq!(state.count(), Some(5));
+
+        let _ = r(&mut state, &Event::OpenMenu(ContextMenu::Select), 0, false);
+        assert_eq!(state.count(), None);
+    }
+
+    #[test]
+    fn count_clears_on_enter_typing() {
+        let mut state = ContextState::activated();
+        let _ = r(&mut state, &Event::CountDigit(5), 0, false);
+        assert_eq!(state.count(), Some(5));
+
+        let _ = r(&mut state, &Event::EnterTyping, 0, false);
+        assert_eq!(state.count(), None);
+    }
+
+    #[test]
+    fn count_clears_on_run_admitted() {
+        let mut state = ContextState::activated();
+        let _ = r(&mut state, &Event::CountDigit(5), 0, false);
+        assert_eq!(state.count(), Some(5));
+
+        let _ = r(&mut state, &Event::RunAdmitted(ContextCommand::Delete), 0, false);
+        assert_eq!(state.count(), None);
+    }
+
+    #[test]
+    fn count_retained_through_await_args() {
+        let mut state = ContextState::activated();
+        let _ = r(&mut state, &Event::CountDigit(5), 0, false);
+        assert_eq!(state.count(), Some(5));
+
+        // Enter AwaitArgs - count should be retained
+        let _ = r(&mut state, &Event::EnterAwaitArgs(AwaitArgs::find_char(true)), 0, false);
+        assert_eq!(state.count(), Some(5));
+        assert!(state.await_args().is_some());
+    }
+
+    #[test]
+    fn count_methods_work() {
+        let mut state = ContextState::activated();
+        
+        // Initially no count
+        assert_eq!(state.count(), None);
+        
+        // Set count
+        state.set_count(Some(42));
+        assert_eq!(state.count(), Some(42));
+        
+        // Clear count
+        state.clear_count();
+        assert_eq!(state.count(), None);
     }
 }

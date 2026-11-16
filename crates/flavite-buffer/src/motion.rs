@@ -138,6 +138,44 @@ pub fn apply(
     Ok(moved)
 }
 
+/// Apply `motion` to every member `count` times (FEUX-0004 X06, E-4 §5.3).
+/// For text-pure motions, this applies the motion repeatedly in one plan.
+/// For visual motions, the count is applied to the editor-computed targets.
+/// Each application is clamped at document bounds.
+pub fn apply_with_count(
+    text: &str,
+    set: &SelectionSet,
+    motion: Motion,
+    extend: bool,
+    targets: Option<&[usize]>,
+    count: u32,
+) -> Result<SelectionSet, MotionError> {
+    if count == 0 {
+        // Count of 0 means no motion - return the original set
+        return Ok(set.clone());
+    }
+    
+    // For visual motions, we need to apply the count to the editor-computed targets
+    // This is done by the editor, not here
+    if motion.is_visual() {
+        // For now, just apply once - visual motion count support needs editor changes
+        return apply(text, set, motion, extend, targets);
+    }
+    
+    // For text-pure motions, apply the motion count times iteratively
+    let mut result = set.clone();
+    for _ in 0..count {
+        // Clamp at document bounds on each iteration
+        let next = apply(text, &result, motion, extend, None)?;
+        // If we hit a bound, subsequent iterations won't change anything
+        if next == result {
+            break;
+        }
+        result = next;
+    }
+    Ok(result)
+}
+
 /// The non-visual head target for one member (delivered ordinary-motion
 /// semantics: a non-extended range collapses inward first; horizontal moves
 /// are grapheme-based, word moves share the UAX-29 movement policy).

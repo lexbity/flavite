@@ -85,6 +85,17 @@ pub enum KeyCode {
     BracketRight,
     Minus,
     Equal,
+    // FEUX-0004 X06: Digits (grammar-owned, E-4)
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
 }
 
 impl KeyCode {
@@ -128,6 +139,16 @@ impl KeyCode {
             KeyCode::BracketRight => "BracketRight",
             KeyCode::Minus => "Minus",
             KeyCode::Equal => "Equal",
+            KeyCode::Digit0 => "Digit0",
+            KeyCode::Digit1 => "Digit1",
+            KeyCode::Digit2 => "Digit2",
+            KeyCode::Digit3 => "Digit3",
+            KeyCode::Digit4 => "Digit4",
+            KeyCode::Digit5 => "Digit5",
+            KeyCode::Digit6 => "Digit6",
+            KeyCode::Digit7 => "Digit7",
+            KeyCode::Digit8 => "Digit8",
+            KeyCode::Digit9 => "Digit9",
         }
     }
 }

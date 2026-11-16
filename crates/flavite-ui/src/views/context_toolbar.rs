@@ -201,8 +201,17 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
         .session
         .as_ref()
         .map_or("", |s| s.state.message().0);
+    // FEUX-0004 X06: Prepend count indicator if present (E-4 §5.2)
+    let count_prefix: String = app
+        .context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.count())
+        .map(|n| format!("{n}·"))
+        .unwrap_or_default();
+    let mut caption: String = format!("{count_prefix}{message}");
     let max_chars = ((width - 130.0).max(40.0) / 6.5) as usize;
-    let mut caption: String = message.chars().take(max_chars).collect();
+    caption = caption.chars().take(max_chars).collect();
     if message.chars().count() > max_chars {
         caption.push('…');
     }

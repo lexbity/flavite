@@ -440,6 +440,9 @@ pub struct EditorSelectionOnlyArgs {
     buffer_id: u64,
     revision: u64,
     selections: SelectionSetArg,
+    // FEUX-0004 X06: Count for select_line (count = N lines)
+    #[serde(default)]
+    count: Option<u32>,
 }
 
 // ---- FEUX-0002 X04/X05: the set-aware verb family ----
@@ -889,16 +892,23 @@ pub(crate) fn handle_select_line(
     let args: EditorSelectionOnlyArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
     let set = normalize_set(&snapshot.text, &args.selections)?;
+    let count = args.count.unwrap_or(1);
     let candidates: Vec<RawSelection> = set
         .members()
         .iter()
         .map(|member| {
-            let (anchor, head) =
+            // FEUX-0004 X06: select count lines starting from the member's containing line
+            // Get the containing line
+            let (line_anchor, line_start) =
                 flavite_buffer::selection::containing_line(&snapshot.text, member.head());
+            
+            // Find the end position after count lines (including the starting line)
+            let end_pos = count_lines_forward(&snapshot.text, line_start, count);
+            
             RawSelection {
                 id: Some(member.id().as_raw()),
-                anchor,
-                head,
+                anchor: line_anchor,
+                head: end_pos,
             }
         })
         .collect();
@@ -906,6 +916,30 @@ pub(crate) fn handle_select_line(
     let (selected, _) = SelectionSet::normalize(&snapshot.text, candidates, Some(hint))
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &selected))
+}
+
+/// Helper to find the position after count lines starting from start_pos.
+/// Returns the position at the end of the count-th line (or EOF if fewer lines exist).
+fn count_lines_forward(text: &str, start_pos: usize, count: u32) -> usize {
+    if count == 0 {
+        return start_pos;
+    }
+    
+    let start_pos = start_pos.min(text.len());
+    let mut remaining = count;
+    let mut pos = start_pos;
+    
+    while remaining > 0 && pos < text.len() {
+        // Find the end of the current line
+        let end_of_line = text[pos..]
+            .find('\n')
+            .map_or(text.len(), |idx| pos + idx + 1); // +1 to include the newline
+        
+        pos = end_of_line;
+        remaining -= 1;
+    }
+    
+    pos.min(text.len())
 }
 
 /// The `editor.insert_*` family: a zero-effect plan collapses every member
@@ -1060,6 +1094,9 @@ pub struct EditorMoveArgs {
     extend: bool,
     #[serde(default)]
     positions: Option<Vec<usize>>,
+    // FEUX-0004 X06: Count for motions (E-4 §5.3)
+    #[serde(default)]
+    count: Option<u32>,
 }
 
 pub(crate) fn handle_editor_move(
@@ -1080,8 +1117,15 @@ pub(crate) fn handle_editor_move(
         }
         (false, None) => None,
     };
-    let moved = flavite_buffer::motion::apply(&snapshot.text, &set, motion, args.extend, positions)
-        .map_err(|error| error.to_string())?;
+    // FEUX-0004 X06: Apply count to motion (E-4 §5.3)
+    let moved = if let Some(n) = args.count {
+        // Apply motion n times
+        flavite_buffer::motion::apply_with_count(&snapshot.text, &set, motion, args.extend, positions, n)
+    } else {
+        // No count, apply once
+        flavite_buffer::motion::apply(&snapshot.text, &set, motion, args.extend, positions)
+    }
+    .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &moved))
 }
 
@@ -1097,6 +1141,9 @@ pub struct EditorFindCharArgs {
     char: String,
     #[serde(default)]
     extend: bool,
+    // FEUX-0004 X06: Count for find-char (Nth occurrence)
+    #[serde(default)]
+    count: Option<u32>,
 }
 
 pub(crate) fn handle_find_char(
@@ -1116,9 +1163,13 @@ pub(crate) fn handle_find_char(
     };
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
     let set = normalize_set(&snapshot.text, &args.selections)?;
-    let found =
+    let count = args.count.unwrap_or(1);
+    let found = if count == 1 {
         flavite_buffer::selection::find_char(&snapshot.text, &set, forward, target, args.extend)
-            .map_err(|error| error.to_string())?;
+    } else {
+        flavite_buffer::selection::find_char_with_count(&snapshot.text, &set, forward, target, args.extend, count)
+    }
+    .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &found))
 }
 
@@ -1696,7 +1747,7 @@ pub struct EditorSurroundAddArgs {
     pub selections: SelectionSetArg,
     pub char: String,
     #[serde(default)]
-    pub undo_policy: Option<crate::flavite::UndoPolicyArg>,
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
 }
 
 /// Arguments for surround_delete command.
@@ -1710,7 +1761,7 @@ pub struct EditorSurroundDeleteArgs {
     pub selections: SelectionSetArg,
     pub char: String,
     #[serde(default)]
-    pub undo_policy: Option<crate::flavite::UndoPolicyArg>,
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
 }
 
 /// Arguments for surround_change command.
@@ -1725,7 +1776,7 @@ pub struct EditorSurroundChangeArgs {
     pub old_char: String,
     pub new_char: String,
     #[serde(default)]
-    pub undo_policy: Option<crate::flavite::UndoPolicyArg>,
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
 }
 
 pub(crate) fn handle_surround_add(

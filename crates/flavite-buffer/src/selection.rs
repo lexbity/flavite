@@ -1055,19 +1055,34 @@ pub fn find_char(
     target: char,
     extend: bool,
 ) -> Result<SelectionSet, FindCharError> {
+    find_char_with_count(text, set, forward, target, extend, 1)
+}
+
+/// Find the Nth occurrence of a character (FEUX-0004 X06, E-4 §5.3).
+/// If count is 1, this is equivalent to find_char (first occurrence).
+/// For count > 1, finds the count-th occurrence in the direction.
+pub fn find_char_with_count(
+    text: &str,
+    set: &SelectionSet,
+    forward: bool,
+    target: char,
+    extend: bool,
+    count: u32,
+) -> Result<SelectionSet, FindCharError> {
     set.validate_against(text)?;
     let mut candidates = Vec::with_capacity(set.len());
     for member in set.iter() {
         let head = member.head();
         let found = if forward {
-            // Search strictly after the grapheme at the head.
+            // Search for the count-th occurrence starting from the head
             let from =
                 flavite_syntax::text::next_grapheme_boundary(text, TextByte(head.min(text.len())))
                     .0;
-            text[from..].find(target).map(|at| from + at)
+            find_nth_char(text, from, target, count, true)
         } else {
+            // Search backward for the count-th occurrence
             let until = head.min(text.len());
-            text[..until].rfind(target)
+            find_nth_char(text, until, target, count, false)
         };
         let Some(at) = found else {
             return Err(FindCharError::NotFound);
@@ -1082,6 +1097,43 @@ pub fn find_char(
     let hint = set.primary_id();
     let (found, _) = normalize_with_hint_fallback(text, candidates, hint)?;
     Ok(found)
+}
+
+/// Helper function to find the nth occurrence of a character in text.
+/// If forward is true, searches forward from start_pos.
+/// If forward is false, searches backward from start_pos.
+fn find_nth_char(text: &str, start_pos: usize, target: char, count: u32, forward: bool) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let mut found_count = 0u32;
+    
+    if forward {
+        // Search forward
+        let mut pos = start_pos;
+        while let Some(idx) = text[pos..].find(target) {
+            found_count += 1;
+            if found_count == count {
+                return Some(pos + idx);
+            }
+            pos += idx + target.len_utf8();
+        }
+    } else {
+        // Search backward
+        let text_before = &text[..start_pos];
+        let chars: Vec<_> = text_before.chars().collect();
+        
+        for (i, c) in chars.iter().enumerate().rev() {
+            if *c == target {
+                found_count += 1;
+                if found_count == count {
+                    // Calculate the byte position from the index
+                    return Some(text_before.char_indices().nth(i).map(|(idx, _)| idx).unwrap_or(0));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Expand `(start, end)` outward to the containing extended-grapheme

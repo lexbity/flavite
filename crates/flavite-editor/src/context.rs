@@ -89,6 +89,18 @@ pub fn native_code(code: Code) -> Option<KeyCode> {
         Code::BracketRight => KeyCode::BracketRight,
         Code::Minus => KeyCode::Minus,
         Code::Equal => KeyCode::Equal,
+        // FEUX-0004 X06: Digits (grammar-owned, E-4)
+        // Note: Numpad digits are NOT converted (recorded in blast radius)
+        Code::Digit0 => KeyCode::Digit0,
+        Code::Digit1 => KeyCode::Digit1,
+        Code::Digit2 => KeyCode::Digit2,
+        Code::Digit3 => KeyCode::Digit3,
+        Code::Digit4 => KeyCode::Digit4,
+        Code::Digit5 => KeyCode::Digit5,
+        Code::Digit6 => KeyCode::Digit6,
+        Code::Digit7 => KeyCode::Digit7,
+        Code::Digit8 => KeyCode::Digit8,
+        Code::Digit9 => KeyCode::Digit9,
         _ => return None,
     })
 }
@@ -124,13 +136,15 @@ pub const fn motion_action(motion: Motion) -> KeyAction {
 mod tests {
     use super::*;
 
-    /// Every position in the 35-position vocabulary converts from a native physical code
-    /// (FEUX-0002 E-8/R9, FEUX-0003 E-2): the conversion boundary covers the whole
-    /// advertised physical vocabulary, so `f`/`Shift+F` and every other
-    /// binding reach the keymap on real hardware.
+    /// Every position in the vocabulary converts from a native physical code
+    /// (FEUX-0002 E-8/R9, FEUX-0003 E-2, FEUX-0004 X06): the conversion boundary
+    /// covers the whole advertised physical vocabulary, so `f`/`Shift+F` and every
+    /// other binding reach the keymap on real hardware.
+    /// FEUX-0004: digits are grammar-owned and must convert; Numpad digits are NOT.
     #[test]
     fn native_converter_covers_the_whole_vocabulary() {
-        // Full 35-position vocabulary (FEUX-0003 E-2)
+        // Full vocabulary: 26 letters + 9 punctuation + 10 digits = 45 positions
+        // (FEUX-0003 E-2: 35 positions, FEUX-0004 X06: +10 digits)
         let all = [
             // Letters A-Z
             (Code::KeyA, KeyCode::KeyA),
@@ -170,6 +184,17 @@ mod tests {
             (Code::BracketRight, KeyCode::BracketRight),
             (Code::Minus, KeyCode::Minus),
             (Code::Equal, KeyCode::Equal),
+            // FEUX-0004 X06: Digits
+            (Code::Digit0, KeyCode::Digit0),
+            (Code::Digit1, KeyCode::Digit1),
+            (Code::Digit2, KeyCode::Digit2),
+            (Code::Digit3, KeyCode::Digit3),
+            (Code::Digit4, KeyCode::Digit4),
+            (Code::Digit5, KeyCode::Digit5),
+            (Code::Digit6, KeyCode::Digit6),
+            (Code::Digit7, KeyCode::Digit7),
+            (Code::Digit8, KeyCode::Digit8),
+            (Code::Digit9, KeyCode::Digit9),
         ];
         for (native, expected) in all {
             assert_eq!(
@@ -178,6 +203,9 @@ mod tests {
                 "{native:?} must convert to {expected:?}"
             );
         }
+        // Numpad digits are NOT converted (recorded in blast radius)
+        assert_eq!(native_code(Code::Numpad0), None);
+        assert_eq!(native_code(Code::Numpad1), None);
     }
 
     /// The default keymap is the sole source of truth for Context Mode bindings (FEUX-0003 X02).
