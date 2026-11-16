@@ -64,6 +64,11 @@ in the toolbar badge; the detail row shows selection counts and messages.
 | `;` / `Shift+;` | `editor.collapse` / `workspace.command_palette` | collapse every range to its head / open the command palette |
 | `/` / `Shift+/` | `workspace.find` / `workspace.replace` | owned find / replace bar |
 | `f` / `Shift+F` | `editor.find_char` | **find character** forward / backward (see below) |
+| `.` | `editor.repeat_last` | replay the last recorded command against the current selection set |
+| `⇧G` | `editor.goto_line` | open line number draft or jump to line with pending count |
+| `T` | `editor.menu_transform` | open **Transform** menu |
+| `⇧T` | `editor.menu_lines` | open **Lines** menu |
+| `Z` | `editor.menu_surround` | open **Surround** menu |
 | `Escape` | `editor.context_back` | pop menus; collapse to primary; exit with hint |
 
 ### Motions
@@ -75,6 +80,29 @@ Hold `Shift` to extend. Line and document motions live in the **Go** menu
 The **Select** menu (`v`) has `w` select word, `x` select line, `a` select
 all.
 
+### Count prefix (numeric grammar)
+
+Digits 1-9 start or extend a pending count prefix; 0 extends only (a leading
+0 is not a count and dispatches as an unbound key). The count is capped
+at 10,000: digits that would exceed the cap are refused with the cap named
+and **clears** the count. The count renders in the detail strip as a prefix
+(e.g., `3·` for count=3).
+
+Count acceptors (commands that multiply by the count):
+
+- **Motions**: `h j k l w b e` — each member applies the motion `count` times
+  in one plan
+- `x` (`editor.select_line`) — selects `count` lines from each member's
+  first line
+- `f` / `⇧F` (`editor.find_char`) — finds the `count`-th occurrence of the
+  character per member
+- `.` (`editor.repeat_last`) — replays the last command `count` times
+  (sequential replays; each replay is its own undo node)
+- `⇧G` (`editor.goto_line`) — with pending count, jumps to line `count`
+
+Clearing: the count clears on escape, menu open, entering typing, unbound
+key, and after any command dispatch (even if refused).
+
 ### Find character (`f` / `Shift+F`)
 
 `f` (forward) or `Shift+F` (backward) enters a **"Waiting for character…"**
@@ -83,6 +111,131 @@ command; the caret moves to the next occurrence of that character after
 each member's head (extend with `Shift` held at resolution). Dead keys and
 modifier-only events are ignored (never committed); `Escape` cancels back
 to commands; any mode exit cancels.
+
+### Transform menu (`T`)
+
+The **Transform** menu provides case and number operations that act on
+each selection independently as pure planners (one atomic undo node each).
+
+| Accelerator | Command | Effect |
+|---|---|---|
+| `u` | `editor.case_upper` | uppercase each character in each selection |
+| `l` | `editor.case_lower` | lowercase each character in each selection |
+| `s` | `editor.case_swap` | swap case of each character (cased→other case, uncased unchanged) |
+| `t` | `editor.case_title` | title-case each word: first cased character uppercased, rest lowercased (UAX #29 word boundaries) |
+| `n` | `editor.number_inc` | increment the first number in each selection; leading-zero width preserved |
+| `d` | `editor.number_dec` | decrement the first number in each selection; leading-zero width preserved |
+| `q` | `editor.number_sequence` | replace each selection's number with its document-order index (1-based); whole command refused if any selection has no number |
+
+**Number scanning**: the first (leftmost) maximal run `[+-]?[0-9]+` fully inside
+the selection range. For an empty selection (caret), scans outward from the
+caret within UAX #29 numeric word boundaries. Integer-only; decimals scan
+as the integer part only.
+
+**Width preservation**: `007` + 1 → `008`; `099` + 1 → `100` (pad drops when
+width grows). i64 bounds: values at `i64::MIN`/ `MAX` refuse with the number
+named.
+
+**Empty selection behavior**: uses the grapheme policy — the first grapheme
+forward or the preceding non-newline grapheme.
+
+### Lines menu (`⇧T`)
+
+The **Lines** menu operates on the *containing lines* of each selection
+(the union of complete lines that intersect each member's range). All
+operations are per-member: each member's block is transformed independently.
+
+| Accelerator | Command | Effect |
+|---|---|---|
+| `s` | `editor.lines_sort_asc` | sort lines byte-lexicographic, stable within block |
+| `d` | `editor.lines_sort_desc` | sort lines inverse byte-lexicographic, stable |
+| `n` | `editor.lines_sort_numeric` | sort by first integer per line (sign-aware); lines without numbers sort after numbered lines, stable |
+| `j` | `editor.lines_join` | replace interior newlines with single space; single-line member is no-op |
+| `c` | `editor.lines_duplicate` | insert a byte-exact copy of each block immediately below it; after-set keeps original members |
+| `e` | `editor.lines_dedupe` | remove lines that exactly equal an earlier line in the same block (byte-exact before newline) |
+| `h` | `editor.lines_shuffle` | Fisher-Yates shuffle within each block; seeded by splitmix64 from system time |
+| `u` | `editor.lines_move_up` | swap each block with the adjacent line-block above; refuses if any block is at BOF or overlaps |
+| `k` | `editor.lines_move_down` | swap each block with the adjacent line-block below; refuses if any block is at EOF or overlaps |
+| `a` | `editor.lines_align` | align lines on a literal delimiter: for each line containing the delimiter, pad the prefix with spaces so all delimiters align to the widest prefix in the block; opens draft host |
+
+**Alignment draft**: `⇧G` without count opens a number draft; `a` in Lines menu
+opens a text draft for the delimiter. Empty delimiter refuses at admission.
+
+### Surround menu (`Z`)
+
+The **Surround** menu adds, changes, or deletes surrounding delimiter pairs
+using a unified `AwaitArgs` capture state (generalized from `AwaitChar`).
+
+| Accelerator | Command | Args | Effect |
+|---|---|---|---|
+| `a` | `editor.surround_add` | 1 char | wrap each member with the pair; self-pair by construction for non-bracket chars |
+| `c` | `editor.surround_change` | 2 chars | change existing surrounding pair: first char = old pair, second char = new pair |
+| `d` | `editor.surround_delete` | 1 char | delete surrounding pair |
+
+**Pair table**:
+- Nesting pairs: `()` `{}` `[]` `<>` — scanner respects nesting depth
+- Self-pairs: `"` `'` `` ` `` — same character both sides, non-nesting
+- Any other printable character creates a self-pair by construction
+
+**Scanning**: per member, finds the *innermost enclosing occurrence* of the
+requested pair. For nesting pairs, uses depth-0 matching (innermost complete
+pair). For self-pairs, finds the nearest enclosing occurrence.
+
+**Failure semantics**: all-or-nothing. If any member has no enclosing pair,
+the **whole command refuses** with the count of failing members (e.g., "3 of 5
+selections have no enclosing (").
+
+**Empty selection**: surround add on an empty member (caret) wraps the empty
+range at the caret position.
+
+**Capture state**: `AwaitArgs` replaces the former `AwaitChar` state. First
+printable resolves index 0; for `surround_change`, second printable resolves
+index 1. `Escape` cancels the whole capture. Menu keys cancel capture then
+open the menu. Dead keys and modifier-only events are ignored.
+
+### Repeat last (`.`)
+
+Replays the last recorded class-E command against the **current** selection
+set. Every command is a pure planner, so re-dispatching the same invocation
+against a new set re-targets for free (free re-targeting).
+
+**Recorded commands**: all class-E mutators including:
+- All edit commands (delete, cut, paste, change, insert variants)
+- All Transform menu commands
+- All Lines menu commands
+- All Surround menu commands
+
+**Not recorded**: class-S selection commands, undo/redo, copy, goto-line,
+menu openers, and `repeat_last` itself.
+
+**Register**: lives and dies with the Context Mode session. Mode exit clears
+it. Never persisted, never synced.
+
+**`count·`**: with a pending count `N`, replays the last command `N` times
+sequentially. Each replay re-plans against the post-previous state. A replay
+that refuses (read-only, stale, disabled, pair-not-found, no-number) stops
+the run with its reason; no rollback across replays (each replay is its own
+undo node).
+
+**Idempotence**: `.` replays the last *recorded* command, not the last `.`.
+So `..` is idempotent — it replays the same original command twice.
+
+**Refusals**: leave the register unchanged. Common refusal reasons include
+"No command to repeat" (empty register), "Repeat was refused; source changed",
+or command-specific reasons like "pair not found".
+
+### Go to line (`⇧G`)
+
+Jumps to a specific line number. Two behaviors:
+
+- **With pending count N**: jump immediately to line N, column 0 (start-of-line
+  semantics). Refuses if N = 0 or N > line count with the bound named.
+- **Without count**: opens the number draft host; Enter dispatches to line N;
+  `Escape` cancels. Same validation (1..line_count).
+
+**Draft host**: a per-tab input row in the toolbar. Only one draft open per
+tab, mutually exclusive with the matches draft. Number fields validate on
+Enter: empty or out-of-range refuses with the line count named.
 
 ### Typing
 
@@ -215,6 +368,14 @@ The hint can be disabled with the typed setting
 | History retention per buffer | 128 MiB / 10,000 nodes |
 | History retention app-wide | 512 MiB |
 | Diagnostics ring | ≤1,000 events, ≤512 B each |
+| Count prefix cap | 10,000 |
+
+Count-specific notes:
+
+- Numpad digits (`Numpad0`-`Numpad9`) are **not** count inputs; they dispatch
+  as unbound key notices. Only top-row digit positions are captured.
+- The count indicator renders in the detail strip as `{N}·`; it never resizes
+  the toolbar (interior text only).
 
 Guards:
 
@@ -331,8 +492,11 @@ Supported layouts: QWERTY, Dvorak, Colemak, AZERTY, QWERTZ.
 
 ## Out of scope (deferred)
 
-Registers and clipboard history, macros, `.` repeat-last-change, counts
-(`3dw`), shell pipes, LSP refactoring, surround, case/style/line
-transforms, per-selection regex split/keep/drop, rectangular/column
-selection, and scoped/union selection matching across views are not shipped
-and are not planned in the current release horizon.
+Registers and clipboard history, macros, shell pipes, LSP refactoring,
+per-selection regex split/keep/drop, rectangular/column selection, and
+scoped/union selection matching across views are not shipped and are not
+planned in the current release horizon.
+
+Note: The following features were previously deferred but are now shipped
+as part of FEUX-0004: `.` repeat-last-change, counts (`3dw`), surround,
+case/style/line transforms.

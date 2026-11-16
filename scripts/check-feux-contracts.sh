@@ -367,6 +367,64 @@ run_x08_gates() {
         "$root/Cargo.toml" "$root/Cargo.lock" "$root/crates" "$root/docs"
 }
 
+run_feux0004_x07_gates() {
+    # FEUX-0004 X07: Close-out gates for the FEUX-0004 round
+    # Presence gates for all X01-X07 artifacts
+    local file
+    for file in \
+        crates/flavite-edit-context/src/key.rs \
+        crates/flavite-edit-context/src/session.rs \
+        crates/flavite-edit-context/src/keymap.rs \
+        crates/flavite-edit-context/src/vocabulary.rs \
+        crates/flavite-buffer/src/pairs.rs \
+        crates/flavite-buffer/src/numbers.rs \
+        crates/flavite-ui/src/host/command_args.rs \
+        crates/flavite-ui/src/host/context_mode.rs \
+        crates/flavite-ui/src/views/context_toolbar.rs \
+        crates/flavite-editor/src/context/layout.rs \
+        scripts/tests/workbench/context_mode_transforms.py \
+        scripts/tests/workbench/context_mode_counts_repeat.py \
+        scripts/tests/workbench/context_mode_surround.py; do
+        gate assert_nonempty "$root/$file"
+    done
+    
+    # Core FEUX-0004 presence checks
+    gate assert_present 'ReservedPosition' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'is_digit_position' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'Digit0' "$root/crates/flavite-edit-context/src/key.rs"
+    gate assert_present 'Code::Digit0' "$root/crates/flavite-editor/src/context.rs"
+    gate assert_present 'pub count' "$root/crates/flavite-edit-context/src/session.rs"
+    gate assert_present 'AwaitArgs' "$root/crates/flavite-edit-context/src/session.rs"
+    gate assert_present 'InvocationRecord' "$root/crates/flavite-edit-context/src/session.rs"
+    gate assert_present 'RepeatLast' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'Transform' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'Lines' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'Surround' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'find_enclosing_pair' "$root/crates/flavite-buffer/src/pairs.rs"
+    gate assert_present 'scan_number' "$root/crates/flavite-buffer/src/numbers.rs"
+    gate assert_present 'CommandArgsState' "$root/crates/flavite-ui/src/host/command_args.rs"
+    gate assert_present 'count_prefix' "$root/crates/flavite-ui/src/views/context_toolbar.rs"
+    gate assert_present 'editor.menu_transform' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'editor.menu_lines' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'editor.menu_surround' "$root/crates/flavite-edit-context/src/keymap.rs"
+    gate assert_present 'Transform' "$root/crates/flavite-editor/src/context/layout.rs"
+    gate assert_present 'Lines' "$root/crates/flavite-editor/src/context/layout.rs"
+    gate assert_present 'Surround' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    gate assert_present 'GotoLine' "$root/crates/flavite-edit-context/src/vocabulary.rs"
+    
+    # No AwaitChar remains (replaced by AwaitArgs)
+    gate assert_absent 'pub struct AwaitChar' "$root/crates/flavite-edit-context/src/session.rs"
+    
+    # Grave position is excluded permanently (E-10)
+    gate assert_absent 'Grave|Backquote' "$root/crates/flavite-edit-context/src/key.rs"
+    
+    # Documentation updated with FEUX-0004 features
+    gate assert_present 'Transform menu' "$root/docs/APP-FEATURES.md"
+    
+    # E-3: shifted menu openers are allowed (Rule X amended)
+    gate assert_present 'shifted.*KeyT' "$root/crates/flavite-edit-context/src/keymap.rs"
+}
+
 run_feux0003_x01_gates() {
     # FEUX-0003 X01: Position vocabulary and keymap data core
     # 35-position vocabulary exists
@@ -540,6 +598,7 @@ case "$slice" in
     X06) run_x06_gates ;;
     X07) run_x07_gates ;;
     X08) run_x08_gates ;;
+    FEUX0004-X07) run_feux0004_x07_gates ;;
     FEUX0003-X01) run_feux0003_x01_gates ;;
     FEUX0003-X02) run_feux0003_x02_gates ;;
     FEUX0003-X03) run_feux0003_x03_gates ;;
@@ -547,7 +606,7 @@ case "$slice" in
     FEUX0003-X05) run_feux0003_x05_gates ;;
     FEUX0003-X06) run_feux0003_x06_gates ;;
     FEUX0003-X07) run_feux0003_x07_gates ;;
-    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08 FEUX0003-X01 FEUX0003-X02 FEUX0003-X03 FEUX0003-X04 FEUX0003-X05 FEUX0003-X06 FEUX0003-X07)" >&2; exit 2 ;;
+    *) echo "unknown slice: ${slice:-<empty>} (implemented: X01 X02 X03 X04 X05 X06 X07 X08 FEUX0004-X07 FEUX0003-X01 FEUX0003-X02 FEUX0003-X03 FEUX0003-X04 FEUX0003-X05 FEUX0003-X06 FEUX0003-X07)" >&2; exit 2 ;;
 esac
 
 if ((GATES_FAILED > 0)); then

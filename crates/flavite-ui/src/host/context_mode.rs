@@ -2196,6 +2196,9 @@ fn replay_last(app: &mut App, target: EditorTarget) -> Task<Message> {
 /// Replay the last recorded invocation with optional count (FEUX-0004 E-5/X06).
 /// If count is Some(n), replay n times sequentially (count·).
 /// If count is None, replay once.
+/// Returns Task::none() after synchronous execution; all replay work happens
+/// in the current frame against the live state, so the UI will refresh with
+/// the final result in one pass.
 fn replay_last_with_count(app: &mut App, target: EditorTarget, count: Option<u32>) -> Task<Message> {
     // Get the last recorded invocation - clone it to avoid borrow issues
     let record = app.context_mode.session.as_ref().and_then(|s| s.state.repeat_last().cloned());
@@ -2209,32 +2212,43 @@ fn replay_last_with_count(app: &mut App, target: EditorTarget, count: Option<u32
     // FEUX-0004 X06: if count is present, replay count times sequentially
     let count = count.unwrap_or(1);
     
-    // For sequential replays, we need to apply each replay against the updated state
-    // This is done by chaining the tasks
-    let task = focus(app, target.tab);
+    // Build args object once
+    let args = serde_json::Value::Object(record.args.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect());
+    
+    // Synchronous replay loop: kernel_mutate is synchronous, so we apply each
+    // replay in sequence against the live app state. After each successful
+    // replay, we re-capture the target to get the updated revision/selection.
+    let mut current_target = target;
     
     for _ in 0..count {
-        // Re-dispatch the recorded command
-        let api_id = record.command_id;
-        let args = serde_json::Value::Object(record.args.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect());
-        
         // Dispatch through kernel_mutate
-        let result = kernel_mutate(app, &target, api_id, args.clone(), "Repeat was refused; source changed");
+        let result = kernel_mutate(app, &current_target, record.command_id, args.clone(), "Repeat was refused; source changed");
         match result {
             Some(success) => {
-                install_receipt(app, &target, &success);
-                // Update target with new revision and selection
-                // For simplicity, we just continue with the original target
-                // A full implementation would update the target after each replay
+                install_receipt(app, &current_target, &success);
+                // Update target for next iteration - re-capture from app state
+                if let Some(new_target) = EditorTarget::capture(app, current_target.tab) {
+                    current_target = new_target;
+                } else {
+                    // If we can't capture, the tab might be closed - stop here
+                    app.context_mode.notice("Tab closed during repeat");
+                    diag(app, current_target.tab, EventKind::RepeatOutcome, Outcome::Refused, Some(current_target.selections.len() as u32));
+                    return Task::none();
+                }
             }
             None => {
                 app.context_mode.notice("Repeat was refused; source changed");
-                diag(app, target.tab, EventKind::RepeatOutcome, Outcome::Refused, Some(target.selections.len() as u32));
+                diag(app, current_target.tab, EventKind::RepeatOutcome, Outcome::Refused, Some(current_target.selections.len() as u32));
                 return Task::none();
             }
         }
+        
+        // The spec says: "a replay that refuses stops the run with its reason
+        // (no rollback across replays — each replay is its own undo node, which
+        // is also the recovery)". Since kernel_mutate returned Some, it succeeded.
     }
     
-    diag(app, target.tab, EventKind::RepeatOutcome, Outcome::Replayed, Some(target.selections.len() as u32));
-    task
+    diag(app, current_target.tab, EventKind::RepeatOutcome, Outcome::Replayed, Some(current_target.selections.len() as u32));
+    // Return focus to ensure UI updates
+    focus(app, current_target.tab)
 }
