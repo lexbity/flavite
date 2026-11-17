@@ -83,9 +83,12 @@ impl FileBrowser {
             .queue
             .iter()
             .any(|(queued, queued_cursor)| queued == &path && queued_cursor == &cursor)
-            && !self.pending.as_ref().is_some_and(|(_, queued, pending_cursor)| {
-                queued == &path && *pending_cursor == cursor
-            })
+            && !self
+                .pending
+                .as_ref()
+                .is_some_and(|(_, queued, pending_cursor)| {
+                    queued == &path && *pending_cursor == cursor
+                })
         {
             self.queue.push_back((path, cursor));
         }
