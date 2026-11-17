@@ -809,10 +809,10 @@ mod tests {
         let result = state.validate_field(0);
         assert!(result.is_err());
 
-        // Empty regex
+        // Empty regex: skipped here (None); requiredness is enforced at apply time
         state.fields = vec![FieldState::with_text("")];
         let result = state.validate_field(0);
-        assert!(result.is_err());
+        assert!(matches!(result, Ok(None)));
 
         // Too long regex (simulate with a short one for test)
         state.fields = vec![FieldState::with_text("a")];

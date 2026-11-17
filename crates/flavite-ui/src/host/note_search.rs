@@ -610,7 +610,7 @@ fn request_find(app: &mut App, tab: TabId) {
             "mode": mode,
             "case_sensitive": case_sensitive,
             "whole_word": whole_word,
-            "scope": scope,
+            "scope_spans": scope.map_or_else(Vec::new, |(start, end)| vec![(start, end)]),
             "offset": page_offset,
         }),
         Origin::Gui,
@@ -959,7 +959,7 @@ fn prepare(app: &mut App, tab: TabId, all: bool) {
             "mode": options.mode,
             "case_sensitive": options.case_sensitive,
             "whole_word": options.whole_word,
-            "scope": scope,
+            "scope_spans": scope.map_or_else(Vec::new, |(start, end)| vec![(start, end)]),
         }),
         Origin::Gui,
     ));

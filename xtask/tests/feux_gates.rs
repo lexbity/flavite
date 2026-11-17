@@ -833,7 +833,7 @@ fn seed_feux0003_x01_inputs(root: &Path) {
     seed_file(
         root,
         "crates/flavite-edit-context/src/keymap.rs",
-        "pub struct ContextKeymap {} pub struct Slot {} pub enum BindingId { Command } pub enum Layout { Qwerty } pub fn defaults_keymap_classifies_identically_to_grammar() {}\n",
+        "pub struct ContextKeymap {} pub struct Slot {} pub enum BindingId { Command } pub enum Layout { Qwerty } pub fn defaults_keymap_classifies_identically_to_delivered_grammar() {}\n",
     );
 
     // Seed labels.rs
@@ -1063,12 +1063,6 @@ fn seed_feux0004_x07_inputs(root: &Path) {
         "crates/flavite-edit-context/src/vocabulary.rs",
         "pub enum ContextMenu { Select, Go, More, Transform, Lines, Surround }\nSelf::Transform => &[C::CaseUpper, C::CaseLower, C::CaseSwap, C::CaseTitle, C::NumberInc, C::NumberDec, C::NumberSequence],\nSelf::Lines => &[C::LinesSortAsc, C::LinesSortDesc, C::LinesSortNumeric, C::LinesJoin, C::LinesDuplicate, C::LinesDedupe, C::LinesShuffle, C::LinesMoveUp, C::LinesMoveDown, C::LinesAlign],\nSelf::Surround => &[C::SurroundAdd, C::SurroundChange, C::SurroundDelete],\nSelf::RepeatLast => \"editor.repeat_last\", Self::GotoLine => \"editor.goto_line\", Self::CaseUpper => \"editor.case_upper\", Self::NumberInc => \"editor.number_inc\",\n",
     );
-    // Keymap additions
-    seed_file(
-        root,
-        "crates/flavite-edit-context/src/keymap.rs",
-        "KeymapError::ReservedPosition { id: String, position: KeyCode }\nfn is_digit_position(position: KeyCode) -> bool { matches!(position, KeyCode::Digit0 | KeyCode::Digit1) }\neditor.menu_transform, editor.menu_lines, editor.menu_surround, editor.repeat_last, editor.goto_line,\n",
-    );
     // Layout additions
     seed_file(
         root,
@@ -1121,11 +1115,12 @@ fn seed_feux0004_x07_inputs(root: &Path) {
         "crates/flavite-ui/src/host/editor_diagnostics.rs",
         "EventKind::RepeatOutcome,\n",
     );
-    // Keymap default root includes new bindings
+    // Keymap default root includes new bindings plus the presence-required
+    // patterns (ReservedPosition, digit position, menu ids).
     seed_file(
         root,
         "crates/flavite-edit-context/src/keymap.rs",
-        "BindingId::MenuOpener(ContextMenu::Transform), Slot::bare(KeyCode::KeyT),\nBindingId::MenuOpener(ContextMenu::Lines), Slot::shifted(KeyCode::KeyT),\nBindingId::MenuOpener(ContextMenu::Surround), Slot::bare(KeyCode::KeyZ),\nBindingId::Command(ContextCommand::RepeatLast), Slot::bare(KeyCode::Period),\nBindingId::Command(ContextCommand::GotoLine), Slot::shifted(KeyCode::KeyG),\n",
+        "KeymapError::ReservedPosition { id: String, position: KeyCode }\nfn is_digit_position(position: KeyCode) -> bool { matches!(position, KeyCode::Digit0 | KeyCode::Digit1) }\neditor.menu_transform, editor.menu_lines, editor.menu_surround, editor.repeat_last, editor.goto_line,\nBindingId::MenuOpener(ContextMenu::Transform), Slot::bare(KeyCode::KeyT),\nBindingId::MenuOpener(ContextMenu::Lines), Slot::shifted(KeyCode::KeyT),\nBindingId::MenuOpener(ContextMenu::Surround), Slot::bare(KeyCode::KeyZ),\nBindingId::Command(ContextCommand::RepeatLast), Slot::bare(KeyCode::Period),\nBindingId::Command(ContextCommand::GotoLine), Slot::shifted(KeyCode::KeyG),\n",
     );
 }
 
@@ -1294,7 +1289,7 @@ fn seed_feux0005_x02_inputs(root: &Path) {
     seed_file(
         root,
         "crates/flavite-edit-context/src/keymap.rs",
-        "BindingId::Command(ContextCommand::TabsToSpaces),\nKeyCode::KeyE,\nBindingId::Command(ContextCommand::SpacesToTabs),\nKeyCode::KeyR,\n",
+        "BindingId::Command(ContextCommand::TabsToSpaces),\nKeyCode::KeyE,\nBindingId::Command(ContextCommand::SpacesToTabs),\nKeyCode::KeyR,\nContextMenu::Transform,\n",
     );
     seed_file(
         root,

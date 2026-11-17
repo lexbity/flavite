@@ -1690,7 +1690,6 @@ dependencies = [
  "flavite-index",
  "flavite-settings",
  "flavite-syntax",
- "flavite-text-search",
  "flavite-theme",
  "flavite-vault",
  "flavite-workspace",
