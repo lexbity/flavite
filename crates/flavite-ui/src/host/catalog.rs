@@ -32,6 +32,13 @@ pub(crate) struct CatalogHost {
     sequence: u64,
     work: mpsc::SyncSender<Work>,
     ready: mpsc::Receiver<Prepared>,
+    /// Index provenance (epoch, generation) whose completed catalog read has
+    /// already refreshed the file browser. A catalog completion that repeats
+    /// the same provenance carries no index change, so the browser must NOT
+    /// be reloaded: reloading would wipe an in-flight directory paging
+    /// session (loaded pages beyond the first, queued continuations) for no
+    /// observable gain, silently discarding the continuation result.
+    last_browser_refresh_provenance: Option<(u64, u64)>,
 }
 impl Default for CatalogHost {
     fn default() -> Self {
@@ -68,6 +75,7 @@ impl Default for CatalogHost {
             sequence: 0,
             work,
             ready,
+            last_browser_refresh_provenance: None,
         }
     }
 }
@@ -98,11 +106,42 @@ pub(crate) fn poll(app: &mut App) {
             generation: prepared.provenance.generation,
             truncated: prepared.truncated,
         };
-        app.file_browser.refresh();
+        // Refresh the file browser only when the vault index provenance
+        // actually changed. Same-provenance completions (a catalog re-read
+        // of unchanged index state) would otherwise reload the browser for
+        // no gain — and a reload mid-paging clears the pending continuation
+        // and its queued pages, so a loaded directory silently reverts to
+        // its first page.
+        let provenance = (prepared.provenance.epoch, prepared.provenance.generation);
+        match app.catalog_host.last_browser_refresh_provenance {
+            // Same provenance as the last read that requested a browser
+            // reload: no index change, so nothing new to reflect.
+            Some(last) if last == provenance => {}
+            // Provenance changed: reload the browser so it reflects the new
+            // vault index state. The reload is deferred until the browser
+            // has no directory query in flight, so it never orphans a
+            // mid-paging continuation.
+            Some(_) => {
+                app.catalog_host.last_browser_refresh_provenance = Some(provenance);
+                app.file_browser.request_refresh();
+            }
+            // First completion: record it as the baseline WITHOUT reloading.
+            // The browser has already performed its own initial load (and an
+            // early reload here can race an in-flight directory query).
+            None => {
+                app.catalog_host.last_browser_refresh_provenance = Some(provenance);
+            }
+        }
         app.link_verdict_requests.clear();
         app.link_verdicts.clear();
         app.run_pending_restore();
     }
+    // Run a deferred reload at the start of the turn, before any results
+    // are drained, so a result applied by this turn is never erased by the
+    // reload in the same turn. Runs on every poll so a reload requested
+    // while a query was in flight runs once the browser is idle, even
+    // without another catalog completion.
+    app.file_browser.refresh_if_idle();
 }
 impl App {
     /// Request a catalog refresh (replaces the pre-S5 blocking load): the

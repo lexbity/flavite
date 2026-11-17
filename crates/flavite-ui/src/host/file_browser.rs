@@ -24,16 +24,23 @@ pub struct Directory {
     pub entries: Vec<DirectoryEntry>,
     pub next: Option<DirectoryCursor>,
     pub error: Option<String>,
+    /// Cursors that loaded pages beyond the first, in load order. A refresh
+    /// re-enqueues these so a reload restores the same pagination extent
+    /// instead of collapsing the folder to its first page.
+    continuations: Vec<DirectoryCursor>,
 }
 #[derive(Debug, Default)]
 pub struct FileBrowser {
     pub views: BTreeMap<Owner, BrowserView>,
     pub directories: BTreeMap<PathBuf, Directory>,
     queue: VecDeque<(PathBuf, Option<DirectoryCursor>)>,
-    pending: Option<(RequestToken, PathBuf, bool)>,
+    pending: Option<(RequestToken, PathBuf, Option<DirectoryCursor>)>,
     attachment: BTreeMap<RequestToken, Owner>,
     generation: u64,
     initialized: bool,
+    /// An implicit reload (catalog index change) was requested while the
+    /// browser had a query in flight; it runs when the browser is idle.
+    refresh_pending: bool,
     pub focused: Option<Owner>,
     typeahead: String,
     typed_at: Option<std::time::Instant>,
@@ -67,23 +74,63 @@ impl FileBrowser {
     fn enqueue(&mut self, path: PathBuf, cursor: Option<DirectoryCursor>) {
         // A queued initial page must not silently swallow a later explicit
         // "Load more" for the same folder: the requests differ by cursor, so
-        // dedupe on the request kind (initial page vs continuation). A
-        // refresh clearing the queue keeps this honest — it re-enqueues
-        // everything it needs.
-        let continuation = cursor.is_some();
-        if !self.queue.iter().any(|(queued, queued_cursor)| {
-            queued == &path && queued_cursor.is_some() == continuation
-        }) && !self
-            .pending
-            .as_ref()
-            .is_some_and(|(_, queued, pending_continuation)| {
-                queued == &path && *pending_continuation == continuation
+        // dedupe on the exact request (initial page or the same continuation
+        // cursor). Distinct continuation cursors (loaded pages beyond the
+        // first) are all queued — a refresh replays them to restore the
+        // pagination extent. A refresh clearing the queue keeps this honest
+        // — it re-enqueues everything it needs.
+        if !self
+            .queue
+            .iter()
+            .any(|(queued, queued_cursor)| queued == &path && queued_cursor == &cursor)
+            && !self.pending.as_ref().is_some_and(|(_, queued, pending_cursor)| {
+                queued == &path && *pending_cursor == cursor
             })
         {
             self.queue.push_back((path, cursor));
         }
     }
+    /// Reload the vault tree, preserving each directory's pagination extent
+    /// (cursors that loaded pages beyond the first): the reload re-enqueues
+    /// every loaded page instead of collapsing folders to their first page
+    /// mid-browse. Used by implicit reloads (catalog index changes) where
+    /// an in-flight directory query must not be orphaned.
     pub fn refresh(&mut self) {
+        let continuations: Vec<(PathBuf, Vec<DirectoryCursor>)> = self
+            .directories
+            .iter()
+            .filter(|(_, dir)| !dir.continuations.is_empty())
+            .map(|(path, dir)| (path.clone(), dir.continuations.clone()))
+            .collect();
+        self.generation += 1;
+        self.pending = None;
+        self.queue.clear();
+        self.directories.clear();
+        self.enqueue(PathBuf::new(), None);
+        for (path, cursors) in continuations {
+            self.enqueue(path.clone(), None);
+            for cursor in cursors {
+                self.enqueue(path.clone(), Some(cursor));
+            }
+        }
+        let paths: BTreeSet<_> = self
+            .views
+            .values()
+            .flat_map(|view| view.expanded.iter().cloned())
+            .collect();
+        for path in paths {
+            if !self.directories.contains_key(&path)
+                && !self.queue.iter().any(|(queued, _)| queued == &path)
+            {
+                self.enqueue(path, None);
+            }
+        }
+        self.initialized = true;
+    }
+
+    /// Hard reload: drop every loaded directory and restart from the first
+    /// page. Used by the explicit user Refresh action.
+    pub fn refresh_reset(&mut self) {
         self.generation += 1;
         self.pending = None;
         self.queue.clear();
@@ -98,6 +145,27 @@ impl FileBrowser {
             self.enqueue(path, None);
         }
         self.initialized = true;
+    }
+
+    /// Request an implicit reload (e.g. a catalog index change). The reload
+    /// is deferred until no directory query is in flight or queued so it
+    /// never orphans a pending continuation mid-paging.
+    pub fn request_refresh(&mut self) {
+        self.refresh_pending = true;
+    }
+
+    /// Run the deferred implicit reload when the browser is idle. Returns
+    /// whether a reload ran. Called at the start of a pump turn, before any
+    /// results are drained, so a freshly applied result is never erased by
+    /// the reload in the same turn.
+    pub fn refresh_if_idle(&mut self) -> bool {
+        if self.refresh_pending && self.pending.is_none() && self.queue.is_empty() {
+            self.refresh_pending = false;
+            self.refresh();
+            true
+        } else {
+            false
+        }
     }
     pub fn rows(&self, owner: Owner, filter: &str) -> Vec<TreeRow> {
         let view = self.views.get(&owner);
@@ -233,7 +301,7 @@ pub fn pump(app: &mut App) {
         )
     {
         app.file_browser.queue.pop_front();
-        app.file_browser.pending = Some((token, path, cursor.is_some()));
+        app.file_browser.pending = Some((token, path, cursor));
     }
 }
 
@@ -267,12 +335,13 @@ pub fn observe(app: &mut App, outcome: &QueryOutcome) -> bool {
     {
         return false;
     }
-    let Some((token, path, append)) = app.file_browser.pending.clone() else {
+    let Some((token, path, cursor)) = app.file_browser.pending.clone() else {
         return true;
     };
     if token != outcome.token {
         return true;
     }
+    let append = cursor.is_some();
     app.file_browser.pending = None;
     let retained: usize = app
         .file_browser
@@ -293,10 +362,19 @@ pub fn observe(app: &mut App, outcome: &QueryOutcome) -> bool {
         ContextQueryResult::Directory(Ok(page)) => {
             if !append {
                 directory.entries.clear();
+                directory.continuations.clear();
             }
             directory.entries.extend(page.entries.iter().cloned());
             directory.next.clone_from(&page.next);
             directory.error = None;
+            // Remember the cursor that loaded this page so a later refresh
+            // can restore the same pagination extent.
+            if append
+                && let Some(cursor) = cursor
+                && !directory.continuations.contains(&cursor)
+            {
+                directory.continuations.push(cursor);
+            }
         }
         ContextQueryResult::Directory(Err(error))
         | ContextQueryResult::Failed { message: error } => directory.error = Some(error.clone()),
@@ -361,7 +439,7 @@ pub fn handle(app: &mut App, message: BrowserMessage) -> iced::Task<Message> {
             }
         }
         BrowserMessage::Refresh => {
-            app.file_browser.refresh();
+            app.file_browser.refresh_reset();
             app.request_catalog_refresh();
         }
         BrowserMessage::Scroll(owner, offset) => {
