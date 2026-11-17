@@ -1462,7 +1462,7 @@ fn apply_edits(text: &str, edits: &[PlannedEdit]) -> String {
 
 // FEUX-0004 X01: SplitMix64 PRNG (E-8: no rand crate dependency)
 /// A simple, fast, 64-bit PRNG suitable for shuffling.
-/// Based on splitmix64: http://xoshiro.di.unimi.it/splitmix64.c
+/// Based on splitmix64: <http://xoshiro.di.unimi.it/splitmix64.c>
 #[derive(Debug, Clone)]
 pub struct SplitMix64 {
     state: u64,
