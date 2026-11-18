@@ -763,7 +763,7 @@ fn attach_services(
         )
     };
     let graph = crate::graph_service::GraphService::start_with_index_watch(
-        crate::doctor::cache_db_path(uuid),
+        crate::doctor::cache_db_path(root, uuid),
         Some(Arc::clone(session)),
         index_watch,
     );
@@ -2292,10 +2292,10 @@ impl Flavite {
         id: &str,
         path: &std::path::Path,
     ) -> Result<(), FlaviteError> {
-        // Use the host OS filesystem for export
+        // Use the host OS filesystem for export, rooted at the same
+        // `<vault>/.flavite/profiles` store the vault uses.
         let os_fs = Box::new(flavite_fs::OsFs::new());
-        let store_with_os =
-            crate::profiles::ProfilesStore::at_root(os_fs, self.vault_ref().root.clone());
+        let store_with_os = crate::profiles::ProfilesStore::at_vault(os_fs, &self.vault_ref().root);
         store_with_os
             .export_path(id, path)
             .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
@@ -2303,7 +2303,8 @@ impl Flavite {
 
     /// Import a profile from a host path (FEUX-0003 X06).
     ///
-    /// Reads the TOML file from the host filesystem and creates a new profile.
+    /// Reads the TOML file from the host filesystem and creates a new profile
+    /// in the vault's store.
     /// The profile name is derived from the file stem.
     ///
     /// # Arguments
@@ -2315,10 +2316,10 @@ impl Flavite {
         &self,
         path: &std::path::Path,
     ) -> Result<crate::profiles::StoredProfile, FlaviteError> {
-        // Use the host OS filesystem for import
+        // Use the host OS filesystem for import, rooted at the same
+        // `<vault>/.flavite/profiles` store the vault uses.
         let os_fs = Box::new(flavite_fs::OsFs::new());
-        let store_with_os =
-            crate::profiles::ProfilesStore::at_root(os_fs, self.vault_ref().root.clone());
+        let store_with_os = crate::profiles::ProfilesStore::at_vault(os_fs, &self.vault_ref().root);
         store_with_os
             .import_path(path)
             .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
@@ -3628,7 +3629,7 @@ impl Flavite {
     /// Current index and watcher summary for CLI and diagnostics.
     pub fn vault_info(&self) -> Result<VaultInfo, FlaviteError> {
         let version = self.session.version().map_err(FlaviteError::IndexError)?;
-        let db_path = crate::doctor::cache_db_path(self.vault_ref.uuid);
+        let db_path = crate::doctor::cache_db_path(&self.vault_ref.root, self.vault_ref.uuid);
         let (note_count, tantivy_generation) = if db_path.exists() {
             let connection = rusqlite::Connection::open_with_flags(
                 &db_path,

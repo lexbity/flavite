@@ -543,12 +543,16 @@ impl SettingsHost {
     }
 
     /// FEUX-0003 X07: Create a profile from current settings.
-    pub fn create_profile(&mut self, flavite: &mut Flavite, name: String) -> Result<(), String> {
-        flavite
+    pub fn create_profile(
+        &mut self,
+        flavite: &mut Flavite,
+        name: String,
+    ) -> Result<flavite_api::profiles::StoredProfile, String> {
+        let profile = flavite
             .profiles_create_from_current(&name)
             .map_err(|e| e.to_string())?;
         self.list_profiles(flavite);
-        Ok(())
+        Ok(profile)
     }
 
     /// FEUX-0003 X07: Apply a profile by id.
@@ -807,25 +811,28 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
             iced::clipboard::write(path.display().to_string())
         }
         SettingsMessage::FocusGained => adopt_on_focus(app),
-        SettingsMessage::RestoreBackup => match app.flavite.as_ref() {
-            Some(flavite) => match flavite.settings_restore_backup() {
-                Ok(_) => {
-                    app.settings.load(flavite);
-                    app.appearance.load(flavite);
-                    app.appearance.reload_theme_package(flavite);
+        SettingsMessage::RestoreBackup => {
+            let restored = app
+                .flavite
+                .as_ref()
+                .and_then(|flavite| flavite.settings_restore_backup().ok());
+            match restored {
+                Some(_) => {
+                    if let Some(flavite) = app.flavite.as_ref() {
+                        app.settings.load(flavite);
+                        app.appearance.load(flavite);
+                        app.appearance.reload_theme_package(flavite);
+                    }
+                    app.record_keymap_adoption();
                     app.status = "Settings restored from the last-good backup".into();
                     iced::Task::none()
                 }
-                Err(error) => {
-                    app.status = format!("Backup restore failed: {error}");
+                None => {
+                    app.status = "Backup restore failed".into();
                     iced::Task::none()
                 }
-            },
-            None => {
-                app.status = "Attach a vault before restoring settings".into();
-                iced::Task::none()
             }
-        },
+        }
         SettingsMessage::ProfilesList => {
             if let Some(flavite) = app.flavite.as_ref() {
                 app.settings.list_profiles(flavite);
@@ -833,15 +840,57 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
             iced::Task::none()
         }
         SettingsMessage::ProfilesCreate { name } => {
-            if let Some(flavite) = app.flavite.as_mut() {
-                match app.settings.create_profile(flavite, name.clone()) {
-                    Ok(_) => {
-                        app.settings.profile_name_draft.clear();
-                        app.status = format!("Profile '{name}' created");
-                    }
-                    Err(error) => {
-                        app.status = format!("Failed to create profile: {error}");
-                    }
+            let created = match app.flavite.as_mut() {
+                Some(flavite) => app.settings.create_profile(flavite, name.clone()),
+                None => Err("Attach a vault before creating a profile".to_string()),
+            };
+            match created {
+                Ok(profile) => {
+                    app.settings.profile_name_draft.clear();
+                    app.status = format!("Profile '{name}' created");
+                    // Diagnostics: capture + create outcomes. The key
+                    // count is the delta document's section-key count
+                    // (create-from-current emits visible deltas only).
+                    let keys = flavite_settings::codec::parse(Some(
+                        std::str::from_utf8(&profile.bytes).unwrap_or_default(),
+                    ))
+                    .ok()
+                    .map(|parsed| {
+                        parsed
+                            .doc
+                            .sections
+                            .values()
+                            .map(|map| map.len())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0);
+                    app.diagnostics.record(
+                        None,
+                        crate::host::editor_diagnostics::ModeEnum::Off,
+                        crate::host::editor_diagnostics::EventKind::ProfileCaptured,
+                        crate::host::editor_diagnostics::Outcome::Applied,
+                        Some(keys as u32),
+                        None,
+                    );
+                    app.diagnostics.record(
+                        None,
+                        crate::host::editor_diagnostics::ModeEnum::Off,
+                        crate::host::editor_diagnostics::EventKind::ProfileCreated,
+                        crate::host::editor_diagnostics::Outcome::Applied,
+                        None,
+                        None,
+                    );
+                }
+                Err(error) => {
+                    app.status = format!("Failed to create profile: {error}");
+                    app.diagnostics.record(
+                        None,
+                        crate::host::editor_diagnostics::ModeEnum::Off,
+                        crate::host::editor_diagnostics::EventKind::ProfileCreated,
+                        crate::host::editor_diagnostics::Outcome::Refused,
+                        None,
+                        None,
+                    );
                 }
             }
             iced::Task::none()
@@ -960,8 +1009,9 @@ pub fn handle(app: &mut App, message: SettingsMessage) -> iced::Task<Message> {
                 app.settings.load(flavite);
                 app.appearance.load(flavite);
                 app.appearance.reload_theme_package(flavite);
-                app.status = "Settings restored from the last-good backup".into();
             }
+            app.record_keymap_adoption();
+            app.status = "Settings restored from the last-good backup".into();
             iced::Task::none()
         }
     }
@@ -990,10 +1040,12 @@ fn adopt_on_focus(app: &mut App) -> iced::Task<Message> {
             Err(_) => app.settings.load_error.is_none(),
         });
     if changed {
-        let flavite = app.flavite.as_ref().expect("checked above");
-        app.settings.load(flavite);
-        app.appearance.load(flavite);
-        app.appearance.reload_theme_package(flavite);
+        if let Some(flavite) = app.flavite.as_ref() {
+            app.settings.load(flavite);
+            app.appearance.load(flavite);
+            app.appearance.reload_theme_package(flavite);
+        }
+        app.record_keymap_adoption();
         app.status = "Settings changed elsewhere — reloaded".into();
     }
     iced::Task::none()
@@ -1014,6 +1066,7 @@ impl App {
             Ok(package_changed) => {
                 if let Some(resolved) = self.settings.resolved.clone() {
                     self.appearance.apply_resolved(resolved);
+                    self.record_keymap_adoption();
                 }
                 if package_changed && let Some(flavite) = self.flavite.as_ref() {
                     self.appearance.reload_theme_package(flavite);
@@ -1029,6 +1082,7 @@ impl App {
                     self.settings.reloaded = false;
                     if let Some(resolved) = self.settings.resolved.clone() {
                         self.appearance.apply_resolved(resolved);
+                        self.record_keymap_adoption();
                     }
                 }
                 self.status = message;

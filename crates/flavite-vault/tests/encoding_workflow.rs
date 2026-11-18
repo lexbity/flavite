@@ -61,6 +61,8 @@ struct Harness {
     fs: MemFs,
     root: PathBuf,
     #[allow(dead_code)]
+    root_dir: tempfile::TempDir,
+    #[allow(dead_code)]
     db_dir: tempfile::TempDir,
     #[allow(dead_code)]
     data_dir: tempfile::TempDir,
@@ -68,10 +70,13 @@ struct Harness {
 
 /// Build a Session over MemFs with hermetic index + device-local data dirs,
 /// exactly like the in-crate `test_session` harness but with the explicit
-/// data dir the hint store and recovery writer root under.
+/// data dir the hint store and recovery writer root under. The vault root
+/// is REAL: `.flavite/` (hints, recovery) is OS-addressable, while note
+/// content flows through the MemFs.
 fn harness() -> Harness {
     let fs = MemFs::new();
-    let root = PathBuf::from("/test/vault");
+    let root_dir = tempfile::tempdir().expect("vault root");
+    let root = root_dir.path().to_path_buf();
     fs.create_dir_all(&root).expect("vault root");
     let db_dir = tempfile::tempdir().expect("index dir");
     let db = db_dir.path().join("index.sqlite3");
@@ -104,6 +109,7 @@ fn harness() -> Harness {
         session,
         fs,
         root,
+        root_dir,
         db_dir,
         data_dir,
     }

@@ -612,18 +612,24 @@ fn chord_label(app: &App, id: &str) -> String {
 
 /// One shortcut-editor row: the command id, its effective chord, a
 /// capture button, and a reset button when overridden (the dialog-era
-/// capture state machine, now tab-scoped state).
+/// capture state machine, now tab-scoped state). Chordless commands
+/// (FEUX-0003 E-15) render as `unbound` rows with the same capture flow.
 #[allow(clippy::too_many_lines)]
 fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Element<'a, Message> {
     let mut section = column![].spacing(2);
-    for (id, _) in crate::host::commands::DEFAULT_CHORDS {
+    let shortcut_ids: Vec<&str> = crate::host::commands::DEFAULT_CHORDS
+        .iter()
+        .map(|(id, _)| *id)
+        .chain(crate::host::commands::CHORDLESS_COMMANDS.iter().copied())
+        .collect();
+    for id in shortcut_ids {
         let capturing = matches!(
             app.settings.capture.as_ref(),
-            Some(crate::host::settings::CaptureRequest::Chord(c)) if c == *id
+            Some(crate::host::settings::CaptureRequest::Chord(c)) if c == id
         );
-        let overridden = app.appearance.shortcut_overrides().contains_key(*id);
+        let overridden = app.appearance.shortcut_overrides().contains_key(id);
         let mut row = row![
-            text((*id).to_owned()).size(metrics.text_sm),
+            text(id.to_owned()).size(metrics.text_sm),
             text(chord_label(app, id)).size(metrics.text),
         ]
         .spacing(metrics.spacing_sm)
@@ -633,7 +639,7 @@ fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Elemen
                 .padding(tab_strip::chip_padding())
                 .style(action_or_ghost(capturing))
                 .on_press(Message::Settings(SettingsMessage::BeginShortcutCapture {
-                    command: (*id).to_owned(),
+                    command: id.to_owned(),
                 })),
         );
         if overridden {
@@ -641,7 +647,7 @@ fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Elemen
                 button(text("Reset").size(metrics.text_sm))
                     .padding(tab_strip::chip_padding())
                     .style(style::ghost())
-                    .on_press(app.reset_shortcut_message((*id).to_owned())),
+                    .on_press(app.reset_shortcut_message(id.to_owned())),
             );
         }
         section = section.push(row);

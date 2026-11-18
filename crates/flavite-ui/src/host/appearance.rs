@@ -134,6 +134,12 @@ pub struct AppearanceHost {
     pub shortcut_error: Option<String>,
     /// The last keymap-validation failure for Context Mode keys.
     pub keymap_error: Option<String>,
+    /// The violation count of the last whole-layer keymap rejection at
+    /// adoption ([`EventKind::KeymapLayerRejected`]); `None` when the last
+    /// adoption accepted the layer. Consumed by the App via
+    /// [`Self::take_keymap_rejection`] so the diagnostics ring records the
+    /// event exactly once per rejection.
+    keymap_layer_rejected: Option<usize>,
     /// The resolved chord table: default chords with any validated
     /// overrides applied. Rebuilt on every adoption.
     pub shortcuts: Vec<(flavite_api::Chord, &'static str)>,
@@ -166,6 +172,7 @@ impl AppearanceHost {
             last_error: None,
             shortcut_error: None,
             keymap_error: None,
+            keymap_layer_rejected: None,
             shortcuts: Vec::new(),
             context_keys: flavite_edit_context::ContextKeymap::defaults(),
             keyboard_layout: flavite_edit_context::labels::Layout::default(),
@@ -495,10 +502,26 @@ impl AppearanceHost {
         // Context Mode keymap: rebuild from resolved settings (FEUX-0003 X02)
         let context_overrides = self.context_key_overrides();
         self.context_keys = match flavite_edit_context::ContextKeymap::resolve(&context_overrides) {
-            Ok(keymap) => keymap,
-            Err(_errors) => {
-                // Whole-layer rejection: use defaults (FR-5 / E-6)
-                // Errors are surfaced via the Settings tab, not logged here
+            Ok(keymap) => {
+                self.keymap_layer_rejected = None;
+                keymap
+            }
+            Err(errors) => {
+                // Whole-layer rejection: use defaults (FR-5 / E-6). The
+                // first violation is surfaced in the Settings row and the
+                // violation count is recorded for the diagnostics event
+                // (the App emits `KeymapLayerRejected` after adoption).
+                let message = if let Some(first) = errors.first() {
+                    first.to_string()
+                } else {
+                    "Invalid Context Mode key configuration".to_string()
+                };
+                self.keymap_error = Some(if errors.len() > 1 {
+                    format!("{message} ({} problems total)", errors.len())
+                } else {
+                    message
+                });
+                self.keymap_layer_rejected = Some(errors.len());
                 flavite_edit_context::ContextKeymap::defaults()
             }
         };
@@ -539,6 +562,15 @@ impl AppearanceHost {
             return Some(error.clone());
         }
         None
+    }
+
+    /// Consume the keymap-rejection record from the last adoption. The App
+    /// calls this after every adoption path (attach, focus-gained, apply)
+    /// to emit [`EventKind::KeymapLayerRejected`] exactly once per
+    /// rejection.
+    #[must_use]
+    pub fn take_keymap_rejection(&mut self) -> Option<usize> {
+        self.keymap_layer_rejected.take()
     }
 
     /// Get the binding label for a Context Mode binding id using the effective

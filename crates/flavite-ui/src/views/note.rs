@@ -159,7 +159,12 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             incarnation,
             input,
         })
-        .with_input_enabled(!app.picker.open && !app.palette_open && app.strip_menu.is_none())
+        .with_input_enabled(
+            !app.picker.open
+                && !app.palette_open
+                && app.profile_picker.is_none()
+                && app.strip_menu.is_none(),
+        )
         .with_interaction(move |snapshot| Message::EditorAction {
             tab,
             incarnation,

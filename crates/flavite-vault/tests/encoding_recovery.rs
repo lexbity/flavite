@@ -55,6 +55,8 @@ struct Harness {
     fs: MemFs,
     root: PathBuf,
     #[allow(dead_code)]
+    root_dir: tempfile::TempDir,
+    #[allow(dead_code)]
     db_dir: tempfile::TempDir,
     #[allow(dead_code)]
     data_dir: tempfile::TempDir,
@@ -65,7 +67,12 @@ impl Harness {
     /// (simulating a process restart while the stack state stays on disk).
     fn new() -> Self {
         let fs = MemFs::new();
-        let root = PathBuf::from("/test/vault");
+        // The vault root is a REAL temporary directory: the recovery writer
+        // and encoding hints live in `.flavite/` on the OS filesystem
+        // (vault-only configuration), while note content still flows
+        // through the MemFs.
+        let root_dir = tempfile::tempdir().expect("vault root");
+        let root = root_dir.path().to_path_buf();
         fs.create_dir_all(&root).expect("vault root");
         let db_dir = tempfile::tempdir().expect("index dir");
         let db = db_dir.path().join("index.sqlite3");
@@ -85,6 +92,7 @@ impl Harness {
             actor,
             fs,
             root,
+            root_dir,
             db_dir,
             data_dir,
         }

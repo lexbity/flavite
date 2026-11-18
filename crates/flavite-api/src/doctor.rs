@@ -11,7 +11,6 @@
 //! Doctor never cleans files referenced by a live journal.
 
 use crate::types::ApiVaultRef;
-use directories::ProjectDirs;
 use flavite_fs::{OsFs, list_orphan_temps};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -238,7 +237,7 @@ impl DoctorChecker {
         if let Ok(Some(uuid)) = flavite_vault::identity::read_vault_toml(&vault.root) {
             vault.uuid = uuid;
         }
-        let db = cache_db_path(vault.uuid);
+        let db = cache_db_path(&vault.root, vault.uuid);
         Self {
             vault,
             db,
@@ -354,13 +353,13 @@ impl DoctorChecker {
         report.add_check(temp_check(&self.vault.root));
         report.add_check(journal_check(&self.vault.root));
         report.add_check(collision_check(&self.vault.root));
-        report.add_check(history_check(self.vault.uuid));
-        report.add_check(observability_check());
+        report.add_check(history_check(&self.vault.root));
+        report.add_check(observability_check(&self.vault.root));
         report.add_check(runtime_counters_check(conn.as_ref()));
         report.add_check(watcher_health_check(conn.as_ref()));
         report.add_check(sample_hash_check(conn.as_ref(), &self.vault.root));
-        report.add_check(registry_check());
-        report.add_check(orphan_socket_check());
+        report.add_check(registry_check(&self.vault.root));
+        report.add_check(orphan_socket_check(&self.vault.root));
         report.summary.calculate_total();
         report
     }
@@ -590,25 +589,19 @@ fn persisted_counter_details(conn: &Connection, keys: &[flavite_index::schema::M
         .join("; ")
 }
 
-/// Local diagnostics directory used by the rotating log and crash report.
+/// The vault-local diagnostics directory (`.flavite/logs/`) used by the
+/// rotating log and crash report.
 #[must_use]
-pub fn diagnostics_log_dir() -> Option<PathBuf> {
-    ProjectDirs::from("com", "flavite", "Flavite")
-        .map(|dirs| dirs.data_local_dir().join("flavite").join("logs"))
+pub fn vault_log_dir(vault_root: &Path) -> PathBuf {
+    vault_root.join(".flavite").join("logs")
 }
 
-fn observability_check() -> DoctorCheck {
-    let Some(dir) = diagnostics_log_dir() else {
-        return DoctorCheck::warn(
-            "observability",
-            "Local logs and crash reports",
-            "OS data directory unavailable",
-        );
-    };
+fn observability_check(root: &Path) -> DoctorCheck {
+    let dir = vault_log_dir(root);
     let log = dir.join("flavite.log");
     let crash = dir.join("crash-report.txt");
     if log.exists() {
-        DoctorCheck::ok("observability", "Local rotating log is available").with_details(format!(
+        DoctorCheck::ok("observability", "Vault rotating log is available").with_details(format!(
             "Log: {}; last crash report: {}",
             log.display(),
             if crash.exists() { "present" } else { "none" }
@@ -616,7 +609,7 @@ fn observability_check() -> DoctorCheck {
     } else {
         DoctorCheck::warn(
             "observability",
-            "Local rotating log has not been created",
+            "Vault rotating log has not been created",
             format!("Expected {}", log.display()),
         )
     }
@@ -656,18 +649,16 @@ fn attachment_check(conn: Option<&Connection>) -> DoctorCheck {
     }
 }
 
-/// Locate the current schema's disposable SQLite cache for a vault identity.
+/// Locate the disposable SQLite cache for a vault, inside the vault:
+/// `<vault>/.flavite/cache/v<major>/index.sqlite3` (self-contained vault).
 #[must_use]
-pub fn cache_db_path(uuid: uuid::Uuid) -> PathBuf {
-    ProjectDirs::from("com", "flavite", "Flavite")
-        .map(|p| {
-            p.cache_dir()
-                .join("flavite")
-                .join(uuid.to_string())
-                .join(format!("v{}", flavite_index::SCHEMA_MAJOR))
-                .join("index.sqlite3")
-        })
-        .unwrap_or_default()
+pub fn cache_db_path(vault_root: &std::path::Path, uuid: uuid::Uuid) -> PathBuf {
+    vault_root
+        .join(".flavite")
+        .join("cache")
+        .join(uuid.to_string())
+        .join(format!("v{}", flavite_index::SCHEMA_MAJOR))
+        .join("index.sqlite3")
 }
 
 fn sqlite_check(conn: Option<&Connection>, path: &Path) -> DoctorCheck {
@@ -855,15 +846,8 @@ fn sample_hash_check(conn: Option<&Connection>, root: &Path) -> DoctorCheck {
     }
 }
 
-fn registry_check() -> DoctorCheck {
-    let Some(project) = ProjectDirs::from("com", "flavite", "Flavite") else {
-        return DoctorCheck::warn(
-            "registry_records",
-            "Registry unavailable",
-            "OS data directory unavailable",
-        );
-    };
-    let dir = project.data_dir().join("flavite/vaults");
+fn registry_check(root: &Path) -> DoctorCheck {
+    let dir = root.join(".flavite").join("identity").join("vaults");
     let Ok(entries) = fs::read_dir(&dir) else {
         return DoctorCheck::ok("registry_records", "No vault registry records found");
     };
@@ -898,15 +882,8 @@ fn registry_check() -> DoctorCheck {
     }
 }
 
-fn orphan_socket_check() -> DoctorCheck {
-    let Some(project) = ProjectDirs::from("com", "flavite", "Flavite") else {
-        return DoctorCheck::warn(
-            "orphan_instance_sockets",
-            "Socket check unavailable",
-            "OS data directory unavailable",
-        );
-    };
-    let dir = project.data_dir().join("flavite/vaults");
+fn orphan_socket_check(root: &Path) -> DoctorCheck {
+    let dir = root.join(".flavite").join("identity").join("vaults");
     let Ok(entries) = fs::read_dir(&dir) else {
         return DoctorCheck::ok("orphan_instance_sockets", "No instance sockets found");
     };
@@ -1053,19 +1030,8 @@ fn collision_check(root: &Path) -> DoctorCheck {
         )
     }
 }
-fn history_check(uuid: uuid::Uuid) -> DoctorCheck {
-    let Some(project) = ProjectDirs::from("com", "flavite", "Flavite") else {
-        return DoctorCheck::warn(
-            "history_size",
-            "History size unavailable",
-            "OS data directory unavailable",
-        );
-    };
-    let path = project
-        .data_dir()
-        .join("flavite/vaults")
-        .join(uuid.to_string())
-        .join("history");
+fn history_check(root: &Path) -> DoctorCheck {
+    let path = root.join(".flavite").join("history");
     let bytes = tree_size(&path);
     let snapshots = tree_file_count(&path);
     const LIMIT: u64 = 1024 * 1024 * 1024;
@@ -1212,12 +1178,11 @@ pub fn run_doctor(vault: ApiVaultRef) -> DoctorReport {
 /// Enumerate durable replacement operations (RFC-0006 S08/§6.8):
 /// inspection-only, never printing keys or content. Quarantined (corrupt/
 /// unknown) operations are flagged, never guessed as empty.
-fn scan_operations(root: &Path, vault_uuid: &uuid::Uuid) -> Vec<DoctorOperation> {
+fn scan_operations(root: &Path) -> Vec<DoctorOperation> {
     let base = root.join(".flavite").join("operations").join("replace");
     let Ok(entries) = std::fs::read_dir(&base) else {
         return Vec::new();
     };
-    let data_dir = flavite_vault::identity::resolve_data_dir(None);
     let mut operations = Vec::new();
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
@@ -1241,14 +1206,12 @@ fn scan_operations(root: &Path, vault_uuid: &uuid::Uuid) -> Vec<DoctorOperation>
             .ok()
             .map(|records| records.flatten().count() as u64)
             .unwrap_or(0);
-        let head_present = data_dir.as_ref().is_some_and(|data| {
-            data.join("flavite")
-                .join("vaults")
-                .join(vault_uuid.to_string())
-                .join("operations")
-                .join(format!("{job_id}.head"))
-                .is_file()
-        });
+        // The high-water head lives in the vault now (`.flavite/operations/`).
+        let head_present = root
+            .join(".flavite")
+            .join("operations")
+            .join(format!("{job_id}.head"))
+            .is_file();
         let quarantine = !manifest_ok || (record_count > 0 && !head_present);
         operations.push(DoctorOperation {
             job_id,
@@ -1272,7 +1235,7 @@ pub fn run_doctor_root(root: PathBuf) -> Result<DoctorReport, String> {
     let identity = flavite_vault::IdentityManager::open(&fs, root)
         .map_err(|e| format!("Cannot acquire vault identity/instance lock: {e}"))?;
     let vault_ref = ApiVaultRef::new(identity.identity().uuid, identity.identity().root.clone());
-    let operations = scan_operations(&identity.identity().root, &identity.identity().uuid);
+    let operations = scan_operations(&identity.identity().root);
     let mut report = DoctorChecker::new(vault_ref).run();
     report.operations = operations;
     drop(identity);

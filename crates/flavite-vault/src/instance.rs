@@ -6,30 +6,17 @@
 //! 3. Root guard + UUID lock ordering per §4.13
 //!
 //! Key guarantees:
-//! - Lock and IPC artifacts live ONLY in OS data dir, never in vault
+//! - Lock and IPC artifacts live ONLY inside the vault's identity root
+//!   (`.flavite/identity/`), never in OS data dirs
 //! - Advisory locks die with the process (no stale locks)
 //! - Cross-machine concurrent writing is unsupported
 //! - Second instance focuses first and exits
 
-use crate::identity::uuid_lock_path;
 use crate::types::VaultIdentity;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use uuid::Uuid;
-
-/// Flavite directory name in OS data.
-const FLAVITE_DIR: &str = "flavite";
-
-/// Vaults subdirectory.
-const VAULTS_DIR: &str = "vaults";
-
-/// Roots subdirectory.
-const ROOTS_DIR: &str = "roots";
-
-/// IPC socket/pipe name.
-const INSTANCE_IPC: &str = "instance.ipc";
 
 /// Lock file mode (Unix: use O_EXCL for atomic creation).
 const LOCK_MODE: u32 = 0o600;
@@ -309,8 +296,8 @@ impl InstanceManager {
     ///
     /// Locks are managed by IdentityManager. This only manages the focus IPC.
     pub fn new(identity: VaultIdentity) -> InstanceResult<Self> {
-        // Create focus IPC
-        let ipc_path = get_ipc_path(identity.uuid)?;
+        // Create focus IPC (vault-local, `<vault>/.flavite/identity/vaults/`).
+        let ipc_path = crate::identity::instance_ipc_path(&identity.root, identity.uuid);
         let focus_ipc = FocusIpc::new(ipc_path, true)?;
 
         Ok(Self {
@@ -323,7 +310,7 @@ impl InstanceManager {
     ///
     /// Returns Ok if focus was sent, Err if no existing instance.
     pub fn try_focus_existing(identity: &VaultIdentity) -> InstanceResult<()> {
-        let ipc_path = get_ipc_path(identity.uuid)?;
+        let ipc_path = crate::identity::instance_ipc_path(&identity.root, identity.uuid);
 
         // Check if IPC endpoint exists
         if !ipc_path.exists() {
@@ -348,50 +335,25 @@ impl InstanceManager {
     }
 }
 
-/// Get the path to the data directory. One authority with the identity
-/// layer: the resolved data directory (binary-bound, explicit, or the
-/// platform default) must hold for the instance IPC too, or a fresh
-/// isolated run binds its socket in the default user data directory while
-/// everything else lives under the override — the ambient state that S8
-/// removes.
-fn instance_data_dir() -> InstanceResult<PathBuf> {
-    crate::identity::resolve_data_dir(None).ok_or(InstanceError::NoProjectDirs)
-}
-
-/// Get the path to the IPC endpoint for a UUID.
-fn get_ipc_path(uuid: Uuid) -> InstanceResult<PathBuf> {
-    let data_dir = instance_data_dir()?;
-    Ok(data_dir
-        .join(FLAVITE_DIR)
-        .join(VAULTS_DIR)
-        .join(uuid.to_string())
-        .join(INSTANCE_IPC))
-}
-
 /// Check if an instance is already running for a vault.
 pub fn is_instance_running(identity: &VaultIdentity) -> bool {
-    // Check UUID lock
-    if let Some(path) = uuid_lock_path(identity.uuid)
-        && AdvisoryLock::exists(&path)
-    {
+    // Check UUID lock (vault-local identity root).
+    if AdvisoryLock::exists(&crate::identity::uuid_lock_path(
+        &identity.root,
+        identity.uuid,
+    )) {
         return true;
     }
 
-    // Check root guard
-    if AdvisoryLock::exists(&get_root_guard_path(&identity.root_key)) {
+    // Check root guard (vault-local identity root).
+    if AdvisoryLock::exists(&crate::identity::root_guard_path(
+        &identity.root,
+        &identity.root_key,
+    )) {
         return true;
     }
 
     false
-}
-
-/// Get the root guard path for a root key.
-fn get_root_guard_path(root_key: &[u8]) -> PathBuf {
-    instance_data_dir()
-        .unwrap_or_else(|_| PathBuf::from("/tmp/flavite"))
-        .join(FLAVITE_DIR)
-        .join(ROOTS_DIR)
-        .join(format!("{}.lock", hex::encode(root_key)))
 }
 
 #[cfg(test)]
@@ -422,13 +384,6 @@ mod tests {
         // Note: On some systems, the file might persist briefly
     }
 
-    #[test]
-    fn test_get_data_dir() {
-        // This should not panic
-        let result = instance_data_dir();
-        assert!(result.is_ok() || result.is_err());
-    }
-
     #[cfg(unix)]
     #[test]
     fn focus_ipc_client_failure_and_lock_cleanup_paths() {
@@ -447,14 +402,18 @@ mod tests {
     }
 
     #[test]
-    fn nonexisting_instance_cannot_be_focused_and_root_keys_are_stable() {
-        let identity =
-            VaultIdentity::new(Uuid::now_v7(), PathBuf::from("/vault"), vec![0, 1, 0xfe]);
+    fn root_guard_path_is_vault_local_and_stable() {
+        let identity = VaultIdentity::new(
+            uuid::Uuid::now_v7(),
+            PathBuf::from("/vault"),
+            vec![0, 1, 0xfe],
+        );
         assert!(matches!(
             InstanceManager::try_focus_existing(&identity),
             Err(InstanceError::IpcConnectionFailed(_)) | Err(InstanceError::NoProjectDirs)
         ));
-        let path = get_root_guard_path(&identity.root_key);
+        let path = crate::identity::root_guard_path(&identity.root, &identity.root_key);
+        assert!(path.starts_with(Path::new("/vault/.flavite/identity")));
         assert!(path.ends_with("0001fe.lock"));
     }
 }

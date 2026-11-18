@@ -171,26 +171,17 @@ fn record_file(records_dir: &Path, seq: u64) -> PathBuf {
 
 impl JobLog {
     /// Open (or create) the log for a job, verifying the chain when
-    /// records exist. `data_dir` is the private OS data directory for the
-    /// high-water head.
+    /// records exist. The private high-water head lives inside the vault
+    /// (`.flavite/operations/<job>/<job>.head`) with the records.
     pub fn open(
         io: Box<dyn OpStoreIo>,
         store: &ReplaceStore,
         job_id: &str,
         key: OperationKey,
-        data_dir: &Path,
-        vault_uuid: &uuid::Uuid,
     ) -> Result<Self, LogError> {
         let records_dir = store.base().join(job_id).join("records");
-        let head_dir = data_dir
-            .join("flavite")
-            .join("vaults")
-            .join(vault_uuid.to_string())
-            .join("operations");
-        let head_path = head_dir.join(format!("{job_id}.head"));
+        let head_path = store.base().join(job_id).join(format!("{job_id}.head"));
         io.mkdir_all(&records_dir).map_err(LogError::Io)?;
-        // The head directory lives in the OS private data dir (outside the
-        // vault) and is created lazily by `write_head` via std::fs.
         let mut log = Self {
             io,
             records_dir,
@@ -217,7 +208,7 @@ impl JobLog {
     }
 
     fn read_head(&self) -> Result<Option<(u64, [u8; 32])>, LogError> {
-        let bytes = match crate::private_state::read_if_exists(&self.head_path) {
+        let bytes = match self.io.read(&self.head_path) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(None),
             Err(error) => return Err(LogError::Io(error)),
@@ -230,15 +221,15 @@ impl JobLog {
         Ok(Some((seq, auth)))
     }
 
-    /// Write the private high-water head atomically (temp + rename): the
-    /// head lives in the OS private data directory, OUTSIDE the vault, so
-    /// the vault-contained operation store must not be used (and vault
-    /// rollback must not be able to rewrite it).
+    /// Write the private high-water head atomically (temp + rename via the
+    /// operation store I/O, so it is contained in the vault and durable).
     fn write_head(&self, seq: u64, auth: [u8; 32]) -> Result<(), LogError> {
         let mut bytes = Vec::with_capacity(40);
         bytes.extend_from_slice(&seq.to_le_bytes());
         bytes.extend_from_slice(&auth);
-        crate::private_state::write_atomic(&self.head_path, &bytes).map_err(LogError::Io)
+        self.io
+            .write_replace(&self.head_path, &bytes)
+            .map_err(LogError::Io)
     }
 
     fn list_records(&self) -> Result<Vec<PathBuf>, LogError> {
@@ -473,7 +464,7 @@ mod tests {
     };
     use crate::replace::store::ReplaceStore;
     use flavite_fs::{Fs, MemFs};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     #[derive(Clone)]
     struct MemIo(MemFs);
@@ -523,10 +514,9 @@ mod tests {
         fn remove(&self, path: &Path) -> Result<(), String> {
             self.0.remove(path).map_err(|e| e.to_string())
         }
-    }
-
-    fn tmp_data_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("flavite-logtest-{}", uuid::Uuid::now_v7()))
+        fn remove_dir_all(&self, path: &Path) -> Result<(), String> {
+            self.0.remove_dir_all(path).map_err(|e| e.to_string())
+        }
     }
 
     fn empty_manifest(job: &str) -> PreviewManifest {
@@ -562,11 +552,11 @@ mod tests {
         let job = "a".repeat(32);
         let job = job.as_str();
         store.seal_preview(&io, &empty_manifest(job)).expect("seal");
-        let data_dir = tmp_data_dir();
+        let key_root = tempfile::tempdir().unwrap();
         let vault = uuid::Uuid::now_v7();
-        let key = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key");
-        let mut log =
-            JobLog::open(Box::new(io.clone()), &store, job, key, &data_dir, &vault).expect("open");
+        let key = crate::operation_key::load_or_create_key_at_vault(key_root.path(), &vault)
+            .expect("key");
+        let mut log = JobLog::open(Box::new(io.clone()), &store, job, key).expect("open");
         let first = log.append(7, ItemAction::IntentDurable).expect("intent");
         assert_eq!(first.seq, 1);
         let second = log
@@ -580,16 +570,15 @@ mod tests {
         assert_eq!(second.seq, 2);
         drop(log);
 
-        let key2 = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key2");
-        let mut reopened =
-            JobLog::open(Box::new(io), &store, job, key2, &data_dir, &vault).expect("reopen");
+        let key2 = crate::operation_key::load_or_create_key_at_vault(key_root.path(), &vault)
+            .expect("key2");
+        let mut reopened = JobLog::open(Box::new(io), &store, job, key2).expect("reopen");
         assert_eq!(reopened.seq(), 2);
         assert_eq!(reopened.last_auth(), second.auth);
         let third = reopened
             .append(8, ItemAction::IntentDurable)
             .expect("append after reopen");
         assert_eq!(third.seq, 3);
-        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]
@@ -600,11 +589,11 @@ mod tests {
         let job = "b".repeat(32);
         let job = job.as_str();
         store.seal_preview(&io, &empty_manifest(job)).expect("seal");
-        let data_dir = tmp_data_dir();
+        let key_root = tempfile::tempdir().unwrap();
         let vault = uuid::Uuid::now_v7();
-        let key = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key");
-        let mut log =
-            JobLog::open(Box::new(io.clone()), &store, job, key, &data_dir, &vault).expect("open");
+        let key = crate::operation_key::load_or_create_key_at_vault(key_root.path(), &vault)
+            .expect("key");
+        let mut log = JobLog::open(Box::new(io.clone()), &store, job, key).expect("open");
         log.append(1, ItemAction::IntentDurable).expect("intent");
         drop(log);
 
@@ -619,11 +608,10 @@ mod tests {
         fs.write_new(&file, &bytes).unwrap();
         fs.fsync_file(&file).unwrap();
 
-        let key2 = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key2");
-        let err =
-            JobLog::open(Box::new(io), &store, job, key2, &data_dir, &vault).expect_err("corrupt");
+        let key2 = crate::operation_key::load_or_create_key_at_vault(key_root.path(), &vault)
+            .expect("key2");
+        let err = JobLog::open(Box::new(io), &store, job, key2).expect_err("corrupt");
         assert!(matches!(err, LogError::Corrupt(_)));
-        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]
@@ -634,32 +622,17 @@ mod tests {
         let job = "c".repeat(32);
         let job = job.as_str();
         store.seal_preview(&io, &empty_manifest(job)).expect("seal");
-        let data_dir = tmp_data_dir();
+        let key_root = tempfile::tempdir().unwrap();
         let vault = uuid::Uuid::now_v7();
-        let key = crate::operation_key::load_or_create_key(&data_dir, &vault).expect("key");
-        let mut log = JobLog::open(
-            Box::new(io.clone()),
-            &store,
-            job,
-            key.clone(),
-            &data_dir,
-            &vault,
-        )
-        .expect("open");
+        let key = crate::operation_key::load_or_create_key_at_vault(key_root.path(), &vault)
+            .expect("key");
+        let mut log = JobLog::open(Box::new(io.clone()), &store, job, key.clone()).expect("open");
         log.append(1, ItemAction::IntentDurable).expect("intent");
         drop(log);
-        // Delete the private head (std::fs: it lives in the real OS data
-        // dir, outside the MemFs vault).
-        let head = data_dir
-            .join("flavite")
-            .join("vaults")
-            .join(vault.to_string())
-            .join("operations")
-            .join(format!("{job}.head"));
-        std::fs::remove_file(&head).expect("remove head");
-        let err = JobLog::open(Box::new(io), &store, job, key, &data_dir, &vault)
-            .expect_err("head missing");
+        // Delete the vault-local head; records survive → HeadMismatch.
+        let head = store.base().join(job).join(format!("{job}.head"));
+        fs.remove(&head).expect("remove head");
+        let err = JobLog::open(Box::new(io), &store, job, key).expect_err("head missing");
         assert!(matches!(err, LogError::HeadMismatch(_)));
-        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

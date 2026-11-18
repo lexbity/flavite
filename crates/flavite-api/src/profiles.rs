@@ -18,9 +18,14 @@ pub const MAX_PROFILE_BYTES: usize = 64 * 1024;
 pub const MAX_PROFILES: usize = 64;
 /// Maximum length of a profile display name (FEUX-0003 §5.8).
 pub const MAX_NAME_BYTES: usize = 64;
+/// Maximum length of the sanitized id stem (FEUX-0003 §5.7: the
+/// sanitized name is capped at 40 bytes before the digest suffix is
+/// appended).
+pub const MAX_SANITIZED_ID_BYTES: usize = 40;
 
-/// Entry name for profile documents.
-const PROFILE_ENTRY: &str = "profile.toml";
+/// File extension for profile documents. Profiles are one flat
+/// `<id>.toml` per document (FEUX-0003 §5.7), never directories.
+const PROFILE_EXT: &str = ".toml";
 
 /// Why a profile storage operation failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +139,9 @@ impl ProfileId {
 /// Sanitize a profile name for use in a filesystem path.
 ///
 /// Converts to lowercase, replaces invalid characters with '-',
-/// collapses consecutive '-', and trims.
+/// collapses consecutive '-', trims, and caps the result at
+/// [`MAX_SANITIZED_ID_BYTES`] bytes so a hostile or absurd name can never
+/// create an unbounded path component (FEUX-0003 §5.7).
 fn sanitize_name(name: &str) -> String {
     let mut result = String::with_capacity(name.len());
 
@@ -165,12 +172,53 @@ fn sanitize_name(name: &str) -> String {
     // Trim leading/trailing '-'
     let trimmed = collapsed.trim_matches('-');
 
+    // Cap at the 40-byte id-stem bound; if truncation lands on a partial
+    // UTF-8 sequence the loss is confined to the stem, never the digest.
+    let mut capped = trimmed
+        .chars()
+        .take(MAX_SANITIZED_ID_BYTES)
+        .collect::<String>();
+    while capped.len() > MAX_SANITIZED_ID_BYTES {
+        capped.pop();
+    }
+    let capped = capped.trim_matches('-');
+
     // Ensure non-empty
-    if trimmed.is_empty() {
+    if capped.is_empty() {
         "profile".to_string()
     } else {
-        trimmed.to_string()
+        capped.to_string()
     }
+}
+
+/// Recover the display portion of an id: `<sanitized>-<8 hex>` → the
+/// sanitized stem. The profile file stores only the id (the digest suffix
+/// is the collision guard), so the stem is the most faithful name the
+/// flat-file layout can report back.
+fn display_name_from_id(id: &str) -> String {
+    let Some((stem, suffix)) = id.rsplit_once('-') else {
+        return id.to_string();
+    };
+    if suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        stem.to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+/// Validate profile bytes at the store boundary: the codec must parse the
+/// document and its schema must not be newer than the supported version
+/// (FEUX-0003 §5.8: `create`/`import` must refuse unparseable and newer
+/// documents; apply-time policy stays at the facade).
+fn validate_profile_bytes(bytes: &[u8]) -> Result<(), ProfilesStoreError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| ProfilesStoreError::Unparseable(error.to_string()))?;
+    let parsed = flavite_settings::codec::parse(Some(text))
+        .map_err(|error| ProfilesStoreError::Unparseable(error.to_string()))?;
+    if parsed.doc.schema > flavite_settings::descriptor::SCHEMA_VERSION {
+        return Err(ProfilesStoreError::SchemaNewer);
+    }
+    Ok(())
 }
 
 /// Compute a short blake3 hash of a string (first 8 hex characters).
@@ -260,11 +308,23 @@ impl ProfilesStore {
         }
     }
 
+    /// The store root directory (`.flavite/profiles` for a vault store).
+    /// Tests and the export/import facade use it to reach real files.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Create and store a new profile from raw TOML bytes.
     ///
+    /// The bytes must parse as a settings document with schema ≤ 2
+    /// (FEUX-0003 §5.8); unparseable or newer documents are refused here,
+    /// never stored. Profiles are one flat `<id>.toml` file per document.
+    ///
     /// # Errors
-    /// Returns an error for invalid names, oversized profiles, duplicate ids,
-    /// protected paths, or filesystem failures.
+    /// Returns an error for invalid names, oversized or unparseable
+    /// profiles, newer schemas, duplicate ids, protected paths, or
+    /// filesystem failures.
     pub fn create(&self, name: &str, bytes: &[u8]) -> Result<StoredProfile, ProfilesStoreError> {
         if !self.allow_writes {
             return Err(ProfilesStoreError::ReadOnly);
@@ -274,11 +334,13 @@ impl ProfilesStore {
             return Err(ProfilesStoreError::TooLarge { size: bytes.len() });
         }
 
+        validate_profile_bytes(bytes)?;
+
         let profile_id = ProfileId::from_name(name)?;
 
-        // Check for duplicate id
-        let directory = self.directory_for(&profile_id.id);
-        let profile_path = directory.join(PROFILE_ENTRY);
+        // Check for duplicate id and protected (symlink) targets
+        let profile_path = self.file_for(&profile_id.id);
+        self.guard_protected(&profile_path)?;
         if self
             .fs
             .exists(&profile_path)
@@ -295,14 +357,11 @@ impl ProfilesStore {
             return Err(ProfilesStoreError::TooManyProfiles);
         }
 
-        let directory = self.directory_for(&profile_id.id);
-        self.guard_protected(&directory.join(PROFILE_ENTRY))?;
-
         self.fs
-            .create_dir_all(&directory)
+            .create_dir_all(&self.root)
             .map_err(|error| ProfilesStoreError::Fs(error.to_string()))?;
 
-        atomic_write(self.fs.as_ref(), &directory.join(PROFILE_ENTRY), bytes)
+        atomic_write(self.fs.as_ref(), &profile_path, bytes)
             .map_err(|error| ProfilesStoreError::Fs(error.to_string()))?;
 
         Ok(StoredProfile {
@@ -313,7 +372,8 @@ impl ProfilesStore {
 
     /// List all stored profiles, sorted by name.
     ///
-    /// A directory without readable profile files is skipped.
+    /// A profile file that is unreadable, empty, or not a `.toml` file is
+    /// skipped (an interrupted write leaves nothing to list).
     pub fn list(&self) -> Result<Vec<StoredProfile>, ProfilesStoreError> {
         let mut profiles = Vec::new();
 
@@ -331,14 +391,17 @@ impl ProfilesStore {
             .read_dir(&self.root)
             .map_err(|error| ProfilesStoreError::Fs(error.to_string()))?
         {
-            if !entry.is_dir {
+            if entry.is_dir {
                 continue;
             }
-
-            let profile_path = entry.path.join(PROFILE_ENTRY);
+            let file_name = entry.path.file_name().unwrap_or_default();
+            let file_name = file_name.to_string_lossy();
+            if !file_name.ends_with(PROFILE_EXT) {
+                continue;
+            }
             let Some(raw_bytes) = self
                 .fs
-                .read_if_exists(&profile_path)
+                .read_if_exists(&entry.path)
                 .map_err(|error| ProfilesStoreError::Fs(error.to_string()))?
             else {
                 continue;
@@ -349,17 +412,12 @@ impl ProfilesStore {
                 continue;
             }
 
-            // Extract the id from the directory name
-            // Directory name format: <sanitized-name>-<hash>
-            let dir_name = entry.path.file_name().unwrap_or_default();
-            let dir_name_str = dir_name.to_string_lossy().to_string();
-
-            // For X06, we use the directory name as the id
-            // In a full implementation, we might parse the name back, but
-            // the directory name is the id
+            // The file stem is the id; the display name is the sanitized
+            // stem (digest suffix stripped).
+            let id = file_name.trim_end_matches(PROFILE_EXT).to_string();
             let profile_id = ProfileId {
-                name: dir_name_str.clone(),
-                id: dir_name_str,
+                name: display_name_from_id(&id),
+                id,
             };
 
             profiles.push(StoredProfile {
@@ -376,12 +434,21 @@ impl ProfilesStore {
 
     /// Read a profile by its internal id.
     pub fn read(&self, id: &str) -> Result<StoredProfile, ProfilesStoreError> {
-        for profile in self.list()? {
-            if profile.id.id == id {
-                return Ok(profile);
-            }
-        }
-        Err(ProfilesStoreError::NotFound { id: id.to_string() })
+        let profile_path = self.file_for(id);
+        let Some(bytes) = self
+            .fs
+            .read_if_exists(&profile_path)
+            .map_err(|error| ProfilesStoreError::Fs(error.to_string()))?
+        else {
+            return Err(ProfilesStoreError::NotFound { id: id.to_string() });
+        };
+        Ok(StoredProfile {
+            id: ProfileId {
+                name: display_name_from_id(id),
+                id: id.to_string(),
+            },
+            bytes,
+        })
     }
 
     /// Read a profile's bytes by its internal id.
@@ -396,10 +463,9 @@ impl ProfilesStore {
             return Err(ProfilesStoreError::ReadOnly);
         }
 
-        let directory = self.directory_for(id);
+        let profile_path = self.file_for(id);
+        self.guard_protected(&profile_path)?;
 
-        // Check if the profile exists
-        let profile_path = directory.join(PROFILE_ENTRY);
         if !self
             .fs
             .exists(&profile_path)
@@ -408,14 +474,9 @@ impl ProfilesStore {
             return Err(ProfilesStoreError::NotFound { id: id.to_string() });
         }
 
-        // Remove the profile file
-        self.guard_protected(&profile_path)?;
         self.fs
             .remove(&profile_path)
             .map_err(|error| ProfilesStoreError::Fs(error.to_string()))?;
-
-        // Note: We don't remove the directory itself, just the profile file.
-        // The directory will be empty and can be cleaned up separately.
 
         Ok(())
     }
@@ -430,8 +491,8 @@ impl ProfilesStore {
 
     /// Import a profile from a host path.
     ///
-    /// Reads the file, validates bounds, and creates a new profile with
-    /// the name derived from the file stem.
+    /// Reads the file, validates bounds and parseability, and creates a
+    /// new profile with the name derived from the file stem.
     pub fn import_path(&self, path: &Path) -> Result<StoredProfile, ProfilesStoreError> {
         if !self.allow_writes {
             return Err(ProfilesStoreError::ReadOnly);
@@ -456,20 +517,20 @@ impl ProfilesStore {
         self.create(&name, &bytes)
     }
 
-    /// Get the directory path for a profile id.
-    fn directory_for(&self, id: &str) -> PathBuf {
-        let mut path = self.root.clone();
-        path.push(id);
-        path
+    /// The path of one profile document: `<root>/<id>.toml`.
+    fn file_for(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}{PROFILE_EXT}"))
     }
 
-    /// Guard against protected paths (symlinks, etc.).
+    /// Guard against protected paths: a target that already exists as a
+    /// symlink is refused, so a hostile link can never redirect a profile
+    /// write (FEUX-0003 §5.8; mirrors `ThemeStore::guard_protected`).
     fn guard_protected(&self, path: &Path) -> Result<(), ProfilesStoreError> {
-        // Check for path escape attempts
-        let path_str = path.to_string_lossy();
-        if path_str.contains("..") {
+        if let Ok(metadata) = self.fs.metadata(path)
+            && metadata.is_symlink
+        {
             return Err(ProfilesStoreError::Protected {
-                path: path_str.to_string(),
+                path: path.display().to_string(),
             });
         }
         Ok(())
@@ -524,9 +585,13 @@ mod tests {
 
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1);
-        // The name in the listed profile is the sanitized directory name
-        // The original name is stored in profile.id.name
-        assert_eq!(listed[0].id.name, _profile.id.id);
+        // Flat-file layout: one <id>.toml; the display name is the
+        // sanitized stem (digest suffix stripped).
+        assert_eq!(listed[0].id.name, "test-profile");
+        assert_eq!(listed[0].id.id, _profile.id.id);
+        // The stored file is a single flat .toml in the root.
+        let file = store.root.join(format!("{}.toml", _profile.id.id));
+        assert!(store.fs.exists(&file).unwrap());
     }
 
     #[test]
@@ -539,6 +604,42 @@ mod tests {
 
         let result = store.create("test", b"schema = 2");
         assert!(matches!(result, Err(ProfilesStoreError::Exists { .. })));
+    }
+
+    #[test]
+    fn store_rejects_unparseable_and_schema_newer() {
+        let temp_dir = tempdir().unwrap();
+        let fs = Box::new(OsFs);
+        let store = ProfilesStore::at_root(fs, temp_dir.path().to_path_buf());
+
+        let result = store.create("bad toml", b"not = [valid toml");
+        assert!(matches!(result, Err(ProfilesStoreError::Unparseable(_))));
+        assert!(store.list().unwrap().is_empty());
+
+        let result = store.create("schema 3", b"schema = 3\n[appearance]");
+        assert!(matches!(result, Err(ProfilesStoreError::SchemaNewer)));
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_rejects_symlink_profile_path() {
+        let temp_dir = tempdir().unwrap();
+        let fs = Box::new(OsFs);
+        let store = ProfilesStore::at_root(fs, temp_dir.path().to_path_buf());
+
+        // Pre-create a profile so we know the generated id, then replace it
+        // with a symlink and pose a second create/delete at that path.
+        let profile = store.create("link target", b"schema = 2").unwrap();
+        let id = profile.id.id.clone();
+        let file = store.file_for(&id);
+        std::fs::remove_file(&file).unwrap();
+        let outside = temp_dir.path().join("outside.toml");
+        std::fs::write(&outside, b"schema = 2").unwrap();
+        std::os::unix::fs::symlink(&outside, &file).unwrap();
+
+        let result = store.delete(&id);
+        assert!(matches!(result, Err(ProfilesStoreError::Protected { .. })));
+        assert!(store.fs.exists(&outside).unwrap(), "target untouched");
     }
 
     #[test]
@@ -586,6 +687,25 @@ mod tests {
 
         let imported = store.import_path(&export_path).unwrap();
         assert_eq!(imported.bytes, b"schema = 2\n[test]\nvalue = 1");
+        // The imported profile derives its name from the file stem.
+        assert_eq!(imported.id.name, "exported");
+    }
+
+    #[test]
+    fn import_rejects_unparseable() {
+        let temp_dir = tempdir().unwrap();
+        let fs = Box::new(OsFs);
+        // Host files live outside the store root so they never appear as
+        // profiles in `list`.
+        let store = ProfilesStore::at_root(fs, temp_dir.path().join("profiles"));
+        let host = temp_dir.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+
+        let bad = host.join("bad.toml");
+        std::fs::write(&bad, b"not [ valid").unwrap();
+        let result = store.import_path(&bad);
+        assert!(matches!(result, Err(ProfilesStoreError::Unparseable(_))));
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]
@@ -606,5 +726,26 @@ mod tests {
         assert_eq!(sanitize_name("---Test---"), "test");
         assert_eq!(sanitize_name(""), "profile");
         assert_eq!(sanitize_name("!!!"), "profile");
+    }
+
+    #[test]
+    fn sanitize_name_caps_at_40_bytes() {
+        // 45 alphanumerics: under the 64-byte display-name bound, but the
+        // sanitized stem exceeds the 40-byte cap.
+        let long = "a".repeat(45);
+        let sanitized = sanitize_name(&long);
+        assert!(sanitized.len() <= MAX_SANITIZED_ID_BYTES);
+        assert_eq!(sanitized.len(), MAX_SANITIZED_ID_BYTES);
+        let id = ProfileId::from_name(&long).unwrap();
+        assert!(id.id.starts_with(&sanitized));
+        assert!(id.id.len() > MAX_SANITIZED_ID_BYTES);
+    }
+
+    #[test]
+    fn display_name_strips_digest_suffix() {
+        let id = ProfileId::from_name("My Cool Profile").unwrap();
+        assert_eq!(display_name_from_id(&id.id), "my-cool-profile");
+        assert_eq!(display_name_from_id("no-suffix"), "no-suffix");
+        assert_eq!(display_name_from_id("stem-not-hex-xyz"), "stem-not-hex-xyz");
     }
 }

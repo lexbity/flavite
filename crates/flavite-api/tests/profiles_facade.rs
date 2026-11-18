@@ -3,7 +3,7 @@
 //! These tests verify the Flavite facade methods for profile operations.
 
 use flavite_api::{ApplyProfileResult, Flavite, FlaviteError};
-use flavite_fs::MemFs;
+use flavite_fs::{Fs, MemFs};
 
 #[test]
 fn profiles_list_returns_empty_for_new_vault() {
@@ -91,29 +91,73 @@ fn profiles_create_and_apply_roundtrip() {
 }
 
 #[test]
-fn profiles_apply_schema_newer_rejected() {
+fn profiles_create_rejects_schema_newer_at_store_boundary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut flavite =
+        Flavite::open_root(temp_dir.path().to_path_buf(), Default::default()).unwrap();
+
+    let fs = MemFs::new();
+    flavite.set_vault_store_fs_for_test(fs);
+
+    // The store refuses newer-schema documents at create/import
+    // (FEUX-0003 §5.8), so a schema-3 profile can never be stored.
+    let result = flavite.profiles().create(
+        "schema 3",
+        b"schema = 3\n[appearance]\nkeyboard_layout = \"qwerty\"",
+    );
+    assert!(matches!(
+        result,
+        Err(flavite_api::profiles::ProfilesStoreError::SchemaNewer)
+    ));
+    assert!(flavite.profiles_list().unwrap().is_empty());
+    let _ = flavite;
+}
+
+#[test]
+fn profiles_apply_refuses_externally_placed_schema_newer() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut flavite =
         Flavite::open_root(temp_dir.path().to_path_buf(), Default::default()).unwrap();
 
     // Replace the filesystem with MemFs for hermetic testing
     let fs = MemFs::new();
+    // Place a schema-3 file directly in the store root (simulating an
+    // external edit that never passed the store boundary) before the fs
+    // is moved into the vault under test.
+    let store_root = temp_dir.path().join(".flavite").join("profiles");
+    fs.create_dir_all(&store_root).unwrap();
+    let id = "schema3-a1b2c3d4";
+    fs.write_new(
+        &store_root.join(format!("{id}.toml")),
+        b"schema = 3\n[appearance]\nkeyboard_layout = \"qwerty\"",
+    )
+    .unwrap();
     flavite.set_vault_store_fs_for_test(fs);
 
-    // Create a profile with schema version 3 (newer than supported)
-    let _profile = flavite
-        .profiles()
-        .create(
-            "schema 3",
-            b"schema = 3\n[appearance]\nkeyboard_layout = \"qwerty\"",
-        )
-        .unwrap();
-    let profiles = flavite.profiles_list().unwrap();
-    let profile_id = profiles[0].profile_id().to_string();
-
-    // Try to apply it - should be rejected
-    let result = flavite.profiles_apply(&profile_id);
+    // Defense-in-depth: a schema-3 file that somehow lands in the store
+    // root is still refused by apply.
+    let result = flavite.profiles_apply(id);
     assert!(matches!(result, Err(FlaviteError::ProfilesSchemaNewer)));
+    let _ = flavite;
+}
+
+#[test]
+fn profiles_import_rejects_unparseable() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut flavite =
+        Flavite::open_root(temp_dir.path().to_path_buf(), Default::default()).unwrap();
+
+    let fs = MemFs::new();
+    flavite.set_vault_store_fs_for_test(fs);
+
+    let bad = temp_dir.path().join("bad.toml");
+    std::fs::write(&bad, b"not [ valid").unwrap();
+    let result = flavite.profiles_import_path(&bad);
+    assert!(matches!(
+        result,
+        Err(FlaviteError::ProfilesError(message)) if message.contains("unparseable")
+    ));
+    assert!(flavite.profiles_list().unwrap().is_empty());
 }
 
 #[test]

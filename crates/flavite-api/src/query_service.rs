@@ -396,8 +396,8 @@ impl QueryService {
         // One bounded search-session registry per Session (RFC-0006 S06);
         // capture goes through the vault actor's ordered handshake.
         let search_sessions = Arc::new(crate::search_sessions::SearchSessionService::new(
-            crate::doctor::cache_db_path(session.vault_uuid()),
-            crate::doctor::cache_db_path(session.vault_uuid())
+            crate::doctor::cache_db_path(session.root(), session.vault_uuid()),
+            crate::doctor::cache_db_path(session.root(), session.vault_uuid())
                 .parent()
                 .map_or_else(
                     || std::env::temp_dir().join("flavite-search-sessions"),

@@ -441,8 +441,11 @@ impl CliDriver {
             ..Default::default()
         };
 
-        let flavite = Flavite::open_root(vault_path, config)
+        let flavite = Flavite::open_root(vault_path.clone(), config)
             .with_context(|| "Failed to open vault through Flavite API")?;
+        // Vault-only configuration: redirect logs + crash reports to the
+        // vault's `.flavite/logs/` now that the vault is open.
+        set_rotating_log_target(vault_path.join(".flavite").join("logs"));
         let request_id = flavite.command_registry().next_request_id();
         let result = flavite.execute(Invocation::new(
             request_id,
@@ -1399,24 +1402,48 @@ impl CliDriver {
 }
 
 /// Initialize tracing with the appropriate level.
+///
+/// The rotating log writer targets a mutable directory: before a vault is
+/// open it falls back to the system temp dir; once a vault opens, the CLI
+/// redirects the target to `<vault>/.flavite/logs/` so every log and
+/// crash report lives inside the vault (vault-only configuration).
 #[derive(Clone)]
 struct RotatingLogWriter {
-    path: PathBuf,
     max_bytes: u64,
+}
+
+/// The shared rotating-log target; `None` = system temp fallback.
+static LOG_TARGET: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<Option<PathBuf>>>> =
+    std::sync::OnceLock::new();
+
+/// Redirect the rotating log (and crash reports) to `dir` (the vault's
+/// `.flavite/logs/`). Called once a vault has opened successfully.
+fn set_rotating_log_target(dir: PathBuf) {
+    let _ = fs::create_dir_all(&dir);
+    let target = LOG_TARGET.get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(None)));
+    *target.write().unwrap() = Some(dir);
+}
+
+fn current_log_path() -> PathBuf {
+    LOG_TARGET
+        .get()
+        .and_then(|target| target.read().unwrap().clone())
+        .unwrap_or_else(|| std::env::temp_dir().join("flavite.log"))
 }
 
 impl<'a> MakeWriter<'a> for RotatingLogWriter {
     type Writer = fs::File;
     fn make_writer(&'a self) -> Self::Writer {
-        if fs::metadata(&self.path).is_ok_and(|metadata| metadata.len() >= self.max_bytes) {
-            let backup = self.path.with_extension("log.1");
+        let path = current_log_path();
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= self.max_bytes) {
+            let backup = path.with_extension("log.1");
             let _ = fs::remove_file(&backup);
-            let _ = fs::rename(&self.path, backup);
+            let _ = fs::rename(&path, backup);
         }
         OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)
+            .open(&path)
             .unwrap_or_else(|_| {
                 OpenOptions::new()
                     .create(true)
@@ -1434,18 +1461,12 @@ fn init_tracing(verbose: bool) {
         tracing::Level::INFO
     };
 
-    let log_path = flavite_api::doctor::diagnostics_log_dir().map(|dir| {
-        let _ = fs::create_dir_all(&dir);
-        dir.join("flavite.log")
-    });
     let prior_hook = std::panic::take_hook();
-    let hook_log_path = log_path.clone();
     std::panic::set_hook(Box::new(move |info| {
-        if let Some(path) = &hook_log_path
-            && let Some(parent) = path.parent()
-        {
+        let path = current_log_path();
+        if let Some(parent) = path.parent() {
             let crash_path = parent.join("crash-report.txt");
-            let tail = fs::read_to_string(path).unwrap_or_default();
+            let tail = fs::read_to_string(&path).unwrap_or_default();
             let last = tail
                 .lines()
                 .rev()
@@ -1460,16 +1481,9 @@ fn init_tracing(verbose: bool) {
         }
         prior_hook(info);
     }));
-    let writer = log_path.map_or_else(
-        || RotatingLogWriter {
-            path: std::env::temp_dir().join("flavite.log"),
-            max_bytes: 5 * 1024 * 1024,
-        },
-        |path| RotatingLogWriter {
-            path,
-            max_bytes: 5 * 1024 * 1024,
-        },
-    );
+    let writer = RotatingLogWriter {
+        max_bytes: 5 * 1024 * 1024,
+    };
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)

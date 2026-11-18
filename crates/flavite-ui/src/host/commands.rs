@@ -53,6 +53,12 @@ pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
     ("note.save", "Mod+S"),
 ];
 
+/// Commands that ship **without** a default chord (FEUX-0003 E-15): they
+/// are bindable through the Settings shortcut capture flow, but render as
+/// `unbound` until the user assigns one. `resolved_chord` returns `None`
+/// for these unless a validated override exists.
+pub const CHORDLESS_COMMANDS: &[&str] = &["workspace.apply_profile"];
+
 /// The pressed modifier state as the API's chord bit mask.
 #[must_use]
 pub fn modifier_bits(modifiers: &Modifiers) -> u8 {
@@ -489,12 +495,23 @@ pub fn ui_specs(overrides: &std::collections::BTreeMap<String, String>) -> Vec<C
 }
 
 /// The effective chord for a command id: the validated preference
-/// override when present, otherwise the catalog default.
+/// override when present, otherwise the catalog default. Chordless
+/// commands ([`CHORDLESS_COMMANDS`]) have no default: they resolve only
+/// when the user assigned a validated override (FEUX-0003 E-15).
 #[must_use]
 pub fn resolved_chord(
     id: &str,
     overrides: &std::collections::BTreeMap<String, String>,
 ) -> Option<Chord> {
+    if CHORDLESS_COMMANDS.contains(&id) {
+        let chord = overrides
+            .get(id)
+            .and_then(|text| flavite_settings::chord::parse_chord(text))?;
+        return Some(Chord {
+            modifiers: chord.modifiers,
+            key: chord.key,
+        });
+    }
     let default = DEFAULT_CHORDS
         .iter()
         .find(|(command, _)| *command == id)
@@ -695,6 +712,7 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
         && !app.palette_open
         && !app.picker.open
+        && app.profile_picker.is_none()
     {
         let tab = app.workspace.focused_tab();
         if app.note_search.finds.contains_key(&tab) {
@@ -715,7 +733,7 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
         };
     }
     // Overlay-local navigation first (§13.1: IME/plain typing precedence).
-    if app.palette_open || app.picker.open {
+    if app.palette_open || app.picker.open || app.profile_picker.is_some() {
         if modifiers.is_empty()
             && let keyboard::Key::Named(named) = &key
         {
@@ -736,8 +754,10 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
         {
             return Some(if app.palette_open {
                 Message::PaletteClose
-            } else {
+            } else if app.picker.open {
                 Message::PickerClose
+            } else {
+                Message::ProfilePickerClose
             });
         }
         return None;
@@ -967,6 +987,8 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
         keyboard::key::Named::Escape => {
             if app.palette_open {
                 Some(Message::PaletteClose)
+            } else if app.profile_picker.is_some() {
+                Some(Message::ProfilePickerClose)
             } else {
                 Some(Message::PickerClose)
             }
@@ -974,6 +996,8 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
         keyboard::key::Named::ArrowDown => {
             if app.palette_open {
                 Some(Message::PaletteNext)
+            } else if app.profile_picker.is_some() {
+                Some(Message::ProfilePickerNext)
             } else {
                 Some(Message::PickerNext)
             }
@@ -981,6 +1005,8 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
         keyboard::key::Named::ArrowUp => {
             if app.palette_open {
                 Some(Message::PalettePrevious)
+            } else if app.profile_picker.is_some() {
+                Some(Message::ProfilePickerPrevious)
             } else {
                 Some(Message::PickerPrevious)
             }
@@ -988,6 +1014,8 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
         keyboard::key::Named::Enter => {
             if app.palette_open {
                 Some(Message::PaletteSubmit)
+            } else if app.profile_picker.is_some() {
+                Some(Message::ProfilePickerSubmit)
             } else {
                 Some(Message::PickerSubmit)
             }
@@ -1009,6 +1037,17 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             app,
             super::editor_diagnostics::DiagnosticsMessage::Export,
         );
+    }
+    // FEUX-0003 E-15: `workspace.apply_profile` is a chordless command
+    // that opens the profile chooser overlay. It is handled before the
+    // availability gate so an empty store reports its own named reason
+    // (the palette row stays disabled via `available`).
+    if id == "workspace.apply_profile" {
+        if app.settings.profiles.is_empty() {
+            app.status = "No saved profiles".into();
+            return iced::Task::none();
+        }
+        return app.update(Message::ProfilePickerOpen);
     }
     if (id.starts_with("editor.")
         || matches!(
@@ -1428,20 +1467,6 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
         }
         "workspace.save_layout" => app.save_layout_now(),
         "workspace.reset_layout" => app.reset_layout(),
-        "workspace.apply_profile" => {
-            // FEUX-0003 X07: Open the Settings tab to the Profiles section
-            // If there are profiles, the user can apply from there
-            if let Some(group) = app.navigation_group() {
-                app.dispatch_layout(|revision| LayoutAction::OpenSettings {
-                    expected_revision: revision,
-                    group,
-                });
-            }
-            // List profiles to show in the Settings tab
-            if let Some(flavite) = app.flavite.as_ref() {
-                app.settings.list_profiles(flavite);
-            }
-        }
         other => app.status = format!("{other} is not a host command"),
     }
     iced::Task::none()

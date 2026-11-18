@@ -135,6 +135,18 @@ impl BindingId {
     pub fn is_menu_opener(&self) -> bool {
         matches!(self, BindingId::MenuOpener(_))
     }
+
+    /// Check if this binding also appears as a menu accelerator in the
+    /// default tables (which must be bare per Rule X §4).
+    #[must_use]
+    pub fn is_menu_accelerator(&self) -> bool {
+        match self {
+            BindingId::Command(command) => DEFAULT_MENUS
+                .iter()
+                .any(|(_, bid, _)| matches!(bid, BindingId::Command(menu_command) if menu_command == command)),
+            _ => false,
+        }
+    }
 }
 
 /// A binding token: physical position + optional shift, or the unbound sentinel.
@@ -341,11 +353,18 @@ impl ContextKeymap {
         let mut root = HashMap::new();
         let mut slots_of = HashMap::new();
 
-        // Add root bindings from DEFAULT_ROOT
+        // Add root bindings from DEFAULT_ROOT.
+        //
+        // Motions appear twice — once bare, once as a shifted grammar-
+        // equivalence twin (the delivered `motion_key` ignored Shift, so
+        // Shift+H must still resolve to the same motion with extend applied
+        // at capture). `entry().or_insert` keeps the FIRST occurrence: the
+        // bare slot, so advertised labels show the unshifted glyph for
+        // motions rather than a misleading `⇧h`.
         for (binding_id, slot) in DEFAULT_ROOT {
             let id_str = binding_id.id().to_string();
             root.insert(*slot, binding_id.clone());
-            slots_of.insert(id_str, *slot);
+            slots_of.entry(id_str).or_insert(*slot);
         }
 
         let mut menus = HashMap::new();
@@ -374,20 +393,20 @@ impl ContextKeymap {
     /// Returns `Err` with a list of all validation violations if the overrides
     /// contain unknown bindings, unreadable tokens, invalid positions, Rule X
     /// violations, or collisions.
+    #[allow(clippy::too_many_lines)]
     pub fn resolve(
         overrides: &std::collections::BTreeMap<String, String>,
     ) -> Result<Self, Vec<KeymapError>> {
         let mut errors = Vec::new();
         let mut composed_root: HashMap<Slot, BindingId> = HashMap::new();
         let mut composed_menus: HashMap<(ContextMenu, KeyCode), BindingId> = HashMap::new();
-        let mut composed_slots_of: HashMap<String, Slot> = HashMap::new();
 
         // Start with defaults
         let defaults = Self::defaults();
         for (slot, binding_id) in &defaults.root {
             composed_root.insert(*slot, binding_id.clone());
-            composed_slots_of.insert(binding_id.id().to_string(), *slot);
         }
+        let mut composed_slots_of = defaults.slots_of.clone();
         for ((menu, position), binding_id) in &defaults.menus {
             composed_menus.insert((*menu, *position), binding_id.clone());
         }
@@ -424,6 +443,10 @@ impl ContextKeymap {
                     }
                     if binding_id.is_menu_opener() && slot.shift {
                         errors.push(KeymapError::ShiftOnMenuOpener { id: id_str.clone() });
+                        continue;
+                    }
+                    if binding_id.is_menu_accelerator() && slot.shift {
+                        errors.push(KeymapError::ShiftOnMenuAccelerator { id: id_str.clone() });
                         continue;
                     }
 
@@ -681,6 +704,16 @@ pub const DEFAULT_ROOT: &[(BindingId, Slot)] = &[
     ),
     // Motions (14 entries: 7 bare + 7 shifted, matching grammar::motion_key exactly)
     // Note: grammar::motion_key ignores shift, so we include both variants for equivalence
+    //
+    // DELIBERATE DIVERGENCE from FEUX-0003 §5.2 (documented): the normative
+    // spec table lists motions as bare-only, but the delivered grammar's
+    // `motion_key` accepted Shift on motion positions (Shift+`h` still moved,
+    // with extend applied at capture). To keep the data default byte-identical
+    // to the delivered behavior, each motion keeps a shifted equivalence twin
+    // here. Rule X still REFUSES shifted tokens in the *user* override layer
+    // (resolve() → ShiftOnMotion) — these twins are internal defaults, never
+    // user-authored. Labels advertise the bare slot (see `defaults`), so a
+    // Dvorak user sees `h`, not `⇧h`.
     (
         BindingId::Motion(Motion::Previous),
         Slot::bare(KeyCode::KeyH),
@@ -1189,6 +1222,52 @@ mod tests {
             errors
                 .iter()
                 .any(|e| matches!(e, KeymapError::ShiftOnMotion { .. }))
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_shift_on_menu_accelerator() {
+        use std::collections::BTreeMap;
+
+        // `editor.select_word` is a Select-menu accelerator (bare only per
+        // Rule X §4); a shifted token must be refused.
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "editor.select_word".to_string(),
+            "shift+physical:KeyW".to_string(),
+        );
+
+        let result = ContextKeymap::resolve(&overrides);
+        assert!(
+            result.is_err(),
+            "Shift on a menu accelerator should be rejected"
+        );
+
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| { matches!(e, KeymapError::ShiftOnMenuAccelerator { .. }) }),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn motion_labels_are_bare_glyphs() {
+        use crate::labels::Layout;
+
+        let keymap = ContextKeymap::defaults();
+
+        // The shifted equivalence twins must not leak into labels: a motion
+        // advertises its bare slot even though Shift+position also resolves
+        // to it (grammar-equivalence twin).
+        assert_eq!(
+            keymap.binding_label(Layout::Qwerty, "editor.motion.previous"),
+            "h"
+        );
+        assert_eq!(
+            keymap.binding_label(Layout::Qwerty, "editor.motion.next_word"),
+            "w"
         );
     }
 

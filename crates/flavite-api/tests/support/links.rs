@@ -64,6 +64,9 @@ impl Fs for SharedFs {
     fn remove(&self, path: &Path) -> Result<()> {
         self.0.remove(path)
     }
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        self.0.remove_dir_all(path)
+    }
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
         self.0.rename_replace(from, to)
     }
@@ -223,7 +226,7 @@ impl Fixture {
         };
         let completion = self.flavite.wait_for_operation(request_id);
         let ExecutionResult::Local(LocalResult::Success(success)) = completion else {
-            panic!("open did not succeed");
+            panic!("open did not succeed: {completion:?}");
         };
         let buffer_id = success.data["buffer_id"].as_u64().expect("buffer id");
         let view = self

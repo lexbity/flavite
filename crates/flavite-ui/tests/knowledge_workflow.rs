@@ -423,12 +423,9 @@ fn w12_crash_child_seeds_and_parks() {
     assert!(edited.is_success(), "child edit admitted: {edited:?}");
 
     // The recovery worker checkpoints within ~100ms of the edit; wait for
-    // the durable file under the identity-keyed recovery store.
-    let uuid = flavite.vault_ref().uuid.to_string();
-    let data = std::env::var_os("FLAVITE_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .expect("child data dir");
-    let recovery_dir = data.join("flavite/vaults").join(&uuid).join("recovery");
+    // the durable file under the vault-local recovery store
+    // (`<root>/.flavite/recovery/`).
+    let recovery_dir = root.join(".flavite").join("recovery");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let has_snapshot = std::fs::read_dir(&recovery_dir)

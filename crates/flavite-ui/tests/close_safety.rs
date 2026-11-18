@@ -16,7 +16,6 @@ use flavite_vault::actor::VaultActorBuilder;
 use flavite_vault::channels::ChannelSet;
 use flavite_vault::session::Session;
 use flavite_workspace::{LayoutAction, NoteLocator, TabDropTarget, TabId};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -40,6 +39,10 @@ struct Fixture {
     data: tempfile::TempDir,
     #[allow(dead_code)]
     cache: tempfile::TempDir,
+    /// Keeps the real vault root alive (`.flavite/` recovery/hints are
+    /// OS-addressable).
+    #[allow(dead_code)]
+    root_dir: tempfile::TempDir,
     /// Held for the whole fixture lifetime: guards the process-global
     /// explicit data-dir redirection.
     _guard: MutexGuard<'static, ()>,
@@ -58,7 +61,8 @@ fn fixture() -> Fixture {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let data = tempfile::tempdir().expect("data tempdir");
     let fs = Arc::new(MemFs::new());
-    let root = PathBuf::from("/test/close-safety");
+    let root_dir = tempfile::tempdir().expect("vault root");
+    let root = root_dir.path().to_path_buf();
     fs.create_dir_all(&root).expect("vault root");
     fs.write_new(&root.join("alpha.md"), ALPHA_ORIGINAL)
         .expect("alpha");
@@ -99,6 +103,7 @@ fn fixture() -> Fixture {
         fs,
         data,
         cache,
+        root_dir,
         _guard: guard,
     }
 }

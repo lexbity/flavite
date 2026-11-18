@@ -77,7 +77,10 @@ fn draft_preview_all(flavite: &Flavite) -> (String, u64) {
 fn draft_preview_and_apply_flow_through_the_facade_without_saving() {
     let fixture = support::fixture(&[("notes/a.md", "alpha one\n"), ("notes/b.md", "alpha two\n")]);
     let flavite = &fixture.flavite;
-    let (buffer_id, rev0) = open_note(flavite, "/test/semantic-links/notes/a.md");
+    let (buffer_id, rev0) = open_note(
+        flavite,
+        &fixture.root.join("notes/a.md").display().to_string(),
+    );
     let rev1 = dirty_note(flavite, buffer_id, rev0, " more");
 
     let (preview_id, revision) = draft_preview_all(flavite);
@@ -146,7 +149,10 @@ fn draft_preview_and_apply_flow_through_the_facade_without_saving() {
 fn draft_stale_guard_is_reportable_over_the_facade() {
     let fixture = support::fixture(&[("notes/a.md", "alpha one\n")]);
     let flavite = &fixture.flavite;
-    let (buffer_id, rev0) = open_note(flavite, "/test/semantic-links/notes/a.md");
+    let (buffer_id, rev0) = open_note(
+        flavite,
+        &fixture.root.join("notes/a.md").display().to_string(),
+    );
     let rev1 = dirty_note(flavite, buffer_id, rev0, " more");
     let (preview_id, revision) = draft_preview_all(flavite);
     // The user edits after the preview was sealed.

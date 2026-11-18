@@ -231,6 +231,7 @@ fn handle_inner(
         || !reading::is_edit(app, tab)
         || app.picker.open
         || app.palette_open
+        || app.profile_picker.is_some()
         || app.strip_menu.is_some()
         || app.dialog.is_some()
         || app.shutdown.is_some()

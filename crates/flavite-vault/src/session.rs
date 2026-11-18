@@ -1575,18 +1575,20 @@ impl Session {
         let (buffer_signal, buffer_watch) = BufferSignal::new();
         buffer_manager.set_graph_stamp_notifier(buffer_signal.notifier());
         let manager = Arc::new(Mutex::new(buffer_manager));
-        let recovery_writer = crate::identity::resolve_data_dir(data_dir.as_deref()).map(|data| {
-            let dir = data
-                .join("flavite")
-                .join("vaults")
-                .join(identity.uuid.to_string())
-                .join("recovery");
-            Arc::new(Mutex::new(RecoveryWriter::new(RecoveryConfig::new(
-                identity.uuid.to_string(),
-                dir,
-                manager.lock_recovering().recovery_interval(),
+        let recovery_writer = {
+            let dir = crate::identity::vault_private_backing_dir(
+                &identity.root,
+                identity.uuid,
+                "recovery",
+            );
+            Some(Arc::new(Mutex::new(RecoveryWriter::new(
+                RecoveryConfig::new(
+                    identity.uuid.to_string(),
+                    dir,
+                    manager.lock_recovering().recovery_interval(),
+                ),
             ))))
-        });
+        };
         let recovery_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let recovery_worker = recovery_writer.as_ref().map(|writer| {
             let manager = manager.clone();
@@ -1655,19 +1657,20 @@ impl Session {
         let (open_job_sender, open_job_receiver) = crossbeam::channel::unbounded::<OpenJob>();
         let (open_result_sender, open_result_receiver) =
             crossbeam::channel::unbounded::<OpenRead>();
-        // RFC-0006 §6.10: device-local encoding hints. The store lives under
-        // the resolved OS data root, bound to this vault's identity; a store
-        // or record failure is a typed pending state surfaced through the
-        // returned issue string, never a silent reset of confirmed choices.
+        // RFC-0006 §6.10: vault-local encoding hints. The store lives under
+        // `.flavite/userstate/` (OS-temp backing for virtual test vaults),
+        // bound to this vault; a store or record failure is a typed pending
+        // state surfaced through the returned issue string, never a silent
+        // reset of confirmed choices.
         let encoding_hints = {
-            let store = crate::identity::resolve_data_dir(data_dir.as_deref()).and_then(|data| {
-                crate::user_state::UserStateStore::open_at(
-                    Box::new(flavite_fs::OsFs::new()),
-                    &data,
-                    &identity.uuid.to_string(),
-                )
-                .ok()
-            });
+            let store = Some(crate::user_state::UserStateStore::at_root(
+                Box::new(flavite_fs::OsFs::new()),
+                crate::identity::vault_private_backing_dir(
+                    &identity.root,
+                    identity.uuid,
+                    "userstate",
+                ),
+            ));
             let (state, issue) = EncodingHintsState::open(store, identity.uuid.to_string());
             if let Some(issue) = issue {
                 tracing::warn!(vault = %identity.uuid, %issue, "encoding hints unavailable");
@@ -1950,22 +1953,15 @@ impl Session {
                                 } => {
                                     let job_hex = hex::encode(job_id.to_be_bytes());
                                     let io = crate::replace::ActorOpStoreIo::new(ctx.actor.clone());
-                                    let data_dir =
-                                        crate::identity::resolve_data_dir(ctx.data_dir.as_deref());
                                     let run = || -> Result<
                                         (crate::replace::JobPhase, crate::replace::JobTotals),
                                         String,
                                     > {
-                                        let data_dir = data_dir.ok_or_else(|| {
-                                            "private data directory is unavailable".to_owned()
-                                        })?;
                                         let mut log = crate::replace::JobLog::open(
                                             Box::new(io.clone()),
                                             &store,
                                             &job_hex,
                                             key,
-                                            &data_dir,
-                                            &ctx.vault_uuid,
                                         )
                                         .map_err(|error| error.to_string())?;
                                         // Release the state mutex for the
@@ -2808,10 +2804,12 @@ impl Session {
             .recovery_key
             .as_deref()
             .ok_or("journal buffer item has no recovery key")?;
-        let writer = self
-            .recovery_writer
-            .as_ref()
-            .ok_or("recovery writer is unavailable for journal buffer patch")?;
+        let Some(writer) = self.recovery_writer.as_ref() else {
+            // No OS-addressable recovery dir (virtual/unwritable vault):
+            // the buffer patch still proceeds; the durable base snapshot is
+            // best-effort in that environment.
+            return Ok(());
+        };
         writer
             .lock()
             .map_err(|_| "recovery writer lock poisoned")?
@@ -4590,14 +4588,11 @@ impl Session {
         Arc::clone(&self.leases)
     }
 
-    /// Load (or create) the device/vault operation key (RFC-0006 §6.9).
-    /// The key store lives outside the vault; inability to protect it
-    /// refuses applicable replacement operations.
+    /// Load (or create) the vault operation key (RFC-0006 §6.9). The key
+    /// store lives inside the vault (`.flavite/operations/key.bin`);
+    /// inability to protect it refuses applicable replacement operations.
     pub fn operation_key(&self) -> Result<crate::replace::OperationKey, String> {
-        let data_dir = self
-            .resolved_data_dir()
-            .ok_or_else(|| "private data directory is unavailable".to_owned())?;
-        crate::operation_key::load_or_create_key(&data_dir, &self.identity.uuid)
+        crate::operation_key::load_or_create_key_at_vault(&self.identity.root, &self.identity.uuid)
             .map_err(|error| error.to_string())
     }
 
@@ -4609,9 +4604,6 @@ impl Session {
         let store = crate::replace::ReplaceStore::new(&self.identity.root);
         let io = crate::replace::ActorOpStoreIo::new(self.actor.clone());
         let Ok(Some(dirs)) = io.list_dir(store.base()) else {
-            return;
-        };
-        let Some(data_dir) = self.resolved_data_dir() else {
             return;
         };
         let Ok(key) = self.operation_key() else {
@@ -4641,14 +4633,9 @@ impl Session {
             let Ok(Some(manifest)) = store.read_manifest(&io, &dir) else {
                 continue;
             };
-            let Ok(log) = crate::replace::JobLog::open(
-                Box::new(io.clone()),
-                &store,
-                &dir,
-                key.clone(),
-                &data_dir,
-                &self.identity.uuid,
-            ) else {
+            let Ok(log) =
+                crate::replace::JobLog::open(Box::new(io.clone()), &store, &dir, key.clone())
+            else {
                 // Corrupt/unknown logs quarantine the operation: leave it
                 // out of the resumable set (inspection-only via doctor).
                 continue;
@@ -9448,10 +9435,14 @@ mod tests {
             other => panic!("expected inbound buffer to open: {other:?}"),
         };
 
-        assert!(matches!(
-            rename_to_terminal(&session, from, to),
-            SessionResult::Success(CommandResult::NoteRenamed { .. })
-        ));
+        let rename_result = rename_to_terminal(&session, from, to);
+        assert!(
+            matches!(
+                rename_result.clone(),
+                SessionResult::Success(CommandResult::NoteRenamed { .. })
+            ),
+            "rename failed: {rename_result:?}"
+        );
         let current = session.buffer_manager.lock().unwrap();
         let buffer = current.get_buffer_by_id(buffer_id).unwrap();
         assert_eq!(buffer.text(), "See [[renamed]] / [[renamed]] / [[other]]");

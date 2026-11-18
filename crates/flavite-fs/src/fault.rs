@@ -775,6 +775,19 @@ impl<F: Fs> Fs for FaultFs<F> {
         result
     }
 
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        self.check_alive()?;
+        let occ = self.bump_count("remove_dir_all");
+        self.inject_before("remove_dir_all", occ)?;
+        let result = self.inner.remove_dir_all(path);
+        match &result {
+            Ok(_) => self.trace_ok("remove_dir_all", occ, FaultBoundary::After),
+            Err(e) => self.trace_err("remove_dir_all", occ, FaultBoundary::After, e),
+        }
+        self.inject_after("remove_dir_all", occ)?;
+        result
+    }
+
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
         self.check_alive()?;
         let occ = self.bump_count("rename_replace");

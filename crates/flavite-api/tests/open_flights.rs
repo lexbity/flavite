@@ -103,6 +103,9 @@ impl Fs for SlowFs {
     fn remove(&self, path: &Path) -> Result<()> {
         self.inner.remove(path)
     }
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        self.inner.remove_dir_all(path)
+    }
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
         self.inner.rename_replace(from, to)
     }
@@ -186,6 +189,9 @@ fn fixture() -> (Fixture, std::sync::Arc<SlowFs>) {
         }
         fn remove(&self, p: &Path) -> Result<()> {
             self.0.remove(p)
+        }
+        fn remove_dir_all(&self, p: &Path) -> Result<()> {
+            self.0.remove_dir_all(p)
         }
         fn rename_replace(&self, f: &Path, t: &Path) -> Result<()> {
             self.0.rename_replace(f, t)

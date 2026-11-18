@@ -22,6 +22,8 @@ use iced::{Element, Length, Padding, alignment};
 pub const PALETTE_INPUT_ID: &str = "palette-query-input";
 /// Widget id of the note picker query input.
 pub const PICKER_INPUT_ID: &str = "picker-query-input";
+/// Widget id of the profile chooser query input (FEUX-0003 E-15).
+pub const PROFILE_PICKER_INPUT_ID: &str = "profile-picker-query-input";
 
 /// Draw the full shell: chrome, workspace region, status bar, overlays.
 #[must_use]
@@ -35,6 +37,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     if app.context_mode.history.open
         && !app.picker.open
         && !app.palette_open
+        && app.profile_picker.is_none()
         && app.dialog.is_none()
         && app.strip_menu.is_none()
     {
@@ -42,6 +45,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     if !app.picker.open
         && !app.palette_open
+        && app.profile_picker.is_none()
         && app.dialog.is_none()
         && app.strip_menu.is_none()
         && app
@@ -52,10 +56,16 @@ pub fn view(app: &App) -> Element<'_, Message> {
     {
         return crate::views::context_toolbar::overlay(app, shell);
     }
-    if app.strip_menu.is_some() && !app.picker.open && !app.palette_open {
+    if app.strip_menu.is_some()
+        && !app.picker.open
+        && !app.palette_open
+        && app.profile_picker.is_none()
+    {
         return menu_overlay(app, shell);
     }
-    let overlay = if app.picker.open {
+    let overlay = if app.profile_picker.is_some() {
+        Some(profile_picker_card(app))
+    } else if app.picker.open {
         Some(picker_card(app))
     } else if app.palette_open {
         Some(palette_card(app))
@@ -73,6 +83,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
             Message::PaletteClose
         } else if app.picker.open {
             Message::PickerClose
+        } else if app.profile_picker.is_some() {
+            Message::ProfilePickerClose
         } else {
             Message::DialogCancel
         });
@@ -887,6 +899,74 @@ fn picker_card(app: &App) -> Element<'_, Message> {
             row![
                 Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
                 text("Enter opens · Ctrl+Enter inserts a link at the caret · Esc dismisses")
+                    .size(metrics.text_sm)
+                    .style(style::dim_text),
+            ],
+        ]
+        .spacing(metrics.spacing_sm)
+        .width(Length::Fill),
+    )
+    .width(Length::Fixed(metrics.palette_width))
+    .padding(metrics.spacing)
+    .style(style::palette_card)
+    .into()
+}
+
+/// The floating profile chooser card (FEUX-0003 E-15): lists saved
+/// profiles by name; Enter applies the selected row.
+fn profile_picker_card(app: &App) -> Element<'_, Message> {
+    let metrics = app.appearance.metrics();
+    let matches = app.profile_picker_matches();
+    let selected = app
+        .profile_picker
+        .as_ref()
+        .map_or(0, |s| s.selected.min(matches.len().saturating_sub(1)));
+    let mut rows = column![].spacing(2);
+    for (index, (id, name)) in matches.iter().enumerate().take(50) {
+        let is_selected = index == selected;
+        rows = rows.push(
+            button(
+                row![
+                    text(name.clone()).width(Length::Fill),
+                    text(id.clone())
+                        .size(metrics.text_sm)
+                        .style(style::dim_text),
+                ]
+                .spacing(metrics.spacing),
+            )
+            .width(Length::Fill)
+            .padding(Padding {
+                top: 8.0,
+                bottom: 8.0,
+                left: 10.0,
+                right: 10.0,
+            })
+            .style(style::list_row(is_selected))
+            .on_press(Message::ProfilePickerPick(index)),
+        );
+    }
+    let body: Element<'_, Message> = if matches.is_empty() {
+        text("No matching profiles").style(style::dim_text).into()
+    } else {
+        scrollable(rows).width(Length::Fill).into()
+    };
+    container(
+        column![
+            text_input(
+                "Apply profile…",
+                app.profile_picker
+                    .as_ref()
+                    .map_or("", |state| state.query.as_str()),
+            )
+            .id(PROFILE_PICKER_INPUT_ID)
+            .on_input(Message::ProfilePickerQuery)
+            .size(metrics.text_lg)
+            .padding(8),
+            rule::horizontal(1),
+            container(body).max_height(360).width(Length::Fill),
+            row![
+                Space::new().width(Length::Fill).height(Length::Fixed(0.0)),
+                text("Enter applies · Esc dismisses")
                     .size(metrics.text_sm)
                     .style(style::dim_text),
             ],

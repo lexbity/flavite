@@ -224,6 +224,12 @@ pub enum VaultActorMsg {
         path: PathBuf,
         reply: Sender<VaultActorResp>,
     },
+    /// Private operation-store recursive directory-tree removal (job
+    /// scratch cleanup; fails when absent or not a directory).
+    OpStoreRemoveDirAll {
+        path: PathBuf,
+        reply: Sender<VaultActorResp>,
+    },
     /// Atomically replace a private operation-store file (head updates).
     OpStoreWriteReplace {
         path: PathBuf,
@@ -768,6 +774,16 @@ impl VaultActorHandle {
         let (reply, response) = crossbeam::channel::bounded(1);
         self.sender
             .send(VaultActorMsg::OpStoreRemove { path, reply })
+            .map_err(|error| error.to_string())?;
+        self.op_store_reply(response)
+    }
+
+    /// Private operation-store recursive directory-tree removal (idempotent
+    /// for absent trees).
+    pub fn op_store_remove_dir_all(&self, path: PathBuf) -> Result<(), String> {
+        let (reply, response) = crossbeam::channel::bounded(1);
+        self.sender
+            .send(VaultActorMsg::OpStoreRemoveDirAll { path, reply })
             .map_err(|error| error.to_string())?;
         self.op_store_reply(response)
     }
@@ -1730,6 +1746,17 @@ impl VaultActor {
                 })();
                 let _ = reply.try_send(VaultActorResp::OpStoreAck(result));
             }
+            VaultActorMsg::OpStoreRemoveDirAll { path, reply } => {
+                let result = (|| {
+                    self.validate_ops_path(&path)?;
+                    match self.fs.remove_dir_all(&path) {
+                        Ok(()) => Ok(()),
+                        Err(flavite_fs::FsError::NotFound(_)) => Ok(()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                })();
+                let _ = reply.try_send(VaultActorResp::OpStoreAck(result));
+            }
             VaultActorMsg::OpStoreWriteReplace { path, bytes, reply } => {
                 let result = (|| {
                     self.validate_ops_path(&path)?;
@@ -2091,13 +2118,7 @@ impl VaultActor {
         let failure_context = request.clone();
         let result: Result<SaveReceipt, SaveFailure> = (|| {
             if self.history.is_none() {
-                let data = crate::identity::resolve_data_dir(self.data_dir.as_deref())
-                    .ok_or_else(|| SaveFailure::from_message("OS data directory is unavailable"))?;
-                let root = data
-                    .join("flavite")
-                    .join("vaults")
-                    .join(self.identity.uuid.to_string())
-                    .join("history");
+                let root = self.identity.root.join(".flavite").join("history");
                 self.history =
                     Some(HistoryStore::open(self.fs.clone(), root).map_err(SaveFailure::from)?);
             }
@@ -2349,13 +2370,7 @@ impl VaultActor {
 
     fn history_store(&mut self) -> Result<&mut HistoryStore, String> {
         if self.history.is_none() {
-            let data = crate::identity::resolve_data_dir(self.data_dir.as_deref())
-                .ok_or_else(|| "OS data directory is unavailable".to_owned())?;
-            let root = data
-                .join("flavite")
-                .join("vaults")
-                .join(self.identity.uuid.to_string())
-                .join("history");
+            let root = self.identity.root.join(".flavite").join("history");
             self.history =
                 Some(HistoryStore::open(self.fs.clone(), root).map_err(|error| error.to_string())?);
         }

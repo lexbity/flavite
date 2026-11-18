@@ -1,7 +1,8 @@
 //! Profiles store tests (FEUX-0003 X06).
 
 use flavite_api::profiles::{
-    MAX_NAME_BYTES, MAX_PROFILE_BYTES, MAX_PROFILES, ProfileId, ProfilesStore, ProfilesStoreError,
+    MAX_NAME_BYTES, MAX_PROFILE_BYTES, MAX_PROFILES, MAX_SANITIZED_ID_BYTES, ProfileId,
+    ProfilesStore, ProfilesStoreError,
 };
 use flavite_fs::OsFs;
 use std::fs as std_fs;
@@ -91,8 +92,64 @@ fn store_create_and_list() {
     // List should contain the profile
     let profiles = store.list().unwrap();
     assert_eq!(profiles.len(), 1);
-    // The name in the profile is the sanitized id, not the original name
-    assert!(profiles[0].id.name.contains("test"));
+    // Flat-file layout: one <id>.toml in the root; the display name is
+    // the sanitized stem (digest suffix stripped).
+    assert_eq!(profiles[0].id.name, "test-profile");
+    assert_eq!(profiles[0].id.id, _profile.id.id);
+    let file = store.root().join(format!("{}.toml", _profile.id.id));
+    assert!(file.exists());
+    assert!(
+        !store
+            .root()
+            .join(_profile.id.id.clone())
+            .join("profile.toml")
+            .exists()
+    );
+}
+
+#[test]
+fn store_rejects_unparseable_and_schema_newer() {
+    let temp_dir = tempdir().unwrap();
+    let fs = Box::new(OsFs);
+    let store = ProfilesStore::at_root(fs, temp_dir.path().to_path_buf());
+
+    let result = store.create("bad toml", b"not = [valid toml");
+    assert!(matches!(result, Err(ProfilesStoreError::Unparseable(_))));
+    assert!(store.list().unwrap().is_empty());
+
+    let result = store.create("schema 3", b"schema = 3\n[appearance]");
+    assert!(matches!(result, Err(ProfilesStoreError::SchemaNewer)));
+    assert!(store.list().unwrap().is_empty());
+}
+
+#[test]
+fn store_rejects_symlink_profile_path() {
+    let temp_dir = tempdir().unwrap();
+    let fs = Box::new(OsFs);
+    let store = ProfilesStore::at_root(fs, temp_dir.path().to_path_buf());
+
+    let profile = store.create("link target", b"schema = 2").unwrap();
+    let id = profile.id.id.clone();
+    let file = store.root().join(format!("{id}.toml"));
+    std_fs::remove_file(&file).unwrap();
+    let outside = temp_dir.path().join("outside.toml");
+    std_fs::write(&outside, b"schema = 2").unwrap();
+    std::os::unix::fs::symlink(&outside, &file).unwrap();
+
+    let result = store.delete(&id);
+    assert!(matches!(result, Err(ProfilesStoreError::Protected { .. })));
+    assert!(outside.exists(), "symlink target untouched");
+}
+
+#[test]
+fn sanitize_name_caps_at_40_bytes() {
+    // 45 alphanumerics: under the 64-byte display-name bound, but the
+    // sanitized stem exceeds the 40-byte cap.
+    let long = "a".repeat(45);
+    let id = ProfileId::from_name(&long).unwrap();
+    let stem = id.id.rsplit_once('-').unwrap().0;
+    assert!(stem.len() <= MAX_SANITIZED_ID_BYTES);
+    assert_eq!(stem.len(), MAX_SANITIZED_ID_BYTES);
 }
 
 #[test]
@@ -124,8 +181,10 @@ fn store_accepts_max_sized_profile() {
     let fs = Box::new(OsFs);
     let store = ProfilesStore::at_root(fs, temp_dir.path().to_path_buf());
 
-    let max_bytes = vec![0u8; MAX_PROFILE_BYTES];
-    let result = store.create("max sized", &max_bytes);
+    // A valid TOML document padded to exactly the bound.
+    let max_toml = format!("schema = 2\n# {}", "x".repeat(MAX_PROFILE_BYTES - 13));
+    assert_eq!(max_toml.len(), MAX_PROFILE_BYTES);
+    let result = store.create("max sized", max_toml.as_bytes());
     assert!(result.is_ok());
 }
 
@@ -252,6 +311,30 @@ fn store_import_rejects_oversized() {
 
     let result = store.import_path(&import_path);
     assert!(matches!(result, Err(ProfilesStoreError::TooLarge { .. })));
+}
+
+#[test]
+fn store_import_rejects_unparseable_and_schema_newer() {
+    let temp_dir = tempdir().unwrap();
+    let fs = Box::new(OsFs);
+    let store = ProfilesStore::at_root(fs, temp_dir.path().join("profiles"));
+
+    // Host files live outside the store root so they never appear as
+    // profiles in `list`.
+    let host = temp_dir.path().join("host");
+    std_fs::create_dir_all(&host).unwrap();
+
+    let bad_path = host.join("bad.toml");
+    std_fs::write(&bad_path, b"not [ valid").unwrap();
+    let result = store.import_path(&bad_path);
+    assert!(matches!(result, Err(ProfilesStoreError::Unparseable(_))));
+    assert!(store.list().unwrap().is_empty());
+
+    let newer_path = host.join("newer.toml");
+    std_fs::write(&newer_path, b"schema = 3\n[appearance]").unwrap();
+    let result = store.import_path(&newer_path);
+    assert!(matches!(result, Err(ProfilesStoreError::SchemaNewer)));
+    assert!(store.list().unwrap().is_empty());
 }
 
 #[test]

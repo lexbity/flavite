@@ -96,6 +96,10 @@ impl Fs for FaultyFs {
         self.maybe_fail("remove")?;
         self.inner.remove(path)
     }
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        self.maybe_fail("remove_dir_all")?;
+        self.inner.remove_dir_all(path)
+    }
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
         self.maybe_fail("rename_replace")?;
         self.inner.rename_replace(from, to)
@@ -187,6 +191,9 @@ impl Fs for SharedFs {
     }
     fn remove(&self, path: &Path) -> Result<()> {
         self.0.remove(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        self.0.remove_dir_all(path)
     }
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
         self.0.rename_replace(from, to)
@@ -422,6 +429,9 @@ fn protected_paths_are_refused_and_notes_never_touched() {
         }
         fn remove(&self, path: &Path) -> Result<()> {
             self.0.remove(path)
+        }
+        fn remove_dir_all(&self, path: &Path) -> Result<()> {
+            self.0.remove_dir_all(path)
         }
         fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
             self.0.rename_replace(from, to)

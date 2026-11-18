@@ -176,6 +176,6 @@ fn cancel_stops_an_applying_job() {
 
 impl PageFixture {
     fn fs_join(&self, relative: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from("/test/semantic-links").join(relative)
+        self.app.root().join(relative)
     }
 }
