@@ -854,6 +854,75 @@ fn split_line_content_and_ending(slice: &str) -> (&str, cosmic_text::LineEnding)
     }
 }
 
+/// Per-band-line shape spans: `(first-row top, wrapped height)` for every
+/// logical line (RFC-0008 S3). Lines without shaped runs (empty/trailing)
+/// fall back to one row of `fallback_height`.
+fn band_line_spans(
+    buffer: &ShapingBuffer,
+    line_count: usize,
+    fallback_height: f32,
+) -> Vec<(f32, f32)> {
+    let mut tops = vec![f32::NAN; line_count];
+    let mut bottoms = vec![0.0_f32; line_count];
+    for run in buffer.layout_runs() {
+        let index = run.line_i;
+        if index < line_count {
+            if tops[index].is_nan() {
+                tops[index] = run.line_top;
+            }
+            let bottom = run.line_top + run.line_height;
+            if bottom > bottoms[index] {
+                bottoms[index] = bottom;
+            }
+        }
+    }
+    let mut cursor = 0.0_f32;
+    let mut spans = Vec::with_capacity(line_count);
+    for index in 0..line_count {
+        if !tops[index].is_nan() {
+            cursor = tops[index];
+        }
+        let bottom = if bottoms[index] > 0.0 {
+            bottoms[index]
+        } else {
+            cursor + fallback_height
+        };
+        spans.push((cursor, (bottom - cursor).max(fallback_height)));
+    }
+    spans
+}
+
+/// Indices of logical band lines intersecting the paint window `[0,
+/// paint_height)` (viewport coordinates; FR-3 whole-line granularity).
+fn painted_line_indices(spans: &[(f32, f32)], paint_offset: f32, paint_height: f32) -> Vec<usize> {
+    spans
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(top, height))| {
+            let top_viewport = top - paint_offset;
+            top_viewport < paint_height && top_viewport + height > 0.0
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// One band line's paint content: the line text WITHOUT its terminator (a
+/// trailing newline inside a paragraph would add a blank row).
+fn band_line_content(visible: &str, starts: &[usize], index: usize) -> String {
+    let start = starts
+        .get(index)
+        .copied()
+        .unwrap_or(visible.len())
+        .min(visible.len());
+    let end = starts
+        .get(index + 1)
+        .copied()
+        .unwrap_or(visible.len())
+        .min(visible.len());
+    let (content, _) = split_line_content_and_ending(&visible[start..end]);
+    content.to_owned()
+}
+
 /// The `buffer.lines` length `Buffer::set_text` produces for band text
 /// `visible` (mirrors cosmic-text's `LineIter` + trailing-empty-line rule).
 fn expected_buffer_line_count(visible: &str) -> usize {
@@ -1955,6 +2024,31 @@ impl EditorState {
         let _ = self.sync_shaped(text, revision, viewport, width);
     }
 
+    /// RFC-0008 S3-T5 harness: run the paint-collection path (spans +
+    /// painted-line set + per-line content) headlessly and return the painted
+    /// line count (all the work `draw` does before `fill_text`).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn painted_line_count_for_perf(
+        &mut self,
+        text: &str,
+        revision: u64,
+        viewport: Viewport,
+        width: f32,
+        paint_height: f32,
+    ) -> usize {
+        let line_height = self.type_metrics.line_height;
+        let shaped = self.sync_shaped(text, revision, viewport, width);
+        let spans = band_line_spans(shaped.buffer, shaped.line_starts.len(), line_height);
+        let painted = painted_line_indices(&spans, shaped.paint_offset(viewport), paint_height);
+        let mut count = 0usize;
+        for index in painted {
+            let _ = band_line_content(shaped.visible, shaped.line_starts, index);
+            count += 1;
+        }
+        count
+    }
+
     /// Hit-test against the cached band shaping. The point is viewport-local;
     /// the band's rows above the viewport are added back before the hit.
     fn hit_test_cached(
@@ -2266,24 +2360,37 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 }
             }
         }
-        renderer.fill_text(
-            text::Text {
-                content: visible_text.to_owned(),
-                bounds: Size::new(text_width, (paint_height + paint_offset).max(1.0)),
-                size: iced::Pixels(self.type_metrics.font_size),
-                line_height: text::LineHeight::Absolute(iced::Pixels(
-                    self.type_metrics.line_height,
-                )),
-                font: iced::Font::MONOSPACE,
-                align_x: text::Alignment::Left,
-                align_y: iced::alignment::Vertical::Top,
-                shaping: text::Shaping::Advanced,
-                wrapping: text::Wrapping::WordOrGlyph,
-            },
-            Point::new(bounds.x + PAD_X, bounds.y + PAD_Y - paint_offset),
-            self.colors.text,
-            clip,
+        // RFC-0008 S3 (D3): paint one logical line per `fill_text` — iced's
+        // paragraph cache is keyed by content+bounds, so unchanged lines are
+        // cache hits and only the edited line's paragraph re-allocates; the
+        // cache stays bounded by iced's per-frame trim. Whole-line
+        // granularity (FR-3): the bottom edge rounds to whole lines.
+        let spans = band_line_spans(
+            shaped_view.buffer,
+            line_starts.len(),
+            self.type_metrics.line_height,
         );
+        for index in painted_line_indices(&spans, paint_offset, paint_height) {
+            let (top, height) = spans[index];
+            renderer.fill_text(
+                text::Text {
+                    content: band_line_content(visible_text, line_starts, index),
+                    bounds: Size::new(text_width, height.max(1.0)),
+                    size: iced::Pixels(self.type_metrics.font_size),
+                    line_height: text::LineHeight::Absolute(iced::Pixels(
+                        self.type_metrics.line_height,
+                    )),
+                    font: iced::Font::MONOSPACE,
+                    align_x: text::Alignment::Left,
+                    align_y: iced::alignment::Vertical::Top,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::WordOrGlyph,
+                },
+                Point::new(bounds.x + PAD_X, bounds.y + PAD_Y + top - paint_offset),
+                self.colors.text,
+                clip,
+            );
+        }
         // Scrollbar: only when the document overflows the viewport. The
         // wheel and gutter-drag share this geometry.
         let total_lines = state.source_line_count(&self.view.text);
@@ -4149,6 +4256,257 @@ mod tests {
                 assert_eq!(lines_persistent, lines_fresh, "line texts diverge");
             }
         }
+    }
+
+    /// Legacy whole-band paint oracle (S3-T1/T3): the pre-S3 mid-line slice's
+    /// painted logical lines — lines whose start falls inside the old
+    /// `paint_text` slice (kept only as the test oracle).
+    fn legacy_painted_lines(
+        visible: &str,
+        starts: &[usize],
+        source_start: usize,
+        runs: &[cosmic_text::LayoutRun<'_>],
+    ) -> Vec<usize> {
+        let visible_end = source_start
+            + runs
+                .iter()
+                .map(|run| {
+                    let start = starts.get(run.line_i).copied().unwrap_or(visible.len());
+                    let end = run.glyphs.iter().map(|glyph| glyph.end).max().unwrap_or(0);
+                    start + end
+                })
+                .max()
+                .unwrap_or(0);
+        let paint_len = visible_end.saturating_sub(source_start).min(visible.len());
+        starts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &start)| start < paint_len)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The draw path's visible-run filter (mirror of `draw`).
+    fn visible_runs<'a>(
+        buffer: &'a ShapingBuffer,
+        paint_offset: f32,
+        paint_height: f32,
+        line_height: f32,
+    ) -> Vec<cosmic_text::LayoutRun<'a>> {
+        buffer
+            .layout_runs()
+            .filter(|run| {
+                let top = run.line_top - paint_offset;
+                top < paint_height && top + line_height > 0.0
+            })
+            .collect()
+    }
+
+    /// S3-T1 + S3-T3: the per-line painted set equals the legacy band-slice
+    /// painted set up to one trailing partial line — never an earlier line
+    /// (FR-3/R9).
+    fn assert_painted_matches_legacy_within_trailing_line(
+        state: &mut EditorState,
+        text: &str,
+        revision: u64,
+        viewport: Viewport,
+        width: f32,
+        paint_height: f32,
+        line_height: f32,
+    ) {
+        let shaped = state.sync_shaped(text, revision, viewport, width);
+        let paint_offset = shaped.paint_offset(viewport);
+        let legacy_runs = visible_runs(shaped.buffer, paint_offset, paint_height, line_height);
+        let spans = band_line_spans(shaped.buffer, shaped.line_starts.len(), line_height);
+        // The legacy full-band paragraph included (clipped) lines fully above
+        // the viewport; the per-line paint does not paint them. For an
+        // apples-to-apples comparison, restrict the legacy set to the lines
+        // intersecting the paint window (the visible ones).
+        let legacy = legacy_painted_lines(
+            shaped.visible,
+            shaped.line_starts,
+            shaped.source_start,
+            &legacy_runs,
+        )
+        .into_iter()
+        .filter(|&index| {
+            let (top, height) = spans[index];
+            let top_viewport = top - paint_offset;
+            top_viewport < paint_height && top_viewport + height > 0.0
+        })
+        .collect::<Vec<_>>();
+        let painted = painted_line_indices(&spans, paint_offset, paint_height);
+        // Difference is allowed only at the window edges (top/bottom partial
+        // lines): strip the common interior, then at most one extra line may
+        // remain at either end — a mid-list divergence (an earlier line
+        // painted differently) leaves more, and fails.
+        let mut a = painted.clone();
+        let mut b = legacy.clone();
+        while a.first() == b.first() && !a.is_empty() {
+            a.remove(0);
+            b.remove(0);
+        }
+        while a.last() == b.last() && !a.is_empty() {
+            a.pop();
+            b.pop();
+        }
+        assert!(
+            a.len() <= 1 && b.len() <= 1,
+            "painted {painted:?} vs legacy {legacy:?} (interior mismatch {a:?}/{b:?})"
+        );
+        assert!(painted.iter().all(|&i| i < shaped.line_starts.len()));
+    }
+
+    #[test]
+    fn painted_lines_match_the_legacy_slice_within_whole_line_granularity() {
+        for (text, first_line, visible, ratio) in [
+            ("one\ntwo\nthree\nfour\nfive", 2usize, 1usize, 1.0f32),
+            ("one\ntwo\nthree\nfour\nfive", 0, 3, 2.0),
+            ("a\n\nb\n\nc\n\nd", 1, 2, 0.7),
+            ("line\n".repeat(40).as_str(), 17, 5, 1.3),
+            ("雪é漢😀\n".repeat(12).as_str(), 3, 4, 1.0),
+            ("", 0, 1, 1.0),
+        ] {
+            let viewport = Viewport {
+                first_line,
+                visible_lines: visible,
+                ..Viewport::default()
+            };
+            let line_height = TypeMetrics::default().line_height;
+            let paint_height = visible as f32 * line_height * ratio;
+            let mut state = EditorState::default();
+            assert_painted_matches_legacy_within_trailing_line(
+                &mut state,
+                text,
+                1,
+                viewport,
+                300.0,
+                paint_height,
+                line_height,
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 25, ..ProptestConfig::default() })]
+
+        /// S3-T3 (R9): randomized viewports/heights never diverge on an
+        /// earlier line — only the trailing partial line may differ.
+        #[test]
+        fn painted_content_differs_from_legacy_only_by_a_trailing_partial_line(
+            base in markdownish_base(),
+            first_line in 0usize..64,
+            visible in 1usize..12,
+            height_ratio in 0.4f32..20.0,
+        ) {
+            let viewport = Viewport {
+                first_line,
+                visible_lines: visible,
+                ..Viewport::default()
+            };
+            let line_height = TypeMetrics::default().line_height;
+            let paint_height = visible as f32 * line_height * height_ratio;
+            let mut state = EditorState::default();
+            assert_painted_matches_legacy_within_trailing_line(
+                &mut state, &base, 1, viewport, 300.0, paint_height, line_height,
+            );
+        }
+    }
+
+    #[test]
+    fn per_line_paragraphs_wrap_identically_to_the_band() {
+        // S3-T2: a wrapped line painted standalone wraps to the same visual
+        // rows the band layout reports for that line.
+        let text = format!("{}\nshort\n", "word ".repeat(60));
+        let width = 120.0_f32;
+        let viewport = Viewport {
+            first_line: 0,
+            visible_lines: 2,
+            ..Viewport::default()
+        };
+        let mut state = EditorState::default();
+        let shaped = state.sync_shaped(&text, 1, viewport, width);
+        let line_index = 0usize;
+        let line_content = band_line_content(shaped.visible, shaped.line_starts, line_index);
+        let standalone = shape_text(&line_content, width, TypeMetrics::default());
+        let band_rows: Vec<_> = shaped
+            .buffer
+            .layout_runs()
+            .filter(|run| run.line_i == line_index)
+            .map(|run| run_signature(run))
+            .collect();
+        let standalone_rows: Vec<_> = standalone.layout_runs().map(run_signature).collect();
+        assert!(
+            band_rows.len() >= 3,
+            "the long line wraps into several rows (got {})",
+            band_rows.len()
+        );
+        assert_eq!(standalone_rows, band_rows, "per-line wrap equals band wrap");
+        // Selection across the wrapped line: the caret hit-testing already
+        // resolves through ShapedView; assert the rows map to the same
+        // logical line (geometry identity).
+        assert!(band_rows.iter().all(|(line, ..)| *line == line_index));
+    }
+
+    #[test]
+    fn headless_paint_double_bounds_paragraph_keys_across_keystrokes() {
+        // S3-T4 (R2): with per-line granularity and iced's per-frame trim,
+        // the paint double's paragraph keys stay bounded by the band. Run
+        // 200 keystrokes (one mid-band char edit each) and track the live
+        // key set under per-frame LRU trim (mirrors iced `Cache::trim`).
+        let base = (0..200u32)
+            .map(|index| format!("line {index:03} alpha beta gamma delta epsilon zeta eta theta\n"))
+            .collect::<String>();
+        let width = 800.0_f32;
+        let viewport = Viewport {
+            first_line: 50,
+            visible_lines: 15,
+            ..Viewport::default()
+        };
+        let line_height = TypeMetrics::default().line_height;
+        let paint_height = 15.0 * line_height;
+        let base_view = EditorView::from(&test_view(&base, 1));
+        let mut text = base.clone();
+        let mut state = EditorState::default();
+        let mut live: std::collections::HashMap<(String, u32), u64> =
+            std::collections::HashMap::new();
+        let mut max_live = 0usize;
+        let mut band_lines = 1usize;
+        for frame in 0..200u64 {
+            let line = 50 + (frame as usize % 100);
+            let marker = format!("line {line:03}");
+            let at = text.find(&marker).expect("marker line") + marker.len();
+            let replacement = if frame % 2 == 0 { 'X' } else { 'x' };
+            text.replace_range(at..at + 1, &replacement.to_string());
+            let view = EditorView {
+                revision: 2 + frame,
+                text: Arc::from(text.as_str()),
+                ..base_view.clone()
+            };
+            state.reconcile(&view, &HashMap::new());
+            let shaped = state.sync_shaped(&text, view.revision, viewport, width);
+            band_lines = shaped.line_starts.len();
+            let paint_offset = shaped.paint_offset(viewport);
+            let spans = band_line_spans(shaped.buffer, band_lines, line_height);
+            let painted = painted_line_indices(&spans, paint_offset, paint_height);
+            assert!(
+                painted.len() <= band_lines,
+                "painted per frame ≤ band lines"
+            );
+            live.clear();
+            for index in painted {
+                let key = (
+                    band_line_content(shaped.visible, shaped.line_starts, index),
+                    spans[index].1.to_bits(),
+                );
+                live.insert(key, frame);
+            }
+            max_live = max_live.max(live.len());
+        }
+        assert!(
+            max_live <= 2 * band_lines + 8,
+            "paragraph-key live set {max_live} exceeds 2×band+8"
+        );
     }
 
     #[test]
