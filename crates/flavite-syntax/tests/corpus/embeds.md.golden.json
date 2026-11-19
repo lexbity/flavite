@@ -1,0 +1,42 @@
+{
+  "links": [
+    {
+      "start": 1,
+      "end": 18,
+      "target_raw": "image-one.png",
+      "alias": null,
+      "anchor": null,
+      "is_embed": true,
+      "by_id": false
+    },
+    {
+      "start": 31,
+      "end": 52,
+      "target_raw": "image-two.png",
+      "alias": "Two",
+      "anchor": null,
+      "is_embed": true,
+      "by_id": false
+    },
+    {
+      "start": 58,
+      "end": 84,
+      "target_raw": "image-three.png",
+      "alias": null,
+      "anchor": "anchor",
+      "is_embed": true,
+      "by_id": false
+    },
+    {
+      "start": 140,
+      "end": 153,
+      "target_raw": "note-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [],
+  "block_ids": []
+}

@@ -1,0 +1,69 @@
+{
+  "links": [
+    {
+      "start": 12,
+      "end": 23,
+      "target_raw": "em-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 41,
+      "end": 55,
+      "target_raw": "under-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 67,
+      "end": 82,
+      "target_raw": "strong-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 99,
+      "end": 115,
+      "target_raw": "strong2-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 147,
+      "end": 162,
+      "target_raw": "nested-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 200,
+      "end": 215,
+      "target_raw": "triple-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 344,
+      "end": 364,
+      "target_raw": "after-hard-break",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [],
+  "block_ids": []
+}

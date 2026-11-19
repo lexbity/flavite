@@ -1,0 +1,33 @@
+{
+  "links": [
+    {
+      "start": 85,
+      "end": 105,
+      "target_raw": "after-html-block",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 145,
+      "end": 167,
+      "target_raw": "inside-inline-html",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 256,
+      "end": 268,
+      "target_raw": "after-br",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [],
+  "block_ids": []
+}

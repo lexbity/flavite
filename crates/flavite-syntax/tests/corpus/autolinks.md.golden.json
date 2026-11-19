@@ -1,0 +1,24 @@
+{
+  "links": [
+    {
+      "start": 91,
+      "end": 105,
+      "target_raw": "not-a-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 125,
+      "end": 143,
+      "target_raw": "after-autolink",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [],
+  "block_ids": []
+}

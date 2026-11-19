@@ -12,6 +12,7 @@ pub mod pulldown_glue;
 pub mod read;
 pub mod scanner;
 pub mod text;
+pub mod ts_inline;
 pub mod ts_ranges;
 pub mod wellknown;
 

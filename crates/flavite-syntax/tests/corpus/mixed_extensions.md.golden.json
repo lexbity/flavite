@@ -1,0 +1,81 @@
+{
+  "links": [
+    {
+      "start": 27,
+      "end": 35,
+      "target_raw": "link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 49,
+      "end": 58,
+      "target_raw": "embed",
+      "alias": null,
+      "anchor": null,
+      "is_embed": true,
+      "by_id": false
+    },
+    {
+      "start": 196,
+      "end": 210,
+      "target_raw": "quote-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 275,
+      "end": 288,
+      "target_raw": "task-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 346,
+      "end": 359,
+      "target_raw": "cell-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      36,
+      40
+    ],
+    [
+      215,
+      225
+    ],
+    [
+      305,
+      314
+    ],
+    [
+      362,
+      371
+    ]
+  ],
+  "block_ids": [
+    [
+      41,
+      47
+    ],
+    [
+      245,
+      257
+    ],
+    [
+      376,
+      387
+    ]
+  ]
+}

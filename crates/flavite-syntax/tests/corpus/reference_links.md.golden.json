@@ -1,0 +1,15 @@
+{
+  "links": [
+    {
+      "start": 248,
+      "end": 261,
+      "target_raw": "real-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [],
+  "block_ids": []
+}

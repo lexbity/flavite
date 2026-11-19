@@ -252,6 +252,27 @@ pub fn math_ranges(content: &str, excluded: &[Range<usize>]) -> Vec<Range<usize>
     out
 }
 
+/// Find the closing `---` or `...` delimiter for frontmatter that opened at
+/// the very first line (the `---\n` prefix is the caller's check).
+///
+/// This is the single, shared frontmatter-boundary rule used by **both** parse
+/// glues (pulldown and tree-sitter) so AC-5 parity cannot drift on YAML
+/// delimiters (RFC-0008 S6).
+pub(crate) fn find_frontmatter_close(text: &str) -> Option<usize> {
+    let after_open = 3; // Skip initial "---"
+    let rest = &text[after_open..];
+
+    let mut line_start = 0usize;
+    for line in rest.lines() {
+        let trimmed = line.trim();
+        if trimmed == "---" || trimmed == "..." {
+            return Some(after_open + line_start + line.len());
+        }
+        line_start += line.len() + 1;
+    }
+    None
+}
+
 /// `true` when `pos` lies inside one of `ranges`.
 fn is_within(ranges: &[Range<usize>], pos: usize) -> bool {
     ranges.iter().any(|r| r.start <= pos && pos < r.end)

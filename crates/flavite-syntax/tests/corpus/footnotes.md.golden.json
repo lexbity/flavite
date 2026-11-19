@@ -1,0 +1,42 @@
+{
+  "links": [
+    {
+      "start": 83,
+      "end": 94,
+      "target_raw": "fn-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 169,
+      "end": 187,
+      "target_raw": "after-footnote",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      99,
+      107
+    ]
+  ],
+  "block_ids": [
+    [
+      29,
+      31
+    ],
+    [
+      45,
+      54
+    ],
+    [
+      140,
+      149
+    ]
+  ]
+}

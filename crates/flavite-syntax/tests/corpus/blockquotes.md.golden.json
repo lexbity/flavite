@@ -1,0 +1,52 @@
+{
+  "links": [
+    {
+      "start": 28,
+      "end": 34,
+      "target_raw": "q1",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 68,
+      "end": 74,
+      "target_raw": "q2",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 113,
+      "end": 125,
+      "target_raw": "q3-embed",
+      "alias": null,
+      "anchor": null,
+      "is_embed": true,
+      "by_id": false
+    },
+    {
+      "start": 141,
+      "end": 157,
+      "target_raw": "after-quotes",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      39,
+      46
+    ]
+  ],
+  "block_ids": [
+    [
+      75,
+      84
+    ]
+  ]
+}

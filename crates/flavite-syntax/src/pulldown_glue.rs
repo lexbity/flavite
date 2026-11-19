@@ -9,7 +9,7 @@
 //! tree-sitter never decides this (D10). Both parse paths use the same scanner,
 //! which is what makes AC-5 parity possible.
 
-use crate::mask::{TextMask, math_ranges};
+use crate::mask::{TextMask, find_frontmatter_close, math_ranges};
 use crate::scanner::{ScannedSpan, SpanKind, scan_inline};
 use crate::text::{Span, TextByte, TextSnapshot};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -211,22 +211,6 @@ fn flush_scan_range(ranges: &mut Vec<Range<usize>>, pending: &mut Range<usize>) 
         ranges.push(pending.clone());
         pending.end = pending.start;
     }
-}
-
-/// Find the closing `---` or `...` delimiter for frontmatter.
-fn find_frontmatter_close(text: &str) -> Option<usize> {
-    let after_open = 3; // Skip initial "---"
-    let rest = &text[after_open..];
-
-    let mut line_start = 0usize;
-    for line in rest.lines() {
-        let trimmed = line.trim();
-        if trimmed == "---" || trimmed == "..." {
-            return Some(after_open + line_start + line.len());
-        }
-        line_start += line.len() + 1;
-    }
-    None
 }
 
 #[cfg(test)]

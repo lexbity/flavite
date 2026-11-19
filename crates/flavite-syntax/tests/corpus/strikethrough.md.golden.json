@@ -1,0 +1,38 @@
+{
+  "links": [
+    {
+      "start": 9,
+      "end": 24,
+      "target_raw": "strike-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 74,
+      "end": 88,
+      "target_raw": "tilde-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 105,
+      "end": 124,
+      "target_raw": "unclosed-strike",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      41,
+      52
+    ]
+  ],
+  "block_ids": []
+}

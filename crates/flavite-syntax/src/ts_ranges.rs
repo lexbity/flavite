@@ -1,9 +1,14 @@
 //! Tree-sitter parse glue (§4.3, D10, AC-5).
 //!
 //! This module provides the editor-side parse path:
-//! 1. Parse markdown with tree-sitter (using the tree-sitter-md grammar).
-//! 2. Build a [`TextMask`] of excluded ranges (code spans/blocks, math).
-//! 3. Run the [`crate::scanner`] on the unmasked text to extract link/tag/block-ID spans.
+//! 1. Parse markdown with tree-sitter (using the tree-sitter-md grammar) —
+//!    **once** per call (RFC-0008 S6 stage A: the block tree is shared by
+//!    the mask builder and the inline-window walk; no duplicate block parse).
+//! 2. Build a [`TextMask`] of excluded ranges (code spans/blocks, HTML,
+//!    frontmatter, math) — block exclusions from the shared tree, inline
+//!    exclusions from one inline-grammar parse ([`crate::ts_inline`]).
+//! 3. Run the [`crate::scanner`] on the unmasked prose windows to extract
+//!    link/tag/block-ID spans.
 //!
 //! The scanner is the **single semantics source** for what counts as a link/tag;
 //! tree-sitter never decides this (D10). Both parse paths use the same scanner,
@@ -12,15 +17,23 @@
 //! Note: tree-sitter's markdown grammar is not fully CommonMark-compliant,
 //! so we use it primarily for block structure and code fence detection.
 
-use crate::mask::{TextMask, math_ranges};
-use crate::scanner::{ScannedSpan, SpanKind, scan_inline};
+use crate::mask::{TextMask, find_frontmatter_close, math_ranges};
+use crate::scanner::{SpanKind, scan_inline};
 use crate::text::{Span, TextByte, TextSnapshot};
 use std::ops::Range;
-use tree_sitter::{Language, Parser};
+use tree_sitter::{Language, Node, Parser, Tree};
 
 /// Get the tree-sitter language for markdown.
 fn markdown_language() -> Language {
     tree_sitter_md::LANGUAGE.into()
+}
+
+// Number of block-grammar `parse` calls made on the current thread since the
+// last reset (`#[cfg(test)]` instrumentation for S6-T2). Thread-local so
+// parallel tests never see each other's parses.
+#[cfg(test)]
+thread_local! {
+    pub static BLOCK_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A parsed note with all extracted structure from tree-sitter.
@@ -64,37 +77,21 @@ pub fn parse_note_ts(bytes: &[u8]) -> Result<TsParsedNote, String> {
         return Err("markdown contains an embedded NUL byte".into());
     }
 
-    // Build the exclusion mask from tree-sitter nodes.
-    let mask = build_mask_ts(text);
+    // ONE block-grammar parse. The same tree feeds both the mask builder and
+    // the scan-window walk (S6 stage A: parse once, walk twice).
+    let tree = parse_block(text).ok_or("failed to parse with tree-sitter")?;
 
-    // Collect inline spans from text nodes.
+    let (mask, windows) = build_mask_and_windows(text, &tree);
+
+    // Collect inline spans from unmasked prose windows.
     let mut links = Vec::new();
     let mut tags = Vec::new();
     let mut block_ids = Vec::new();
-
-    // Parse with tree-sitter.
-    let mut parser = Parser::new();
-    parser
-        .set_language(&markdown_language())
-        .map_err(|e| format!("failed to set language: {e}"))?;
-
-    let tree = parser
-        .parse(text, None)
-        .ok_or("failed to parse with tree-sitter")?;
-
-    let root = tree.root_node();
-
-    // Recursively collect text ranges that are not in code/HTML/math contexts.
-    // We track whether we're in an excluded context (code block, inline code, HTML).
-    let mut cursor = root.walk();
-    collect_inline_spans(
-        &mut cursor,
-        text,
-        &mask,
-        &mut links,
-        &mut tags,
-        &mut block_ids,
-    );
+    for window in windows {
+        for range in mask.unmasked(&window) {
+            scan_window(&snapshot, range, &mut links, &mut tags, &mut block_ids);
+        }
+    }
 
     Ok(TsParsedNote {
         snapshot,
@@ -105,197 +102,210 @@ pub fn parse_note_ts(bytes: &[u8]) -> Result<TsParsedNote, String> {
     })
 }
 
-/// Build the exclusion mask from tree-sitter nodes.
-fn build_mask_ts(text: &str) -> TextMask {
-    let mut excluded: Vec<Range<usize>> = Vec::new();
-
+/// Parse `text` with the block grammar. Counted under `#[cfg(test)]` so
+/// S6-T2 can assert exactly one block parse per `parse_note_ts` call.
+fn parse_block(text: &str) -> Option<Tree> {
+    #[cfg(test)]
+    BLOCK_PARSE_COUNT.with(|c| c.set(c.get() + 1));
     let mut parser = Parser::new();
-    // SAFETY: We know markdown_language() is valid for this text.
-    if parser.set_language(&markdown_language()).is_err() {
-        // If we can't set the language, return an empty mask.
-        return TextMask::empty(text.len());
-    }
-
-    let tree = match parser.parse(text, None) {
-        Some(t) => t,
-        None => return TextMask::empty(text.len()),
-    };
-
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-
-    // Recursively collect excluded ranges.
-    collect_excluded_ranges(&mut cursor, &mut excluded);
-
-    // The block grammar leaves inline content opaque. Parse the same snapshot
-    // with tree-sitter-md's inline grammar so code spans are excluded too.
-    let mut inline_parser = Parser::new();
-    let inline_language: Language = tree_sitter_md::INLINE_LANGUAGE.into();
-    if inline_parser.set_language(&inline_language).is_ok()
-        && let Some(inline_tree) = inline_parser.parse(text, None)
-    {
-        let mut inline_cursor = inline_tree.root_node().walk();
-        collect_excluded_ranges(&mut inline_cursor, &mut excluded);
-    }
-
-    // Add math ranges (tree-sitter doesn't natively handle math).
-    let math_ranges = math_ranges(text, &excluded);
-    excluded.extend(math_ranges);
-
-    TextMask::new(excluded, text.len())
+    parser.set_language(&markdown_language()).ok()?;
+    parser.parse(text, None)
 }
 
-/// Node kinds that represent excluded content (code, HTML, etc.).
-fn is_excluded_kind(kind: &str) -> bool {
+/// Build the exclusion mask and the prose scan windows from a block tree.
+///
+/// One tree walk produces both:
+/// * **exclusions** — code blocks, HTML blocks and YAML frontmatter
+///   (`minus_metadata`), plus the shared frontmatter heuristic
+///   ([`find_frontmatter_close`]) and the inline-grammar exclusions;
+/// * **windows** — the ranges whose unmasked content is prose: paragraphs,
+///   heading content (without their `#`/underline markers) and table cells
+///   (without their `|` separators). This mirrors pulldown's scan windows so
+///   AC-5 parity holds (RFC-0008 S6).
+fn build_mask_and_windows(text: &str, tree: &Tree) -> (TextMask, Vec<Range<usize>>) {
+    let mut excluded: Vec<Range<usize>> = Vec::new();
+    let mut windows: Vec<Range<usize>> = Vec::new();
+
+    // Shared frontmatter rule with the pulldown glue. The YAML-style
+    // `minus_metadata` node covers the `---` … `---` form; the shared
+    // heuristic additionally covers the `...` closer so both glues agree.
+    if text.starts_with("---\n")
+        && let Some(close) = find_frontmatter_close(text)
+    {
+        excluded.push(0..close);
+    }
+
+    // Footnote-definition labels (`[^label]:` at line starts) are part of the
+    // `FootnoteDefinition` tag, which pulldown never emits as text — so they
+    // must be masked (the *references* `[^1]` in prose stay scanned, matching
+    // pulldown's window gap arithmetic).
+    excluded.extend(footnote_definition_label_ranges(text));
+
+    walk_block_structure(tree.root_node(), &mut excluded, &mut windows);
+
+    crate::ts_inline::extend_inline_exclusions(text, &mut excluded);
+    excluded.extend(math_ranges(text, &excluded));
+
+    windows.sort_by_key(|r| (r.start, r.end));
+    windows.dedup();
+
+    (TextMask::new(excluded, text.len()), windows)
+}
+
+/// Node kinds whose entire range is excluded content (not prose).
+fn is_block_excluded_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "code_block"
-            | "inline_code"
-            | "code_span"
-            | "fenced_code_block"
-            | "html_block"
-            | "html_inline"
-            | "raw_html"
-            | "raw_text"
+        "fenced_code_block" | "indented_code_block" | "html_block" | "minus_metadata"
     )
 }
 
-/// Recursively collect excluded byte ranges from tree-sitter nodes.
-fn collect_excluded_ranges(
-    cursor: &mut tree_sitter::TreeCursor<'_>,
+/// Node kinds whose *content* (sans markers) is prose: the scan window is the
+/// node's `inline` child when present, else the node itself.
+const PROSE_BLOCK_KINDS: &[&str] = &["atx_heading", "setext_heading"];
+
+/// Recursively walk the block tree, collecting excluded ranges and prose scan
+/// windows in one pass.
+fn walk_block_structure(
+    node: Node<'_>,
     excluded: &mut Vec<Range<usize>>,
+    windows: &mut Vec<Range<usize>>,
 ) {
-    let node = cursor.node();
     let kind = node.kind();
 
-    if is_excluded_kind(kind) {
-        let range = node.byte_range();
-        excluded.push(range.start..range.end);
-        // Don't descend into excluded nodes.
+    if is_block_excluded_kind(kind) {
+        excluded.push(node.byte_range());
         return;
     }
 
-    // Check for frontmatter (YAML frontmatter is a special case).
-    if kind == "frontmatter" || kind == "yaml_front_matter" {
-        let range = node.byte_range();
-        excluded.push(range.start..range.end);
+    if kind == "paragraph" {
+        windows.push(node.byte_range());
+        return;
+    }
+
+    if kind == "pipe_table" {
+        // Pulldown's event stream does not flush between cells/rows: a table
+        // scans as ONE window across all cells (pipes and the delimiter row
+        // are gap bytes). Mirror that with the whole table node.
+        windows.push(node.byte_range());
+        return;
+    }
+
+    if PROSE_BLOCK_KINDS.contains(&kind) {
+        let window = first_child_of_kind(&node, "inline")
+            .map_or_else(|| node.byte_range(), |inline| inline.byte_range());
+        windows.push(window);
+        return;
+    }
+
+    if kind == "inline" {
+        // Safety net: a bare inline section directly under the document or a
+        // section (loose grammar output). Children of paragraphs/headings are
+        // already covered by the parent's window and must not be added here.
+        if matches!(
+            node.parent().map(|p| p.kind()),
+            Some("section") | Some("document")
+        ) {
+            windows.push(node.byte_range());
+        }
         return;
     }
 
     // Descend into children.
+    let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            collect_excluded_ranges(cursor, excluded);
+            walk_block_structure(cursor.node(), excluded, windows);
             if !cursor.goto_next_sibling() {
                 break;
             }
         }
-        cursor.goto_parent();
     }
 }
 
-/// Collect inline spans from text nodes that are not in excluded contexts.
-fn collect_inline_spans(
-    cursor: &mut tree_sitter::TreeCursor<'_>,
-    text: &str,
-    mask: &TextMask,
+/// First child of `node` with kind `want`, if any.
+fn first_child_of_kind<'a>(node: &Node<'a>, want: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if cursor.node().kind() == want {
+                return Some(cursor.node());
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Byte ranges of footnote-definition labels: `[^label]:` at the start of a
+/// line (after optional indentation).
+///
+/// Pulldown models a footnote definition as a `FootnoteDefinition` tag whose
+/// label is never emitted as text, so neither the label nor its brackets can
+/// appear in a scan window. Inline footnote *references* (`[^1]` in prose)
+/// are not masked: pulldown's window gap arithmetic surfaces them as text
+/// bytes, and the parity corpus asserts that behavior (footnotes.md).
+fn footnote_definition_label_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut line_start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let indent = content.len() - content.trim_start_matches([' ', '\t']).len();
+        if let Some(rest) = content[indent..].strip_prefix("[^")
+            && let Some(close) = rest.find(']')
+            && close > 0
+            && rest.as_bytes().get(close + 1) == Some(&b':')
+        {
+            // "[^" (2) + label (close) + "]" (1) + ":" (1).
+            let start = line_start + indent;
+            out.push(start..start + close + 4);
+        }
+        line_start += line.len();
+    }
+    out
+}
+
+/// Run the scanner over one unmasked prose window, mapping spans into the full
+/// text and routing them by kind.
+#[allow(clippy::too_many_arguments)]
+fn scan_window(
+    snapshot: &TextSnapshot,
+    range: Range<usize>,
     links: &mut Vec<super::pulldown_glue::Link>,
     tags: &mut Vec<Span<TextByte>>,
     block_ids: &mut Vec<Span<TextByte>>,
 ) {
-    let node = cursor.node();
-    let kind = node.kind();
-
-    // Skip excluded nodes (code, HTML, etc.).
-    if is_excluded_kind(kind) {
-        return;
-    }
-
-    // Check if this is a text node that we should scan.
-    if kind == "text" || kind == "inline_text" || kind == "paragraph" {
-        let byte_range = node.byte_range();
-        let start = byte_range.start;
-        let end = byte_range.end;
-
-        // Only scan if this range has unmasked content.
-        if !mask.is_masked(start) || !mask.is_masked(end.saturating_sub(1)) {
-            // Check if any part of this range is unmasked.
-            let mut scan_start = start;
-            while scan_start < end {
-                if !mask.is_masked(scan_start) {
-                    // Find the unmasked region.
-                    let mut scan_end = scan_start;
-                    while scan_end < end && !mask.is_masked(scan_end) {
-                        scan_end += 1;
-                    }
-                    if scan_end > scan_start {
-                        // Scan this unmasked region.
-                        let spans = scan_inline(
-                            &TextSnapshot::new(&text.as_bytes()[scan_start..scan_end])
-                                .expect("utf-8"),
-                            0..(scan_end - scan_start),
-                        );
-                        // Map spans back to the full text coordinates.
-                        for span in spans {
-                            let mapped_span = Span::new(
-                                TextByte(span.span.start.0 + scan_start),
-                                TextByte(span.span.end.0 + scan_start),
-                            );
-                            match span.kind {
-                                SpanKind::Link => {
-                                    if let Some(link) =
-                                        super::pulldown_glue::Link::from_scanned(ScannedSpan {
-                                            span: mapped_span,
-                                            kind: span.kind,
-                                            payload: span.payload,
-                                        })
-                                    {
-                                        links.push(link);
-                                    }
-                                }
-                                SpanKind::Embed => {
-                                    if let Some(link) =
-                                        super::pulldown_glue::Link::from_scanned(ScannedSpan {
-                                            span: mapped_span,
-                                            kind: span.kind,
-                                            payload: span.payload,
-                                        })
-                                    {
-                                        links.push(link);
-                                    }
-                                }
-                                SpanKind::Tag => {
-                                    tags.push(mapped_span);
-                                }
-                                SpanKind::BlockId => {
-                                    block_ids.push(mapped_span);
-                                }
-                            }
-                        }
-                    }
-                    scan_start = scan_end;
-                } else {
-                    scan_start += 1;
+    for span in scan_inline(snapshot, range) {
+        match span.kind {
+            SpanKind::Link | SpanKind::Embed => {
+                if let Some(link) = super::pulldown_glue::Link::from_scanned(span) {
+                    links.push(link);
                 }
             }
+            SpanKind::Tag => tags.push(span.span),
+            SpanKind::BlockId => block_ids.push(span.span),
         }
-    }
-
-    // Descend into children.
-    if cursor.goto_first_child() {
-        loop {
-            collect_inline_spans(cursor, text, mask, links, tags, block_ids);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-        cursor.goto_parent();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reset_parse_counters() {
+        BLOCK_PARSE_COUNT.with(|c| c.set(0));
+        crate::ts_inline::INLINE_PARSE_COUNT.with(|c| c.set(0));
+    }
+
+    fn block_parses() -> usize {
+        BLOCK_PARSE_COUNT.with(|c| c.get())
+    }
+
+    fn inline_parses() -> usize {
+        crate::ts_inline::INLINE_PARSE_COUNT.with(|c| c.get())
+    }
 
     #[test]
     fn parses_basic_note() {
@@ -308,7 +318,8 @@ mod tests {
     #[test]
     fn mask_excludes_code() {
         let src = "`[[not a link]]`";
-        let mask = build_mask_ts(src);
+        let tree = parse_block(src).expect("parse");
+        let (mask, _windows) = build_mask_and_windows(src, &tree);
         assert!(mask.is_masked(2));
         let result = parse_note_ts(src.as_bytes()).expect("parse");
         assert!(result.links.is_empty());
@@ -324,5 +335,79 @@ mod tests {
         assert_eq!(result.links[0].target_raw, "image.png");
         assert_eq!(result.tags.len(), 1);
         assert_eq!(result.block_ids.len(), 1);
+    }
+
+    /// S6-T2: stage A must parse the block grammar exactly once per
+    /// `parse_note_ts` call — and the inline grammar exactly once.
+    #[test]
+    fn stage_a_parses_block_grammar_once_per_call() {
+        reset_parse_counters();
+        let src = "# H [[link]]\n\n`[[code]]` and $x$ and [[tail]]\n";
+        let result = parse_note_ts(src.as_bytes()).expect("parse");
+        assert_eq!(
+            block_parses(),
+            1,
+            "block grammar must be parsed exactly once"
+        );
+        assert_eq!(
+            inline_parses(),
+            1,
+            "inline grammar must be parsed exactly once"
+        );
+        assert_eq!(
+            result.links.len(),
+            2,
+            "heading and paragraph links both found"
+        );
+    }
+
+    /// Windows must cover heading content (markers stripped) and the whole
+    /// table (pulldown scans tables as one merged window) — the
+    /// pulldown-visible prose.
+    #[test]
+    fn windows_strip_heading_markers_and_cover_whole_tables() {
+        let src = "# H [[link]]\n\n| a | b |\n|---|---|\n| [[x]] | y |\n";
+        let tree = parse_block(src).expect("parse");
+        let (_mask, windows) = build_mask_and_windows(src, &tree);
+        let table_start = src.find("| a |").expect("table start");
+        let table_end = src.find("\n| [[x]]").map(|i| i + 1).expect("table end");
+        let table_window = windows
+            .iter()
+            .find(|w| w.start == table_start)
+            .expect("table window");
+        // One window covers the entire table (header through last body row).
+        assert!(
+            table_window.end > table_end,
+            "table window must cover body rows: {table_window:?}"
+        );
+        // No window may include a heading marker.
+        for w in &windows {
+            let slice = &src[w.clone()];
+            assert!(
+                !slice.starts_with("#"),
+                "window must not include heading markers: {slice:?}"
+            );
+        }
+        let result = parse_note_ts(src.as_bytes()).expect("parse");
+        let targets: Vec<&str> = result.links.iter().map(|l| l.target_raw.as_str()).collect();
+        assert_eq!(targets, ["link", "x"]);
+    }
+
+    /// Frontmatter (both `---` and `...` closers) is excluded via the shared
+    /// heuristic even before the block grammar sees it.
+    #[test]
+    fn frontmatter_is_masked_with_shared_heuristic() {
+        for src in [
+            "---\ntitle: #tag\n---\n\n[[link]]\n",
+            "---\ntitle: #tag\n...\n\n[[link]]\n",
+        ] {
+            let result = parse_note_ts(src.as_bytes()).expect("parse");
+            assert_eq!(
+                result.tags.len(),
+                0,
+                "frontmatter tag must be masked: {src:?}"
+            );
+            assert_eq!(result.links.len(), 1, "body link must survive: {src:?}");
+        }
     }
 }
