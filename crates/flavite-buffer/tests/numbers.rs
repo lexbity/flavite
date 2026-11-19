@@ -105,29 +105,44 @@ fn number_dec_minus_zero() {
 }
 
 #[test]
-fn number_inc_overflow_skips() {
-    // NumberInc/NumberDec silently skip members with overflow
+fn number_inc_overflow_refuses_naming_number() {
+    // E-9: overflow refuses the whole command, naming the number.
     let text = "9223372036854775807";
     let set = set_of(text, 0..text.len());
     let result = plan(text, &set, &EditOperation::NumberInc);
-    // Should succeed with no changes (silently skipped)
-    assert!(result.is_ok());
-    let prepared = result.unwrap();
-    assert_eq!(prepared.after_text, text);
-    assert_eq!(prepared.ops.len(), 0);
+    assert!(matches!(
+        result,
+        Err(PlanError::Overflow { value, delta: 1 }) if value == "9223372036854775807"
+    ));
 }
 
 #[test]
-fn number_dec_underflow_skips() {
-    // NumberInc/NumberDec silently skip members with overflow
+fn number_dec_underflow_refuses_naming_number() {
+    // E-9: underflow refuses the whole command, naming the number.
     let text = "-9223372036854775808";
     let set = set_of(text, 0..text.len());
     let result = plan(text, &set, &EditOperation::NumberDec);
-    // Should succeed with no changes (silently skipped)
-    assert!(result.is_ok());
-    let prepared = result.unwrap();
-    assert_eq!(prepared.after_text, text);
-    assert_eq!(prepared.ops.len(), 0);
+    assert!(matches!(
+        result,
+        Err(PlanError::Overflow { value, delta: -1 }) if value == "-9223372036854775808"
+    ));
+}
+
+#[test]
+fn number_inc_refuses_when_member_lacks_number() {
+    // E-9: a member without a scannable number refuses the whole command
+    // with the failing count, matching sequence's all-or-nothing shape.
+    let text = "a 0 b X c 0";
+    let set = multi_set(
+        text,
+        &[
+            [1, 2, 3],   // first "0"
+            [2, 6, 7],   // "X" - no number
+            [3, 10, 11], // third "0"
+        ],
+    );
+    let result = plan(text, &set, &EditOperation::NumberInc);
+    assert!(matches!(result, Err(PlanError::NoNumber { count: 1 })));
 }
 
 #[test]

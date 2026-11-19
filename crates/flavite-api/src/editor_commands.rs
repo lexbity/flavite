@@ -443,6 +443,10 @@ pub struct EditorSelectionOnlyArgs {
     // FEUX-0004 X06: Count for select_line (count = N lines)
     #[serde(default)]
     count: Option<u32>,
+    // FEUX-0004 X05: Optional insertion text for `.` replay of the
+    // insert_* typing-entry family (absent = the delivered empty collapse).
+    #[serde(default)]
+    text: Option<String>,
 }
 
 // ---- FEUX-0002 X04/X05: the set-aware verb family ----
@@ -992,10 +996,11 @@ pub(crate) fn handle_insert_start(
     session: &Session,
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
     insert_at(
         session,
         invocation,
-        flavite_buffer::commands::EditOperation::InsertAtStarts(String::new()),
+        flavite_buffer::commands::EditOperation::InsertAtStarts(args.text.unwrap_or_default()),
     )
 }
 
@@ -1003,10 +1008,11 @@ pub(crate) fn handle_insert_end(
     session: &Session,
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
     insert_at(
         session,
         invocation,
-        flavite_buffer::commands::EditOperation::InsertAtEnds(String::new()),
+        flavite_buffer::commands::EditOperation::InsertAtEnds(args.text.unwrap_or_default()),
     )
 }
 
@@ -1014,10 +1020,11 @@ pub(crate) fn handle_insert_line_start(
     session: &Session,
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
     insert_at(
         session,
         invocation,
-        flavite_buffer::commands::EditOperation::InsertAtLineStarts(String::new()),
+        flavite_buffer::commands::EditOperation::InsertAtLineStarts(args.text.unwrap_or_default()),
     )
 }
 
@@ -1025,10 +1032,11 @@ pub(crate) fn handle_insert_line_end(
     session: &Session,
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
     insert_at(
         session,
         invocation,
-        flavite_buffer::commands::EditOperation::InsertAtLineEnds(String::new()),
+        flavite_buffer::commands::EditOperation::InsertAtLineEnds(args.text.unwrap_or_default()),
     )
 }
 

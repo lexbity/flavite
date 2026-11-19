@@ -246,11 +246,9 @@ pub enum KeymapError {
     UnreadableToken { id: String, text: String },
     /// The position name in the token is not a valid `KeyCode` variant.
     UnknownPosition { id: String, text: String },
-    /// Shift modifier on a motion binding (forbidden by Rule X).
+    /// Shift modifier on a motion binding (forbidden by Rule X rule 1).
     ShiftOnMotion { id: String },
-    /// Shift modifier on a menu opener binding (forbidden by Rule X).
-    ShiftOnMenuOpener { id: String },
-    /// Shift modifier on a menu accelerator binding (forbidden by Rule X).
+    /// Shift modifier on a menu accelerator binding (forbidden by Rule X rule 4).
     ShiftOnMenuAccelerator { id: String },
     /// Two bindings map to the same root slot (position + shift).
     Collision {
@@ -284,9 +282,6 @@ impl std::fmt::Display for KeymapError {
             }
             KeymapError::ShiftOnMotion { id } => {
                 write!(f, "Shift modifier not allowed on motion binding '{id}'")
-            }
-            KeymapError::ShiftOnMenuOpener { id } => {
-                write!(f, "Shift modifier not allowed on menu opener '{id}'")
             }
             KeymapError::ShiftOnMenuAccelerator { id } => {
                 write!(f, "Shift modifier not allowed on menu accelerator '{id}'")
@@ -436,13 +431,12 @@ impl ContextKeymap {
                     composed_slots_of.remove(id_str);
                 }
                 BindingToken::Position(slot) => {
-                    // Validate Rule X: no shift on motions, menu openers, or menu accelerators
+                    // Validate Rule X: no shift on motions or menu accelerators
+                    // (rule 1 and rule 4 stand). Rule 3 was replaced by
+                    // FEUX-0004 E-3: menu-opener bindings MAY bind bare or
+                    // shift+ positions as distinct slots.
                     if binding_id.is_motion() && slot.shift {
                         errors.push(KeymapError::ShiftOnMotion { id: id_str.clone() });
-                        continue;
-                    }
-                    if binding_id.is_menu_opener() && slot.shift {
-                        errors.push(KeymapError::ShiftOnMenuOpener { id: id_str.clone() });
                         continue;
                     }
                     if binding_id.is_menu_accelerator() && slot.shift {
@@ -1223,6 +1217,32 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, KeymapError::ShiftOnMotion { .. }))
         );
+    }
+
+    #[test]
+    fn resolve_accepts_shift_on_menu_opener() {
+        use std::collections::BTreeMap;
+
+        // FEUX-0004 E-3: Rule X rule 3 was replaced - menu openers MAY bind
+        // shifted positions as distinct slots (the default `⇧T` Lines opener
+        // is exactly such a slot).
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "editor.menu_lines".to_string(),
+            "shift+physical:KeyT".to_string(),
+        );
+
+        let result = ContextKeymap::resolve(&overrides);
+        assert!(
+            result.is_ok(),
+            "Shift on a menu opener should be accepted: {result:?}"
+        );
+        let keymap = result.unwrap();
+        let slot = Slot::shifted(KeyCode::KeyT);
+        assert!(matches!(
+            keymap.lookup_root(slot),
+            Some(BindingId::MenuOpener(ContextMenu::Lines))
+        ));
     }
 
     #[test]

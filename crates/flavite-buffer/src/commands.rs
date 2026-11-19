@@ -244,6 +244,10 @@ pub enum PlanError {
     Overflow { value: String, delta: i64 },
     /// For NumberSequence: one or more selections contain no number.
     SequenceNoNumber,
+    /// A Lines move would run past the document edge (E-8 §5.7 clamp).
+    MoveClamp,
+    /// A Lines move target intersects another member's block (E-8 §5.7).
+    MoveOverlap,
 }
 
 impl From<crate::selection::SetError> for PlanError {
@@ -277,6 +281,8 @@ impl std::fmt::Display for PlanError {
                 write!(f, "Number {} overflows when adding {}", value, delta)
             }
             Self::SequenceNoNumber => write!(f, "Some selections contain no number"),
+            Self::MoveClamp => write!(f, "Cannot move: block is at the edge of the document"),
+            Self::MoveOverlap => write!(f, "Cannot move: selections occupy adjacent blocks"),
         }
     }
 }
@@ -606,34 +612,43 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
             }
         }
         EditOperation::NumberInc => {
+            // E-9: every member must carry a scannable number; overflow
+            // refuses naming the number (all-or-nothing, like sequence).
+            let mut missing = 0usize;
             for member in set.iter() {
-                if let Some(scan_result) = scan_number(text, member)
-                    && let Ok(replacement) = increment_number(text, &scan_result, 1)
-                {
-                    let (start, end) = number_range(&scan_result);
-                    planned.push(PlannedEdit {
-                        start,
-                        end,
-                        replacement,
-                    });
-                }
-                // Silently skip members without numbers or with overflow
-                // (spec doesn't require refusal for inc/dec like it does for sequence)
+                let Some(scan_result) = scan_number(text, member) else {
+                    missing += 1;
+                    continue;
+                };
+                let replacement = increment_number(text, &scan_result, 1)?;
+                let (start, end) = number_range(&scan_result);
+                planned.push(PlannedEdit {
+                    start,
+                    end,
+                    replacement,
+                });
+            }
+            if missing > 0 {
+                return Err(PlanError::NoNumber { count: missing });
             }
         }
         EditOperation::NumberDec => {
+            let mut missing = 0usize;
             for member in set.iter() {
-                if let Some(scan_result) = scan_number(text, member)
-                    && let Ok(replacement) = increment_number(text, &scan_result, -1)
-                {
-                    let (start, end) = number_range(&scan_result);
-                    planned.push(PlannedEdit {
-                        start,
-                        end,
-                        replacement,
-                    });
-                }
-                // Silently skip members without numbers or with overflow
+                let Some(scan_result) = scan_number(text, member) else {
+                    missing += 1;
+                    continue;
+                };
+                let replacement = increment_number(text, &scan_result, -1)?;
+                let (start, end) = number_range(&scan_result);
+                planned.push(PlannedEdit {
+                    start,
+                    end,
+                    replacement,
+                });
+            }
+            if missing > 0 {
+                return Err(PlanError::NoNumber { count: missing });
             }
         }
         EditOperation::NumberSequence => {
@@ -831,58 +846,98 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
             }
         }
         EditOperation::LinesMoveUp => {
+            // E-8/S5.7: collect every member's block first; refuse the whole
+            // command when any block clamps at the document edge or when a
+            // target region intersects another member's block. Only after
+            // the precheck passes do we compose the swaps (document order,
+            // top to bottom).
+            let mut blocks: Vec<(usize, usize)> = Vec::with_capacity(set.len());
             for member in set.iter() {
-                if let Some((block_start, block_end)) = containing_line_range(text, member) {
-                    // Move block up: swap with previous line block
-                    if block_start > 0 {
-                        let prev_line_start = text[..block_start].rfind('\n').map_or(0, |i| i + 1);
-                        let prev_line_end = block_start;
-                        // Swap the two blocks
-                        let this_block = text[block_start..block_end].to_string();
-                        let prev_block = text[prev_line_start..prev_line_end].to_string();
-                        // Replace prev block with this block
-                        planned.push(PlannedEdit {
-                            start: prev_line_start,
-                            end: prev_line_end,
-                            replacement: this_block.clone(),
-                        });
-                        // Replace this block with prev block
-                        planned.push(PlannedEdit {
-                            start: block_start,
-                            end: block_end,
-                            replacement: prev_block,
-                        });
+                if let Some(block) = containing_line_range(text, member) {
+                    blocks.push(block);
+                }
+            }
+            let mut targets: Vec<(usize, usize)> = Vec::with_capacity(blocks.len());
+            for &(block_start, _) in &blocks {
+                if block_start == 0 {
+                    return Err(PlanError::MoveClamp);
+                }
+                // block_start is always a line start (0 or right after a
+                // newline), so block_start - 1 is the previous line's
+                // newline; the previous line starts after the newline before
+                // that one (or at 0).
+                let prev_line_start = text[..block_start - 1].rfind('\n').map_or(0, |i| i + 1);
+                targets.push((prev_line_start, block_start));
+            }
+            for (i, &(target_start, target_end)) in targets.iter().enumerate() {
+                for (j, &(other_start, other_end)) in blocks.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    if target_start < other_end && other_start < target_end {
+                        return Err(PlanError::MoveOverlap);
                     }
                 }
             }
+            for (i, &(block_start, block_end)) in blocks.iter().enumerate() {
+                let (prev_line_start, prev_line_end) = targets[i];
+                let this_block = text[block_start..block_end].to_string();
+                let prev_block = text[prev_line_start..prev_line_end].to_string();
+                planned.push(PlannedEdit {
+                    start: prev_line_start,
+                    end: prev_line_end,
+                    replacement: this_block.clone(),
+                });
+                planned.push(PlannedEdit {
+                    start: block_start,
+                    end: block_end,
+                    replacement: prev_block,
+                });
+            }
         }
         EditOperation::LinesMoveDown => {
+            // E-8/S5.7: same precheck discipline as move-up; targets are the
+            // next line block.
+            let mut blocks: Vec<(usize, usize)> = Vec::with_capacity(set.len());
             for member in set.iter() {
-                if let Some((block_start, block_end)) = containing_line_range(text, member) {
-                    // Move block down: swap with next line block
-                    if block_end < text.len() {
-                        let next_line_start = block_end;
-                        let next_line_end = text[block_end..]
-                            .find('\n')
-                            .map_or(text.len(), |i| block_end + i + 1);
-                        if next_line_start < text.len() {
-                            let this_block = text[block_start..block_end].to_string();
-                            let next_block = text[next_line_start..next_line_end].to_string();
-                            // Replace this block with next block
-                            planned.push(PlannedEdit {
-                                start: block_start,
-                                end: block_end,
-                                replacement: next_block.clone(),
-                            });
-                            // Replace next block with this block
-                            planned.push(PlannedEdit {
-                                start: next_line_start,
-                                end: next_line_end,
-                                replacement: this_block,
-                            });
-                        }
+                if let Some(block) = containing_line_range(text, member) {
+                    blocks.push(block);
+                }
+            }
+            let mut targets: Vec<(usize, usize)> = Vec::with_capacity(blocks.len());
+            for &(_, block_end) in &blocks {
+                if block_end >= text.len() {
+                    return Err(PlanError::MoveClamp);
+                }
+                let next_line_end = text[block_end..]
+                    .find('\n')
+                    .map_or(text.len(), |i| block_end + i + 1);
+                targets.push((block_end, next_line_end));
+            }
+            for (i, &(target_start, target_end)) in targets.iter().enumerate() {
+                for (j, &(other_start, other_end)) in blocks.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    if target_start < other_end && other_start < target_end {
+                        return Err(PlanError::MoveOverlap);
                     }
                 }
+            }
+            for (i, &(block_start, block_end)) in blocks.iter().enumerate() {
+                let (next_line_start, next_line_end) = targets[i];
+                let this_block = text[block_start..block_end].to_string();
+                let next_block = text[next_line_start..next_line_end].to_string();
+                planned.push(PlannedEdit {
+                    start: block_start,
+                    end: block_end,
+                    replacement: next_block.clone(),
+                });
+                planned.push(PlannedEdit {
+                    start: next_line_start,
+                    end: next_line_end,
+                    replacement: this_block,
+                });
             }
         }
         // FEUX-0004 X03: Align command
@@ -1533,26 +1588,31 @@ fn swap_case(c: char) -> String {
     }
 }
 
-/// Title-case a string using Unicode word boundaries.
-/// First cased character of each word is uppercased, rest are lowercased.
+/// Title-case a string using UAX #29 word boundaries (E-10).
+/// Within each word segment, the first cased character is uppercased and
+/// the remaining cased characters are lowercased; uncased characters pass
+/// through untouched. Segments come from `WordBoundarySet` (the delivered
+/// UAX #29 machinery), so apostrophes and hyphens stay inside their word
+/// (`"café's"` → `"Café's"`).
 fn title_case(text: &str) -> String {
-    let mut result = String::new();
-    let mut word_start = true;
-
-    for c in text.chars() {
-        // Check if this is a word boundary
-        if word_start && c.is_alphabetic() {
-            // First cased character of a word: uppercase
-            result.extend(c.to_uppercase());
-            word_start = false;
-        } else if !c.is_alphabetic() {
-            // Non-alphabetic character: mark next as word start
-            result.push(c);
-            word_start = true;
-        } else {
-            // Alphabetic but not word start: lowercase
-            result.extend(c.to_lowercase());
+    let boundaries = flavite_syntax::text::word_boundaries(text);
+    let mut result = String::with_capacity(text.len());
+    let mut start = 0usize;
+    for &end in boundaries.iter().skip(1) {
+        let segment = &text[start..end];
+        let mut first_cased = true;
+        for c in segment.chars() {
+            let cased = c.is_uppercase() || c.is_lowercase();
+            if cased && first_cased {
+                result.extend(c.to_uppercase());
+                first_cased = false;
+            } else if cased {
+                result.extend(c.to_lowercase());
+            } else {
+                result.push(c);
+            }
         }
+        start = end;
     }
     result
 }

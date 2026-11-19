@@ -139,6 +139,10 @@ pub struct ContextSession {
     /// classifies admission, forwards events and interprets effects.
     pub state: ContextState,
     pub menu_target: Option<EditorTarget>,
+    /// Pending typing-run text for `.` repeat (FEUX-0004 E-5): set when a
+    /// typing-entry command begins its run, accumulated by the input host,
+    /// finalized with `InvocationRecord` at the run's end (group seal).
+    pub typing_record: Option<(&'static str, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -515,6 +519,8 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
 }
 
 fn exit(app: &mut App) {
+    // FEUX-0004 X05: any unfinished typing run records at session exit.
+    finalize_typing_record(app);
     app.context_mode.clear_preview();
     app.diagnostics.clear_burst_hint();
     app.context_mode.history = Default::default();
@@ -849,21 +855,46 @@ pub fn native_key(
                     shift: key.modifiers.shift,
                 };
 
-                // Look up in keymap
-                if let Some(binding_id) = app.appearance.context_keys.lookup_root(slot) {
+                // Look up in keymap. The resolved binding is cloned out so
+                // the keymap borrow does not span the dispatch (which may
+                // mutate the app).
+                if let Some(binding_id) = app.appearance.context_keys.lookup_root(slot).cloned() {
                     match binding_id {
                         BindingId::Command(command) => {
                             return if key.repeat {
                                 Task::none()
                             } else {
-                                run(app, target, *command)
+                                run(app, target, command)
                             };
                         }
                         BindingId::Motion(motion) => {
-                            key.input.action = flavite_editor::context::motion_action(*motion);
+                            // FEUX-0004 X06: a pending count multiplies the
+                            // motion (E-4 §5.3). The count is consumed by the
+                            // dispatch (cleared even on refusal); motions are
+                            // acceptors, so a count must never survive the
+                            // key to silently multiply a later command.
+                            let count = app
+                                .context_mode
+                                .session
+                                .as_ref()
+                                .and_then(|s| s.state.count());
+                            if let Some(n) = count {
+                                let (now_ms, burst_enabled) = chart_inputs(app);
+                                if let Some(s) = &mut app.context_mode.session {
+                                    let effects = reduce(
+                                        &mut s.state,
+                                        &Event::ClearCount,
+                                        now_ms,
+                                        burst_enabled,
+                                    );
+                                    let _ = run_effects(app, target.tab, effects);
+                                }
+                                return counted_motion(app, &target, motion, n);
+                            }
+                            key.input.action = flavite_editor::context::motion_action(motion);
                         }
                         BindingId::FindChar { forward } => {
-                            let command = ContextCommand::FindChar { forward: *forward };
+                            let command = ContextCommand::FindChar { forward };
                             return if key.repeat {
                                 Task::none()
                             } else {
@@ -874,7 +905,7 @@ pub fn native_key(
                             return if key.repeat {
                                 Task::none()
                             } else {
-                                handle(app, ContextMessage::OpenMenu(target, *menu))
+                                handle(app, ContextMessage::OpenMenu(target, menu))
                             };
                         }
                     }
@@ -1378,6 +1409,12 @@ fn kernel_task(
                 // Menu openers (not actual commands)
                 "editor.menu_select" | "editor.menu_go" | "editor.menu_more" |
                 "editor.menu_transform" | "editor.menu_lines" | "editor.menu_surround" |
+                // Typing-entry commands record their run text at group seal
+                // (FEUX-0004 E-5): the admission-time args are empty and would
+                // otherwise overwrite the register with an untyped record.
+                "editor.change" | "editor.insert_start" | "editor.insert_end" |
+                "editor.insert_line_start" | "editor.insert_line_end" |
+                "editor.open_above" | "editor.open_below" |
                 // Repeat itself (would be recursive)
                 "editor.repeat_last"
             );
@@ -1555,6 +1592,79 @@ fn row_targets(app: &App, target: &EditorTarget, rows: i32) -> Result<Vec<usize>
     Ok(positions)
 }
 
+/// A counted motion dispatch (FEUX-0004 X06, E-4 §5.3): the count is applied
+/// per member in one plan through the delivered `editor.move` path.
+/// Horizontal (text-pure) motions pass the count to `apply_with_count`;
+/// visual up/down recompute the N-row target heads through the same vertical
+/// geometry the widget paints (clamped per member, the delivered rule).
+fn counted_motion(
+    app: &mut App,
+    target: &EditorTarget,
+    motion: flavite_edit_context::Motion,
+    n: u32,
+) -> Task<Message> {
+    let api_name = match motion {
+        flavite_edit_context::Motion::Previous => "char_left",
+        flavite_edit_context::Motion::Next => "char_right",
+        flavite_edit_context::Motion::Up => "line_up",
+        flavite_edit_context::Motion::Down => "line_down",
+        flavite_edit_context::Motion::NextWord => "word_next",
+        flavite_edit_context::Motion::PreviousWord => "word_prev",
+        flavite_edit_context::Motion::NextWordEnd => "word_end",
+    };
+    if matches!(
+        motion,
+        flavite_edit_context::Motion::Up | flavite_edit_context::Motion::Down
+    ) {
+        let rows = if matches!(motion, flavite_edit_context::Motion::Up) {
+            -(n as i32)
+        } else {
+            n as i32
+        };
+        match counted_vertical_targets(app, target, rows) {
+            Some(positions) => selections_only_task(
+                app,
+                target,
+                "editor.move",
+                serde_json::json!({"motion": api_name, "positions": positions}),
+            ),
+            None => Task::none(),
+        }
+    } else {
+        selections_only_task(
+            app,
+            target,
+            "editor.move",
+            serde_json::json!({"motion": api_name, "count": n}),
+        )
+    }
+}
+
+/// Vertical target heads for a counted up/down motion: N visual rows per
+/// member, clamped by the delivered vertical geometry (no refusal — the
+/// motion simply stops at the document edge).
+fn counted_vertical_targets(app: &App, target: &EditorTarget, rows: i32) -> Option<Vec<usize>> {
+    use flavite_editor::navigation::{VerticalMotion, vertical_target};
+    let view = app.note_editor_view(target.tab)?;
+    let bounds = app
+        .editor_bounds
+        .get(&target.tab)
+        .map_or(640.0, |b| b.width);
+    let metrics = app.appearance.metrics();
+    let width = flavite_editor::widget::wrap_width_for(bounds, metrics.editor_max_line_width());
+    let motion = VerticalMotion {
+        rows,
+        width,
+        metrics: metrics.editor_type(),
+    };
+    let mut positions = Vec::with_capacity(target.selections.len());
+    for &(_, head) in &target.selections {
+        let (at, _) = vertical_target(&view.text, head, motion, None);
+        positions.push(at);
+    }
+    Some(positions)
+}
+
 /// A selection-only verb, ending in focus.
 fn selections_only_task(
     app: &mut App,
@@ -1711,9 +1821,15 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
             Task::none()
         }
         ContextMessage::Unbound(target) => {
-            if valid(app, target, false) {
+            if valid(app, target.clone(), false) {
                 app.context_mode
                     .notice("No command on this key · choose a menu");
+                // FEUX-0004 E-4: an unbound key clears a pending count.
+                let (now_ms, burst_enabled) = chart_inputs(app);
+                if let Some(s) = &mut app.context_mode.session {
+                    let effects = reduce(&mut s.state, &Event::ClearCount, now_ms, burst_enabled);
+                    let _ = run_effects(app, target.tab, effects);
+                }
             }
             Task::none()
         }
@@ -1749,6 +1865,7 @@ fn enter(app: &mut App, target: EditorTarget) {
         buffer: target.buffer,
         state: ContextState::activated(),
         menu_target: None,
+        typing_record: None,
     });
 }
 
@@ -1849,6 +1966,8 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 ),
             );
         }
+        // FEUX-0004 X05: escaping a typing run seals it for `.` replay.
+        finalize_typing_record(app);
         let (now_ms, burst_enabled) = chart_inputs(app);
         let effects = app
             .context_mode
@@ -1868,6 +1987,9 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         let task = run_effects(app, target.tab, effects);
         return task.unwrap_or_else(|| focus(app, target.tab));
     }
+    // FEUX-0004 X05: a command dispatch ends any prior typing run; record it
+    // before the new invocation replaces the register.
+    finalize_typing_record(app);
     seal(app, target.tab);
     super::editor_history::invalidate(app);
     if command != History {
@@ -1876,6 +1998,13 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     if !valid(app, target.clone(), true) {
         app.context_mode
             .notice("Source changed; command was not applied");
+        // FEUX-0004 E-4: the dispatch attempt consumes the count even when
+        // refused; a stale refusal must not leave it pending.
+        let (now_ms, burst_enabled) = chart_inputs(app);
+        if let Some(s) = &mut app.context_mode.session {
+            let effects = reduce(&mut s.state, &Event::ClearCount, now_ms, burst_enabled);
+            let _ = run_effects(app, target.tab, effects);
+        }
         return Task::none();
     }
     // FEUX-0004 X06: Capture count before RunAdmitted clears it (E-4)
@@ -1965,6 +2094,9 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     // (FEUX-0002 X04/X05, E-1/E-6): the whole captured set rides the
     // command. The Go-menu motions became `editor.move` per-member verbs.
     let typing_entry = command.enters_typing();
+    // Capture before the match consumes `command` (FEUX-0004 X05: typing
+    // runs record their accumulated text at group seal).
+    let typing_entry_id = typing_entry.then(|| command.id());
     let task = match command {
         SelectAll => unreachable!("handled by the host-side whole-set select"),
         LineStart => selections_only_task(
@@ -2410,6 +2542,9 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         }
         let (now_ms, burst_enabled) = chart_inputs(app);
         if let Some(s) = &mut app.context_mode.session {
+            if let Some(id) = typing_entry_id {
+                s.typing_record = Some((id, String::new()));
+            }
             let _ = reduce(&mut s.state, &Event::EnterTyping, now_ms, burst_enabled);
         }
     }
@@ -2430,6 +2565,28 @@ pub(crate) fn record_invocation(
         let record = InvocationRecord { command_id, args };
         let _ = reduce(&mut s.state, &Event::Record(record), now_ms, burst_enabled);
     }
+}
+
+/// Finalize a pending typing-run record at its group seal (FEUX-0004 E-5):
+/// the accumulated run text is recorded for `.` replay. Called wherever a
+/// typing run ends (Escape, next dispatch, session exit); empty runs record
+/// nothing.
+fn finalize_typing_record(app: &mut App) {
+    let (command_id, text) = {
+        let Some(session) = &mut app.context_mode.session else {
+            return;
+        };
+        let Some(record) = session.typing_record.take() else {
+            return;
+        };
+        record
+    };
+    if text.is_empty() {
+        return;
+    }
+    let mut args = std::collections::BTreeMap::new();
+    args.insert("typed_text".to_string(), text);
+    record_invocation(app, command_id, args);
 }
 
 /// Replay the last recorded invocation with optional count (FEUX-0004 E-5/X06).
@@ -2465,49 +2622,79 @@ fn replay_last_with_count(
     // FEUX-0004 X06: if count is present, replay count times sequentially
     let count = count.unwrap_or(1);
 
-    // Build args object once
-    let args = serde_json::Value::Object(
-        record
-            .args
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect(),
-    );
+    // Resolve replay steps from the record. Typing-entry records carry their
+    // run text and replay as one batch (E-5): change composes to a typed
+    // replacement; the insert_* family inserts the text directly; open-
+    // above/below compose open-then-type.
+    enum ReplayStep {
+        Kernel(&'static str, serde_json::Value),
+        SelectionOnly(&'static str, serde_json::Value),
+    }
+    let typed_text = record.args.get("typed_text").cloned();
+    let steps: Vec<ReplayStep> = match (record.command_id, typed_text) {
+        ("editor.change", Some(text)) => vec![ReplayStep::Kernel(
+            "editor.type",
+            serde_json::json!({"text": text, "undo_policy": "isolated"}),
+        )],
+        (
+            "editor.insert_start"
+            | "editor.insert_end"
+            | "editor.insert_line_start"
+            | "editor.insert_line_end",
+            Some(text),
+        ) => vec![ReplayStep::SelectionOnly(
+            record.command_id,
+            serde_json::json!({"text": text}),
+        )],
+        ("editor.open_above" | "editor.open_below", Some(text)) => vec![
+            ReplayStep::Kernel(record.command_id, serde_json::json!({})),
+            ReplayStep::Kernel(
+                "editor.type",
+                serde_json::json!({"text": text, "undo_policy": "isolated"}),
+            ),
+        ],
+        (id, _) => {
+            let args = serde_json::Value::Object(
+                record
+                    .args
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect(),
+            );
+            vec![ReplayStep::Kernel(id, args)]
+        }
+    };
 
-    // Synchronous replay loop: kernel_mutate is synchronous, so we apply each
-    // replay in sequence against the live app state. After each successful
-    // replay, we re-capture the target to get the updated revision/selection.
+    // Synchronous replay loop: each dispatch is synchronous, so we apply the
+    // steps in sequence against the live app state. After each successful
+    // step, we re-capture the target to get the updated revision/selection.
     let mut current_target = target;
 
     for _ in 0..count {
-        // Dispatch through kernel_mutate
-        let result = kernel_mutate(
-            app,
-            &current_target,
-            record.command_id,
-            args.clone(),
-            "Repeat was refused; source changed",
-        );
-        match result {
-            Some(success) => {
-                install_receipt(app, &current_target, &success);
-                // Update target for next iteration - re-capture from app state
-                if let Some(new_target) = EditorTarget::capture(app, current_target.tab) {
-                    current_target = new_target;
-                } else {
-                    // If we can't capture, the tab might be closed - stop here
-                    app.context_mode.notice("Tab closed during repeat");
-                    diag(
+        for step in &steps {
+            let succeeded = match step {
+                ReplayStep::Kernel(id, args) => {
+                    match kernel_mutate(
                         app,
-                        current_target.tab,
-                        EventKind::RepeatOutcome,
-                        Outcome::Refused,
-                        Some(current_target.selections.len() as u32),
-                    );
-                    return Task::none();
+                        &current_target,
+                        id,
+                        args.clone(),
+                        "Repeat was refused; source changed",
+                    ) {
+                        Some(success) => {
+                            install_receipt(app, &current_target, &success);
+                            true
+                        }
+                        None => false,
+                    }
                 }
-            }
-            None => {
+                ReplayStep::SelectionOnly(id, args) => {
+                    selections_only(app, &current_target, id, args.clone()).is_some()
+                }
+            };
+            if !succeeded {
+                // A refusing replay stops the run with its reason; the
+                // register is unchanged (E-5).
                 app.context_mode
                     .notice("Repeat was refused; source changed");
                 diag(
@@ -2519,11 +2706,22 @@ fn replay_last_with_count(
                 );
                 return Task::none();
             }
+            // Update target for the next step/replay - re-capture from app
+            // state.
+            if let Some(new_target) = EditorTarget::capture(app, current_target.tab) {
+                current_target = new_target;
+            } else {
+                app.context_mode.notice("Tab closed during repeat");
+                diag(
+                    app,
+                    current_target.tab,
+                    EventKind::RepeatOutcome,
+                    Outcome::Refused,
+                    Some(current_target.selections.len() as u32),
+                );
+                return Task::none();
+            }
         }
-
-        // The spec says: "a replay that refuses stops the run with its reason
-        // (no rollback across replays — each replay is its own undo node, which
-        // is also the recovery)". Since kernel_mutate returned Some, it succeeded.
     }
 
     diag(

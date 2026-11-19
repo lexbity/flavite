@@ -113,7 +113,6 @@ run_x02_gates() {
         crates/flavite-edit-context/src/lib.rs \
         crates/flavite-edit-context/src/key.rs \
         crates/flavite-edit-context/src/vocabulary.rs \
-        crates/flavite-edit-context/src/grammar.rs \
         crates/flavite-edit-context/src/session.rs \
         crates/flavite-edit-context/src/effect.rs \
         crates/flavite-edit-context/tests/transitions.rs; do

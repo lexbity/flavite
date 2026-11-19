@@ -1169,5 +1169,161 @@ fn context_toggle_preserves_a_manually_maximized_pane() {
     assert_eq!(fixture.app.maximized_group(), Some(group));
 }
 
+/// Press one physical key through the acknowledged ContextNative path.
+/// `seq` is a strictly increasing request sequence owned by the test (the
+/// host's lease rejects reused sequence numbers as replays).
+fn press_key(
+    app: &mut App,
+    tab: TabId,
+    code: iced::keyboard::key::Code,
+    text: &str,
+    seq: &mut u64,
+) {
+    use flavite_editor::context::{ContextEvent, ContextKey, ContextRequest};
+    use iced::keyboard::Modifiers;
+    let source = EditorTarget::capture(app, tab).unwrap();
+    *seq += 1;
+    let sequence = *seq;
+    let key = ContextKey {
+        code: native_code(code),
+        modifiers: native_modifiers(Modifiers::empty()),
+        repeat: false,
+        input: CapturedInput {
+            buffer: source.buffer,
+            observed_revision: source.revision,
+            sequence,
+            action: KeyAction::Insert,
+            text: text.into(),
+            extend: false,
+            document_boundary: false,
+            vertical: None,
+            preferred_x: Vec::new(),
+            clipboard_acquired: false,
+        },
+    };
+    let _ = app.update(Message::ContextNative {
+        tab,
+        incarnation: source.incarnation,
+        request: ContextRequest {
+            buffer: source.buffer,
+            revision: source.revision,
+            selection: source.selection,
+            selections: vec![source.selection],
+            sequence,
+            event: ContextEvent::Key(key),
+        },
+    });
+}
+
+fn pending_count(app: &App) -> Option<u32> {
+    app.context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.count())
+}
+
+#[test]
+fn count_motion_multiplies_and_consumes_the_count() {
+    use iced::keyboard::key::Code;
+    let (mut f, tab) = fixture(3122);
+    // Body: "one café\nsecond line\n" — line 2 starts at byte 10.
+    selection(&mut f.app, tab, 0, 0);
+    run(&mut f.app, tab, Command::Toggle);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Command);
+
+    let mut seq = f.app.workspace.tab(&tab).unwrap().interaction().sequence;
+    press_key(&mut f.app, tab, Code::Digit3, "3", &mut seq);
+    assert_eq!(pending_count(&f.app), Some(3));
+
+    // A counted line-down consumes the count and moves a full 3-row visual
+    // step (clamped to the document end in this two-line fixture).
+    press_key(&mut f.app, tab, Code::KeyJ, "j", &mut seq);
+    assert_eq!(
+        pending_count(&f.app),
+        None,
+        "motion dispatch consumes the count"
+    );
+    let snapshot = f.app.editor_interaction_snapshot(tab).unwrap();
+    assert_eq!(
+        snapshot.selection,
+        (22, 22),
+        "counted motion clamps at document end"
+    );
+
+    // The count is gone, so a plain `j` is a single motion (already at the
+    // last position: stays put, no multiplication).
+    press_key(&mut f.app, tab, Code::KeyJ, "j", &mut seq);
+    let snapshot = f.app.editor_interaction_snapshot(tab).unwrap();
+    assert_eq!(snapshot.selection, (22, 22));
+}
+
+#[test]
+fn unbound_key_clears_a_pending_count() {
+    use iced::keyboard::key::Code;
+    let (mut f, tab) = fixture(3123);
+    selection(&mut f.app, tab, 0, 0);
+    run(&mut f.app, tab, Command::Toggle);
+    let mut seq = f.app.workspace.tab(&tab).unwrap().interaction().sequence;
+    press_key(&mut f.app, tab, Code::Digit5, "5", &mut seq);
+    assert_eq!(pending_count(&f.app), Some(5));
+    // `Q` is root-free (FEUX-0004 §6): an unbound key clears the count.
+    press_key(&mut f.app, tab, Code::KeyQ, "q", &mut seq);
+    assert_eq!(pending_count(&f.app), None);
+}
+
+#[test]
+fn repeat_replays_change_with_typed_text() {
+    use iced::keyboard::key::Code;
+    let (mut f, tab) = fixture(3124);
+    // "one café\nsecond line\n"
+    selection(&mut f.app, tab, 0, 0);
+    run(&mut f.app, tab, Command::Toggle);
+
+    // Change the first word and type a replacement run.
+    selection(&mut f.app, tab, 4, 9); // "café"
+    run(&mut f.app, tab, Command::Change);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
+    type_text(&mut f.app, tab, "XYZ");
+    run(&mut f.app, tab, Command::Escape);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Command);
+
+    // The register holds the change record with its run text.
+    let record = f
+        .app
+        .context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.repeat_last().cloned())
+        .expect("change recorded");
+    assert_eq!(record.command_id, "editor.change");
+    assert_eq!(
+        record.args.get("typed_text").map(String::as_str),
+        Some("XYZ")
+    );
+
+    // Replay against a different selection: the text is inserted at the new
+    // carets (E-5 re-targeting). The first change shortened line 1, so the
+    // second word now starts after "one XYZ\n"; resolve its span live.
+    let text_before = f.app.note_editor_view(tab).unwrap().text.clone();
+    let second_start = text_before.find("second").expect("second word");
+    selection(&mut f.app, tab, second_start, second_start + "second".len());
+    let mut seq = f.app.workspace.tab(&tab).unwrap().interaction().sequence;
+    press_key(&mut f.app, tab, Code::Period, ".", &mut seq);
+    assert_eq!(
+        f.app.note_editor_view(tab).unwrap().text.as_ref(),
+        "one XYZ\nXYZ line\n"
+    );
+
+    // The register is unchanged by replay: `.` stays idempotent.
+    let record = f
+        .app
+        .context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.repeat_last().cloned())
+        .expect("change still recorded");
+    assert_eq!(record.command_id, "editor.change");
+}
+
 #[path = "../../flavite-api/tests/support/editor_operations.rs"]
 mod editor_operations_fixture;

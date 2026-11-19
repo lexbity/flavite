@@ -239,37 +239,47 @@ pub fn number_str<'a>(text: &'a str, scan_result: &NumberScanResult) -> &'a str 
     &text[scan_result.start..scan_result.end]
 }
 
-/// Extract the first integer from a string.
-/// Used for numeric sorting of lines.
+/// Extract the first integer from a string (E-8 numeric sort key).
+/// The first integer is the leftmost maximal run `[+-]?[0-9]+` anywhere in
+/// the line (sign adjacent only), matching the E-9 scanner's sign rules.
+/// Lines without an integer yield `None`.
 #[must_use]
 pub fn extract_first_number(line: &str) -> Option<i64> {
-    let mut chars = line.chars();
-    let mut sign = 1i64;
-
-    if let Some(c) = chars.clone().next() {
-        if c == '+' {
-            chars.next();
-        } else if c == '-' {
-            sign = -1;
-            chars.next();
-        }
-    }
-
-    let mut digits: String = String::new();
-    for c in chars {
-        if c.is_ascii_digit() {
-            digits.push(c);
+    let bytes = line.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let c = bytes[pos];
+        if c == b'+' || c == b'-' {
+            if pos + 1 < bytes.len() && bytes[pos + 1].is_ascii_digit() {
+                let sign = if c == b'-' { -1i64 } else { 1i64 };
+                let mut digits = String::new();
+                for ch in line[pos + 1..].chars() {
+                    if ch.is_ascii_digit() {
+                        digits.push(ch);
+                    } else {
+                        break;
+                    }
+                }
+                let num: i64 = digits.parse().unwrap_or(0);
+                return Some(sign * num);
+            }
+            pos += 1;
+        } else if c.is_ascii_digit() {
+            let mut digits = String::new();
+            for ch in line[pos..].chars() {
+                if ch.is_ascii_digit() {
+                    digits.push(ch);
+                } else {
+                    break;
+                }
+            }
+            let num: i64 = digits.parse().unwrap_or(0);
+            return Some(num);
         } else {
-            break;
+            pos += 1;
         }
     }
-
-    if digits.is_empty() {
-        None
-    } else {
-        let num: i64 = digits.parse().unwrap_or(0);
-        Some(sign * num)
-    }
+    None
 }
 
 #[cfg(test)]

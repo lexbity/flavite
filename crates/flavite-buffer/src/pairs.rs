@@ -200,6 +200,13 @@ fn is_escaped(text: &str, pos: usize) -> bool {
 }
 
 /// Find enclosing nesting pair (parentheses, braces, brackets, angle brackets).
+///
+/// §5.5: walk left from `member.start` collecting open delimiters at depth 0
+/// (closes count +1), and right from `member.end` collecting closes at depth
+/// 0 (opens count +1). The innermost valid pair is the nearest open/close
+/// candidate pair whose interval is balanced; a pair whose delimiters are
+/// inside the member (or that crosses sibling pairs) fails the interval
+/// check and is not reported — mismatch is a refusal, never a silent match.
 fn find_enclosing_nesting_pair(text: &str, member: &Selection, pair: &Pair) -> Option<PairMatch> {
     let open_char = pair.open;
     let close_char = pair.close;
@@ -207,57 +214,75 @@ fn find_enclosing_nesting_pair(text: &str, member: &Selection, pair: &Pair) -> O
     let member_start = member.start();
     let member_end = member.end();
 
-    // Scan backward from member start to find opening delimiter at depth 0
-    let mut depth = 0;
-    let mut open_pos: Option<usize> = None;
-
-    for pos in (0..=member_start).rev() {
-        let c = bytes[pos] as char;
-        if c == close_char {
-            depth += 1;
-        } else if c == open_char {
-            if depth == 0 {
-                open_pos = Some(pos);
-                break;
+    // Candidate opens: nearest-first (ascending by position) at depth 0 when
+    // walking left strictly below member.start.
+    let mut open_candidates: Vec<usize> = Vec::new();
+    let mut balance = 0i32;
+    let mut pos = member_start;
+    while pos > 0 {
+        pos -= 1;
+        if bytes[pos] as char == close_char {
+            balance += 1;
+        } else if bytes[pos] as char == open_char {
+            if balance == 0 {
+                open_candidates.push(pos);
             } else {
-                depth -= 1;
+                balance -= 1;
             }
         }
     }
 
-    let open_pos = open_pos?;
-
-    // Scan forward from member end to find matching close at depth 0
-    let mut depth = 0;
-    let mut close_pos: Option<usize> = None;
-
-    for (pos, &byte) in bytes
-        .iter()
-        .enumerate()
-        .skip(member_end)
-        .take(text.len() - member_end)
-    {
-        let c = byte as char;
-        if c == open_char {
-            depth += 1;
-        } else if c == close_char {
-            if depth == 0 {
-                close_pos = Some(pos);
-                break;
+    // Candidate closes: nearest-first at depth 0 when walking right from
+    // member.end (inclusive of the boundary position).
+    let mut close_candidates: Vec<usize> = Vec::new();
+    let mut balance = 0i32;
+    let mut pos = member_end;
+    while pos < bytes.len() {
+        if bytes[pos] as char == open_char {
+            balance += 1;
+        } else if bytes[pos] as char == close_char {
+            if balance == 0 {
+                close_candidates.push(pos);
             } else {
-                depth -= 1;
+                balance -= 1;
+            }
+        }
+        pos += 1;
+    }
+
+    // A candidate pair is valid iff its interior [open+1, close) is balanced:
+    // net zero opens/closes with a non-negative prefix (no unclosed opens and
+    // no closes that would close an earlier sibling).
+    for &open_pos in &open_candidates {
+        for &close_pos in &close_candidates {
+            if close_pos <= open_pos {
+                continue;
+            }
+            let mut net = 0i32;
+            let mut valid = true;
+            for &b in &bytes[open_pos + 1..close_pos] {
+                if b as char == open_char {
+                    net += 1;
+                } else if b as char == close_char {
+                    net -= 1;
+                    if net < 0 {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid && net == 0 {
+                return Some(PairMatch {
+                    open_start: open_pos,
+                    open_end: open_pos + open_char.len_utf8(),
+                    close_start: close_pos,
+                    close_end: close_pos + close_char.len_utf8(),
+                });
             }
         }
     }
 
-    let close_pos = close_pos?;
-
-    Some(PairMatch {
-        open_start: open_pos,
-        open_end: open_pos + open_char.len_utf8(),
-        close_start: close_pos,
-        close_end: close_pos + close_char.len_utf8(),
-    })
+    None
 }
 
 /// Validation result for surround operations across multiple selections.
@@ -346,36 +371,42 @@ mod tests {
         assert!(Pair::from_open('x').is_none());
     }
 
-    // TODO: Fix innermost test - algorithm issue
     #[test]
-    #[ignore]
     fn nesting_pair_finds_innermost() {
         let text = "(outer (inner) outer)";
-        let set = set_of(text, 7..12); // "inner"
+        let set = set_of(text, 8..13); // "inner" without its delimiters
         let member = set.iter().next().unwrap();
         let pair = Pair::from_open('(').unwrap();
         let result = find_enclosing_pair(text, member, &pair);
         assert!(result.is_some());
         let match_ = result.unwrap();
         assert_eq!(match_.open_start, 7);
-        assert_eq!(match_.close_start, 12);
+        assert_eq!(match_.close_start, 13);
     }
 
-    // TODO: Fix innermost when whole text test - algorithm issue
     #[test]
-    #[ignore]
-    fn nesting_pair_finds_innermost_when_whole_text() {
-        // When the member spans the entire text, we still find the innermost pair
-        // because that's what the spec (E-7) requires
+    fn whole_text_member_has_no_enclosing_pair() {
+        // §5.5 scans strictly outward from the member's range; a member
+        // covering the whole buffer has nothing outside it, so the pairing
+        // is NotFound (the delimiters are inside the member, not enclosing).
         let text = "(outer (inner) outer)";
         let set = set_of(text, 0..text.len()); // whole text
         let member = set.iter().next().unwrap();
         let pair = Pair::from_open('(').unwrap();
         let result = find_enclosing_pair(text, member, &pair);
-        assert!(result.is_some());
-        let match_ = result.unwrap();
-        assert_eq!(match_.open_start, 7);
-        assert_eq!(match_.close_start, 12);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn member_including_delimiters_has_no_enclosing_pair() {
+        // A member that already contains its delimiters is not enclosed; the
+        // scan is outward-only (E-7), so "(first)" selected whole refuses.
+        let text = "(first)";
+        let set = set_of(text, 0..7);
+        let member = set.iter().next().unwrap();
+        let pair = Pair::from_open('(').unwrap();
+        let result = find_enclosing_pair(text, member, &pair);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -411,40 +442,59 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // TODO: Fix angle bracket pair matching - the test assumes HTML-style tags
-    // which require language-aware parsing. For now, skip this test.
     #[test]
-    #[ignore]
     fn angle_brackets_work() {
-        let text = "<tag>content</tag>";
-        let set = set_of(text, 5..12); // "content"
+        // Properly nested angle brackets: the innermost enclosing pair around
+        // "b" is the (4, 8) pair.
+        let text = "< a < b > c >";
+        let set = set_of(text, 6..7); // "b"
         let member = set.iter().next().unwrap();
         let pair = Pair::from_open('<').unwrap();
         let result = find_enclosing_pair(text, member, &pair);
         assert!(result.is_some());
         let match_ = result.unwrap();
-        assert_eq!(match_.open_start, 0);
-        assert_eq!(match_.close_start, 17);
+        assert_eq!(match_.open_start, 4);
+        assert_eq!(match_.close_start, 8);
     }
 
-    // TODO: Fix mixed pairs test - needs investigation
     #[test]
-    #[ignore]
+    fn sibling_angle_brackets_are_not_nested() {
+        // "<tag>content</tag>" is two sibling pairs, not nesting; a member
+        // between them has no enclosing bracket pair (E-7 refusal, never a
+        // silent cross-pair match).
+        let text = "<tag>content</tag>";
+        let set = set_of(text, 5..12); // "content"
+        let member = set.iter().next().unwrap();
+        let pair = Pair::from_open('<').unwrap();
+        let result = find_enclosing_pair(text, member, &pair);
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn mixed_pairs_independently() {
+        // Each pair type resolves its own innermost enclosing pair around the
+        // same member, independently of the other bracket types nearby.
         let text = "{ [ ( ) ] }";
-        // Test each pair type
-        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+        let set = set_of(text, 5..6); // the space between ( and )
+        let member = set.iter().next().unwrap();
+        for (open, close, open_at, close_at) in [
+            ('(', ')', 4usize, 6usize),
+            ('[', ']', 2, 8),
+            ('{', '}', 0, 10),
+        ] {
             let pair = Pair::from_open(open).unwrap();
-            let set = set_of(text, 0..text.len());
-            let member = set.iter().next().unwrap();
             let result = find_enclosing_pair(text, member, &pair);
-            assert!(result.is_some(), "Should find pair for {open}{close}");
+            assert!(
+                result.is_some(),
+                "Should find pair for {open}{close} around the member"
+            );
+            let match_ = result.unwrap();
+            assert_eq!(match_.open_start, open_at, "open for {open}");
+            assert_eq!(match_.close_start, close_at, "close for {close}");
         }
     }
 
-    // TODO: Fix validate tests - needs investigation
     #[test]
-    #[ignore]
     fn validate_all_have_pairs() {
         let text = "(first) (second)";
         let set = SelectionSet::normalize(
@@ -452,12 +502,12 @@ mod tests {
             vec![
                 RawSelection {
                     id: None,
-                    anchor: 0,
-                    head: 7,
+                    anchor: 1,
+                    head: 6,
                 },
                 RawSelection {
                     id: None,
-                    anchor: 8,
+                    anchor: 9,
                     head: 15,
                 },
             ],
@@ -471,7 +521,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn validate_missing_pairs() {
         let text = "(first) second";
         let set = SelectionSet::normalize(
@@ -479,8 +528,8 @@ mod tests {
             vec![
                 RawSelection {
                     id: None,
-                    anchor: 0,
-                    head: 7,
+                    anchor: 1,
+                    head: 6,
                 },
                 RawSelection {
                     id: None,
@@ -500,19 +549,18 @@ mod tests {
         ));
     }
 
-    // TODO: Fix escaped quotes test - needs investigation
     #[test]
-    #[ignore]
     fn escaped_quotes_not_counted() {
-        let text = "\"\\\"escaped\\\"\""; // "\"escaped\""
-        let set = set_of(text, 4..11); // "escaped"
+        let text = "\"\\\"escaped\\\"\"";
+        // bytes: 0 '"' 1 '\\' 2 '"' 3..10 "escaped" 10 '\\' 11 '"' 12 '"'
+        let set = set_of(text, 3..10); // "escaped"
         let member = set.iter().next().unwrap();
         let pair = Pair::from_open('"').unwrap();
         let result = find_enclosing_pair(text, member, &pair);
-        // The outer quotes should match
+        // The outer quotes should match; the escaped inner quotes are skipped.
         assert!(result.is_some());
         let match_ = result.unwrap();
         assert_eq!(match_.open_start, 0);
-        assert_eq!(match_.close_start, 16);
+        assert_eq!(match_.close_start, 12);
     }
 }

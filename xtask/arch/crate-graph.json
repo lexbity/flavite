@@ -290,6 +290,11 @@
       "kind": "normal"
     },
     {
+      "from": "flavite-cli",
+      "to": "zip",
+      "kind": "dev"
+    },
+    {
       "from": "flavite-edit-context",
       "to": "flavite-buffer",
       "kind": "normal"

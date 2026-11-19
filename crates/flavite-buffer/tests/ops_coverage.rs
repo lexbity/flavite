@@ -6,7 +6,7 @@
 //! as integration tests so they count in the full-workspace instrumented
 //! run (`just ci-extras-coverage`).
 
-use flavite_buffer::commands::{EditOperation, plan};
+use flavite_buffer::commands::{EditOperation, PlanError, plan};
 use flavite_buffer::indent::{
     Unit, conversion_would_change, dedent_amount, dedent_step, detect_unit, is_blank_or_ws,
     is_whitespace_only, leading_whitespace, spaces_to_tabs_line, tabs_to_spaces_line,
@@ -83,6 +83,20 @@ fn plan_lines_sort_asc_desc_numeric() {
 }
 
 #[test]
+fn plan_lines_sort_numeric_scans_whole_line() {
+    // E-8: the numeric key is the first integer found anywhere in the line
+    // (sign-aware), not just a line-leading integer.
+    let nums = "item 10\nitem 2\nitem 30\n";
+    let set = set_of(nums, 0..nums.len());
+    let numeric = plan(nums, &set, &EditOperation::LinesSortNumeric).unwrap();
+    assert_eq!(numeric.after_text, "item 2\nitem 10\nitem 30\n");
+    let signed = "x -5\ny +3\nz 1\n";
+    let set = set_of(signed, 0..signed.len());
+    let numeric = plan(signed, &set, &EditOperation::LinesSortNumeric).unwrap();
+    assert_eq!(numeric.after_text, "x -5\nz 1\ny +3\n");
+}
+
+#[test]
 fn plan_lines_join_duplicate_dedupe() {
     let text = "a\nb\nc\n";
     let set = set_of(text, 0..text.len());
@@ -114,10 +128,64 @@ fn plan_lines_move_up_down() {
     let text = "a\nb\nc\n";
     let set = set_of(text, 2..3); // "b"
     let up = plan(text, &set, &EditOperation::LinesMoveUp).unwrap();
-    assert_eq!(up.after_text, "a\nb\nc\n");
+    assert_eq!(up.after_text, "b\na\nc\n");
     let set = set_of(text, 2..3);
     let down = plan(text, &set, &EditOperation::LinesMoveDown).unwrap();
     assert_eq!(down.after_text, "a\nc\nb\n");
+}
+
+#[test]
+fn plan_lines_move_up_clamps_first_line_with_refusal() {
+    let text = "a\nb\nc\n";
+    let set = set_of(text, 0..1); // first line
+    let result = plan(text, &set, &EditOperation::LinesMoveUp);
+    assert!(matches!(result, Err(PlanError::MoveClamp)));
+}
+
+#[test]
+fn plan_lines_move_down_clamps_last_line_with_refusal() {
+    let text = "a\nb\nc\n";
+    let set = set_of(text, 4..5); // last line
+    let result = plan(text, &set, &EditOperation::LinesMoveDown);
+    assert!(matches!(result, Err(PlanError::MoveClamp)));
+}
+
+#[test]
+fn plan_lines_move_up_refuses_overlapping_targets() {
+    // Two adjacent selected blocks (lines 3 and 4): moving both up sends the
+    // upper block's target into nothing, but the lower block's target IS the
+    // upper block (E-8 §5.7 overlap precheck refuses whole).
+    let text = "w\nx\na\nb\ny\nz\n";
+    let set = multi_set(
+        text,
+        &[[1, 4, 6], [2, 6, 8]], // "a\n" and "b\n"
+    );
+    let result = plan(text, &set, &EditOperation::LinesMoveUp);
+    assert!(matches!(result, Err(PlanError::MoveOverlap)));
+}
+
+#[test]
+fn plan_lines_move_down_refuses_overlapping_targets() {
+    let text = "w\nx\na\nb\ny\nz\n";
+    let set = multi_set(
+        text,
+        &[[1, 4, 6], [2, 6, 8]], // "a\n" and "b\n"
+    );
+    let result = plan(text, &set, &EditOperation::LinesMoveDown);
+    assert!(matches!(result, Err(PlanError::MoveOverlap)));
+}
+
+#[test]
+fn plan_lines_move_multiple_disjoint_blocks() {
+    // Two disjoint blocks (lines 1 and 3) move up independently; the swap
+    // pairs do not intersect, so the batch composes.
+    let text = "a\nb\nc\nd\ne\n";
+    let set = multi_set(
+        text,
+        &[[1, 2, 4], [2, 6, 8]], // "b\n" and "d\n"
+    );
+    let moved = plan(text, &set, &EditOperation::LinesMoveUp).unwrap();
+    assert_eq!(moved.after_text, "b\na\nd\nc\ne\n");
 }
 
 #[test]
@@ -299,6 +367,23 @@ fn plan_case_title_and_swap() {
     assert_eq!(title.after_text, "Hello Hello\n");
     let swap = plan(text, &set, &EditOperation::CaseSwap).unwrap();
     assert_eq!(swap.after_text, "HELLO HellO\n");
+}
+
+#[test]
+fn plan_case_title_uses_uax29_word_boundaries() {
+    // E-10: apostrophes stay inside their word (UAX #29 MidLetter); the
+    // hyphen is a word boundary, so hyphenated parts title independently;
+    // uncased chars pass through.
+    let text = "\"café's\" well-known 123 雪\n";
+    let set = set_of(text, 0..text.len());
+    let title = plan(text, &set, &EditOperation::CaseTitle).unwrap();
+    assert_eq!(title.after_text, "\"Café's\" Well-Known 123 雪\n");
+    // A lowercase run whose first cased char is a MID-word letter still
+    // uppercases only the word's first cased char.
+    let text = "one TWO three\n";
+    let set = set_of(text, 0..text.len());
+    let title = plan(text, &set, &EditOperation::CaseTitle).unwrap();
+    assert_eq!(title.after_text, "One Two Three\n");
 }
 
 // ---------------------------------------------------------------------------

@@ -240,6 +240,11 @@ pub enum Event {
     /// The host pre-classifies digits before keymap lookup; this event carries
     /// the resolved digit value for the statechart to accumulate.
     CountDigit(u32),
+    /// The count is consumed by a dispatch the statechart does not see
+    /// (FEUX-0004 E-4: motions route through the native path; unbound and
+    /// stale refusals consume too). Clearing is a side-effect-free event so
+    /// the host can consume without fabricating a `RunAdmitted`.
+    ClearCount,
 }
 
 /// Pure outcomes the host interprets against the app.
@@ -595,7 +600,9 @@ pub fn reduce(
             // - A digit that would exceed the cap refuses with the cap named and clears
             let current = state.count.unwrap_or(0);
             let new_count = if current == 0 && *d == 0 {
-                // Leading 0 is not a count - treat as unbound
+                // Leading 0 is not a count - it dispatches as an unbound key
+                // notice (E-4), exactly like the host's unbound path.
+                state.set_message(ContextState::UNBOUND, false);
                 None
             } else {
                 let next = current * 10 + d;
@@ -608,6 +615,12 @@ pub fn reduce(
                 }
             };
             state.set_count(new_count);
+            Vec::new()
+        }
+        Event::ClearCount => {
+            // FEUX-0004 E-4: a dispatch path outside the statechart consumed
+            // the count (native motions, unbound/refused dispatches).
+            state.clear_count();
             Vec::new()
         }
     }
@@ -992,10 +1005,24 @@ mod tests {
 
     #[test]
     fn count_digit_leading_zero_is_not_a_count() {
-        // Leading 0 is not a count - should stay None
+        // Leading 0 is not a count - should stay None and surface the
+        // unbound-key notice (E-4).
         let mut state = ContextState::activated();
         let _ = r(&mut state, &Event::CountDigit(0), 0, false);
         assert_eq!(state.count(), None);
+        assert_eq!(state.message(), (ContextState::UNBOUND, false));
+    }
+
+    #[test]
+    fn clear_count_event_clears_without_side_effects() {
+        let mut state = ContextState::activated();
+        let _ = r(&mut state, &Event::CountDigit(7), 0, false);
+        assert_eq!(state.count(), Some(7));
+        let effects = r(&mut state, &Event::ClearCount, 0, false);
+        assert!(effects.is_empty());
+        assert_eq!(state.count(), None);
+        // No message is set by clearing.
+        assert_ne!(state.message(), (COUNT_CAP_REFUSAL, true));
     }
 
     #[test]

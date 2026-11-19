@@ -4,6 +4,7 @@ use crate::{
     app::{App, Message},
     host::{note_search, reading},
 };
+use flavite_edit_context::ContextMode;
 use flavite_editor::{
     input::{CapturedInput, PreparedInput},
     keymap::KeyAction,
@@ -585,6 +586,23 @@ fn handle_inner(
         }
         app.workspace.invalidate_writing_target(view.buffer_id);
         app.linking.invalidate_if_source_changed(None);
+        // FEUX-0004 X05: accumulate typing-run text for `.` repeat (E-5).
+        // Insert/newline apply in typing mode is the run's raw material; the
+        // accumulated run is recorded at group seal by the context host.
+        if matches!(input.action, KeyAction::Insert | KeyAction::Newline)
+            && app.context_mode.mode(tab) == ContextMode::Typing
+        {
+            let text = if input.action == KeyAction::Newline {
+                "\n".to_string()
+            } else {
+                input.text.clone()
+            };
+            if let Some(session) = &mut app.context_mode.session
+                && let Some((_, accumulated)) = &mut session.typing_record
+            {
+                accumulated.push_str(&text);
+            }
+        }
     }
     let Some(current) = app.note_editor_view(tab) else {
         return iced::Task::none();

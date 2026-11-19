@@ -22,14 +22,28 @@ fn count_digit_sequence_builds_count() {
 fn count_leading_zero_is_ignored() {
     let mut state = ContextState::activated();
 
-    // Leading 0 should not start a count
+    // Leading 0 should not start a count, and surfaces the unbound notice
     let _ = reduce(&mut state, &Event::CountDigit(0), 0, false);
     assert_eq!(state.count(), None);
+    assert_eq!(
+        state.message(),
+        (flavite_edit_context::ContextState::UNBOUND, false)
+    );
 
     // 0 after a digit should extend the count
     let _ = reduce(&mut state, &Event::CountDigit(1), 0, false);
     let _ = reduce(&mut state, &Event::CountDigit(0), 0, false);
     assert_eq!(state.count(), Some(10));
+}
+
+#[test]
+fn clear_count_event_consumes_pending_count() {
+    let mut state = ContextState::activated();
+    let _ = reduce(&mut state, &Event::CountDigit(3), 0, false);
+    assert_eq!(state.count(), Some(3));
+
+    let _ = reduce(&mut state, &Event::ClearCount, 0, false);
+    assert_eq!(state.count(), None);
 }
 
 #[test]

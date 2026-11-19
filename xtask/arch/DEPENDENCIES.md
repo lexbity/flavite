@@ -81,6 +81,10 @@ Normal/build:
 - `flavite-settings` (normal)
 - `tracing` (normal)
 
+Dev-only:
+
+- `zip`
+
 ### `flavite-edit-context`
 
 Normal/build:
@@ -253,7 +257,7 @@ Normal/build:
 - `tantivy` ← flavite-index, xtask
 - `tracing` ← flavite-api, flavite-cli, flavite-index, flavite-vault
 - `tree-sitter` ← flavite-syntax
-- `zip` ← flavite-api, flavite-theme, flavite-ui
+- `zip` ← flavite-api, flavite-cli, flavite-theme, flavite-ui
 - `zstd` ← flavite-vault
 
 ## Layering rules (§10.2)
@@ -276,6 +280,4 @@ Temporary floor waivers (must have a valid expiry and reason):
 
 | Crate | Temporary floor | Expires | Reason |
 |---|---:|---|---|
-| flavite-fs | 86.8% | 2026-11-30 | Platform-specific filesystem failure branches remain uncovered in the Linux report; add portable FaultFs cases before expiry. |
-| flavite-index | 87.5% | 2026-11-30 | Index actor error and cache-recovery branches remain uncovered; raise the floor after the next index fault-path test slice. |
 | flavite-vault | 84.4% | 2026-11-30 | Actor shutdown and uncommon journal-recovery branches remain uncovered; add deterministic fault cases before expiry. |
