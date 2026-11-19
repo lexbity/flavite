@@ -226,6 +226,7 @@ mod tests {
             text: "one café\n雪 three".into(),
             path: "note.md".into(),
             state: flavite_buffer::state::BufferState::Clean,
+            last_edit: None,
         }
     }
 

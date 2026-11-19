@@ -294,6 +294,26 @@ pub struct SharedBufferSnapshot {
     pub path: PathBuf,
     /// Authoritative save-format descriptor of this revision (§6.10).
     pub source_format: flavite_encoding::SourceFormat,
+    /// Single-edit changed-range hint (RFC-0008 D1/S7), computed from the
+    /// applied transition and frozen with this revision. `None` for
+    /// external reloads, merges, journal patches, first open, and multi-op
+    /// batches.
+    pub last_edit: Option<flavite_syntax::EditRange>,
+}
+
+/// Compute the single-edit changed-range hint from a transition's ops
+/// (RFC-0008 D1/S7): exactly one op yields a hint; multi-op batches
+/// (replace-all, task toggles) yield `None`.
+fn last_edit_hint(ops: &[flavite_buffer::undo::EditOp]) -> Option<flavite_syntax::EditRange> {
+    let op = ops.first()?;
+    if ops.len() != 1 {
+        return None;
+    }
+    Some(flavite_syntax::EditRange {
+        start: op.range.start.0,
+        old_end: op.range.end.0,
+        new_end: op.range.start.0 + op.replacement.len(),
+    })
 }
 
 /// Failure while acquiring an immutable buffer snapshot.
@@ -304,6 +324,17 @@ pub enum BufferSnapshotError {
     #[error("stale revision: expected {expected}, current {actual}")]
     Stale { expected: u64, actual: u64 },
 }
+
+/// Revision-keyed shared snapshot cache: per open buffer, the latest
+/// (revision, text, last-edit hint) triple (RFC-0008 D1/S7).
+type SharedSnapshotCache = HashMap<
+    BufferId,
+    (
+        Revision,
+        std::sync::Arc<str>,
+        Option<flavite_syntax::EditRange>,
+    ),
+>;
 
 /// Commands that can be executed by the Session.
 #[derive(Debug, Clone)]
@@ -1127,7 +1158,11 @@ pub struct Session {
     /// Latest immutable text snapshot per open buffer. Views/workers retain
     /// older revisions through Arc while the cache itself remains bounded to
     /// one revision per buffer.
-    shared_snapshots: Mutex<HashMap<BufferId, (Revision, std::sync::Arc<str>)>>,
+    /// Revision-keyed shared text cache, plus the single-edit changed-range
+    /// hint (`last_edit`, RFC-0008 D1/S7) frozen with the revision it
+    /// describes. `None` for external reloads, merges, journal patches,
+    /// first open, and multi-op batches.
+    shared_snapshots: Mutex<SharedSnapshotCache>,
     /// Autosave failures observed by the host pump.
     autosave_failures_total: AtomicU64,
     /// Save requests admitted by autosave, so asynchronous failures are counted too.
@@ -4450,10 +4485,11 @@ impl Session {
         }
         let mut cache = self.shared_snapshots.lock_recovering();
         Ok(match cache.get(&buffer_id) {
-            Some((cached, text)) if *cached == revision => text.clone(),
+            Some((cached, text, _)) if *cached == revision => text.clone(),
             _ => {
                 let text: std::sync::Arc<str> = buffer.text().to_owned().into();
-                cache.insert(buffer_id, (revision, text.clone()));
+                let hint = last_edit_hint(buffer.model().last_transition_ops());
+                cache.insert(buffer_id, (revision, text.clone(), hint));
                 text
             }
         })
@@ -6573,6 +6609,18 @@ impl Session {
         });
         let after_selections = after;
 
+        // RFC-0008 D1/S7: freeze the single-edit changed-range hint with the
+        // new revision. The model's `last_transition_ops` is only populated
+        // by undo/redo transitions, so forward applies derive the hint from
+        // the applied ops here (exactly one op → hint; multi-op batches →
+        // `None`). The cache serves every later view of this revision.
+        let hint = last_edit_hint(&ops);
+        {
+            let mut cache = self.shared_snapshots.lock_recovering();
+            let text: std::sync::Arc<str> = buffer.text().to_owned().into();
+            cache.insert(buffer_id, (new_revision, text, hint));
+        }
+
         SessionResult::Success(CommandResult::EditsApplied {
             buffer_id,
             new_revision,
@@ -7952,16 +8000,17 @@ impl Session {
             .cloned()
             .ok_or(BufferSnapshotError::NotFound(buffer_id.as_u64()))?;
         let current_revision = buffer.revision();
-        let text = {
+        let (text, last_edit) = {
             let mut cache = self.shared_snapshots.lock_recovering();
             match cache.get(&buffer_id) {
-                Some((cached_revision, text)) if *cached_revision == current_revision => {
-                    text.clone()
+                Some((cached_revision, text, hint)) if *cached_revision == current_revision => {
+                    (text.clone(), *hint)
                 }
                 _ => {
                     let text: std::sync::Arc<str> = buffer.text().to_owned().into();
-                    cache.insert(buffer_id, (current_revision, text.clone()));
-                    text
+                    let hint = last_edit_hint(buffer.model().last_transition_ops());
+                    cache.insert(buffer_id, (current_revision, text.clone(), hint));
+                    (text, hint)
                 }
             }
         };
@@ -7973,6 +8022,7 @@ impl Session {
             state: buffer.state(),
             path,
             source_format: buffer.model().source_format(),
+            last_edit,
         })
     }
 
@@ -10961,6 +11011,149 @@ mod tests {
                 .iter()
                 .all(|completion| completion.request_id != request_id),
             "a cancelled collection never delivers a completion"
+        );
+    }
+
+    /// Apply `ops` as one `ApplyEdits` turn and return the new revision.
+    fn apply_edits_turn(
+        session: &Session,
+        buffer_id: BufferId,
+        revision: Revision,
+        ops: Vec<EditOp>,
+    ) -> Revision {
+        match session.execute(SessionCommand::ApplyEdits {
+            buffer_id,
+            revision,
+            ops,
+            undo_policy: flavite_buffer::undo::UndoPolicy::Typing,
+            editor: None,
+            operation: session
+                .issue_editor_operation(buffer_id, revision, None)
+                .expect("fixture activation"),
+            unit: None,
+        }) {
+            SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
+                new_revision
+            }
+            result => panic!("edit failed: {result:?}"),
+        }
+    }
+
+    /// Snapshot's `last_edit` must equal the hint derived from the model's
+    /// own transition ops (the rule the cache fill uses for undo/redo
+    /// transitions, which populate `last_transition_ops`).
+    fn assert_snapshot_hint_matches_model(
+        session: &Session,
+        buffer_id: BufferId,
+        revision: Revision,
+    ) {
+        let snapshot = session
+            .shared_buffer_snapshot(buffer_id, Some(revision))
+            .unwrap();
+        let ops = {
+            let manager_arc = session.buffer_manager();
+            let manager = manager_arc.lock().unwrap();
+            manager
+                .get_buffer_by_id(buffer_id)
+                .unwrap()
+                .model()
+                .last_transition_ops()
+                .to_vec()
+        };
+        assert_eq!(
+            snapshot.last_edit,
+            last_edit_hint(&ops),
+            "snapshot hint must match the model's last transition ops"
+        );
+    }
+
+    /// S7-T1: the revision-keyed snapshot hint is `None` on first open
+    /// (no transition), `Some` after a single edit and after undo/redo
+    /// (single merged op), and `None` for multi-op batches.
+    #[test]
+    fn shared_snapshot_last_edit_follows_transition_ops() {
+        let (session, _fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/note.md");
+        let (buffer_id, revision) = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            result => panic!("open failed: {result:?}"),
+        };
+
+        // First open: no transition ops → no hint.
+        let snapshot = session
+            .shared_buffer_snapshot(buffer_id, Some(revision))
+            .unwrap();
+        assert_eq!(snapshot.last_edit, None);
+
+        // Single edit → one op → hint (forward applies are frozen by
+        // `apply_edits` from the applied ops).
+        let op = EditOp::new(Span::new(TextByte(2), TextByte(2)), "AB".into());
+        let edited = apply_edits_turn(&session, buffer_id, revision, vec![op]);
+        assert_eq!(
+            session
+                .shared_buffer_snapshot(buffer_id, Some(edited))
+                .unwrap()
+                .last_edit,
+            Some(flavite_syntax::EditRange {
+                start: 2,
+                old_end: 2,
+                new_end: 4,
+            })
+        );
+
+        // Undo → single reverted op → hint again.
+        let undone = match session.execute(SessionCommand::Undo {
+            buffer_id,
+            revision: edited,
+            operation: session
+                .issue_editor_operation(buffer_id, edited, None)
+                .expect("fixture activation"),
+        }) {
+            SessionResult::Success(CommandResult::UndoPerformed { new_revision, .. }) => {
+                new_revision
+            }
+            result => panic!("undo failed: {result:?}"),
+        };
+        assert_snapshot_hint_matches_model(&session, buffer_id, undone);
+        assert!(
+            session
+                .shared_buffer_snapshot(buffer_id, Some(undone))
+                .unwrap()
+                .last_edit
+                .is_some()
+        );
+
+        // Redo → single reapplied op → hint again.
+        let redone = match session.execute(SessionCommand::Redo {
+            buffer_id,
+            revision: undone,
+            operation: session
+                .issue_editor_operation(buffer_id, undone, None)
+                .expect("fixture activation"),
+        }) {
+            SessionResult::Success(CommandResult::RedoPerformed { new_revision, .. }) => {
+                new_revision
+            }
+            result => panic!("redo failed: {result:?}"),
+        };
+        assert_snapshot_hint_matches_model(&session, buffer_id, redone);
+
+        // Multi-op batch (replace-all shape) → no hint.
+        let batch = vec![
+            EditOp::new(Span::new(TextByte(0), TextByte(0)), "X".into()),
+            EditOp::new(Span::new(TextByte(1), TextByte(1)), "Y".into()),
+        ];
+        let batched = apply_edits_turn(&session, buffer_id, redone, batch);
+        assert_eq!(
+            session
+                .shared_buffer_snapshot(buffer_id, Some(batched))
+                .unwrap()
+                .last_edit,
+            None,
+            "multi-op batches must not produce a hint"
         );
     }
 }

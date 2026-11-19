@@ -65,26 +65,55 @@ pub fn scan_note(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
     let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
         return (Vec::new(), Vec::new());
     };
-    // The canonical parse already scanned every prose window. Reusing its
-    // tag/block spans avoids scanning the full note a second time and
-    // allocating duplicate link payloads that drawing never uses.
-    let mut decorations: Vec<_> = parsed
-        .tags
+    spans_from_parsed(parsed.links, parsed.tags, parsed.block_ids)
+}
+
+/// Scan links and decorations through the **tree-sitter** structure path
+/// (RFC-0008 S7, flag-on): spans replace `scan_note`'s output with the same
+/// types and scanner-shared semantics; the parity corpus proves byte-identical
+/// ranges and kinds (AC-5).
+#[must_use]
+pub fn scan_note_ts(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
+    let Ok(parsed) = flavite_syntax::ts_ranges::parse_note_ts(text.as_bytes()) else {
+        return (Vec::new(), Vec::new());
+    };
+    spans_from_ts(parsed)
+}
+
+/// Convert a tree-sitter parse into the widget's span views. Public so the
+/// widget can drive the structure engine (`StructureEngine::sync`) and
+/// convert its output without re-parsing.
+#[must_use]
+pub fn spans_from_ts(
+    parsed: flavite_syntax::ts_ranges::TsParsedNote,
+) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
+    spans_from_parsed(parsed.links, parsed.tags, parsed.block_ids)
+}
+
+/// Shared conversion from a canonical parse (either glue) into the widget's
+/// link and decoration views. The canonical parse already scanned every prose
+/// window; reusing its tag/block spans avoids scanning the full note a second
+/// time and allocating duplicate link payloads that drawing never uses.
+fn spans_from_parsed(
+    links: Vec<flavite_syntax::pulldown_glue::Link>,
+    tags: Vec<flavite_syntax::text::Span<flavite_syntax::text::TextByte>>,
+    block_ids: Vec<flavite_syntax::text::Span<flavite_syntax::text::TextByte>>,
+) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
+    let mut decorations: Vec<_> = tags
         .into_iter()
         .map(|span| ScannedSpan {
             span,
             kind: SpanKind::Tag,
             payload: None,
         })
-        .chain(parsed.block_ids.into_iter().map(|span| ScannedSpan {
+        .chain(block_ids.into_iter().map(|span| ScannedSpan {
             span,
             kind: SpanKind::BlockId,
             payload: None,
         }))
         .collect();
     decorations.sort_unstable_by_key(|span| span.span.start.0);
-    let links = parsed
-        .links
+    let links = links
         .into_iter()
         .map(|link| LinkSpan {
             span: link.span.start.0..link.span.end.0,

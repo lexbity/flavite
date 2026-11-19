@@ -625,6 +625,49 @@ impl<'a, Message> EditorWidget<'a, Message> {
     }
 }
 
+/// Documents at or above this size skip markdown structure parsing entirely
+/// (plain mode: no spans; RFC-0008 FR-9). Flag-independent; also the gate
+/// the paged-buffer RFC inherits.
+pub(crate) const HUGE_TEXT_THRESHOLD: usize = 64 * 1024 * 1024;
+
+/// Whether the tree-sitter structure path is enabled (`FLAVITE_TS_STRUCTURE=1`,
+/// RFC-0008 FR-8). Default OFF in stage B; flipped on after parity + review
+/// (stage C). Read per revision change — a getenv lookup, O(1), no
+/// allocation when unset; deliberately not cached in a `OnceLock` so tests
+/// can flip the flag deterministically between calls.
+fn ts_structure_enabled() -> bool {
+    std::env::var_os("FLAVITE_TS_STRUCTURE").is_some()
+}
+
+/// Produce the structure spans for a revision change (RFC-0008 S7):
+///
+/// * **Plain mode** (FR-9): documents ≥ [`HUGE_TEXT_THRESHOLD`] skip all
+///   markdown parsing — no pulldown, no tree-sitter, no spans. Editing,
+///   undo, find, and save are unaffected.
+/// * **Flag on**: the structure engine (D7-B), stage B full parse; the
+///   `hint` rides along for S8's incremental path.
+/// * **Flag off**: the shipped pulldown path ([`scan_note`]).
+///
+/// Pure in the inputs that matter, so tests can exercise every mode without
+/// touching process-global environment.
+fn structure_spans(
+    text: &str,
+    hint: Option<flavite_syntax::EditRange>,
+    ts_enabled: bool,
+    engine: &mut flavite_syntax::StructureEngine,
+) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
+    if text.len() >= HUGE_TEXT_THRESHOLD {
+        (Vec::new(), Vec::new())
+    } else if ts_enabled {
+        match engine.sync(text.as_bytes(), hint) {
+            Ok(parsed) => crate::links::spans_from_ts(parsed),
+            Err(_) => (Vec::new(), Vec::new()),
+        }
+    } else {
+        scan_note(text)
+    }
+}
+
 /// Widget-local interaction state. Text and mutations remain Session-owned.
 #[derive(Debug, Default)]
 pub struct EditorState {
@@ -633,6 +676,9 @@ pub struct EditorState {
     revision: Option<u64>,
     link_spans: Vec<LinkSpan>,
     decorations: Vec<flavite_syntax::ScannedSpan>,
+    /// Structure source (RFC-0008 D7-B): owned here, defined in
+    /// flavite-syntax — the widget never links tree-sitter directly.
+    structure: flavite_syntax::StructureEngine,
     /// Source line lookup shared by caret mapping and viewport extraction.
     line_starts: Vec<usize>,
     line_text_addr: usize,
@@ -1411,10 +1457,16 @@ impl EditorState {
         self.buffer_id = Some(view.buffer_id);
         if self.revision != Some(view.revision) {
             // RFC-0008 S1 (FR-10): the structure-parse phase (pulldown
-            // `scan_note` today; the tree-sitter path in S6–S8).
+            // `scan_note` today; the tree-sitter path behind the flag,
+            // S7/S8).
             let _scan_span =
                 tracing::info_span!("render.scan", doc_len = view.text.len()).entered();
-            let (link_spans, decorations) = scan_note(&view.text);
+            let (link_spans, decorations) = structure_spans(
+                &view.text,
+                view.last_edit,
+                ts_structure_enabled(),
+                &mut self.structure,
+            );
             self.link_spans = link_spans;
             self.decorations = decorations;
             self.line_starts.clear();
@@ -3377,6 +3429,7 @@ mod tests {
             text: text.into(),
             path: std::path::PathBuf::from("long.md"),
             state: BufferState::Clean,
+            last_edit: None,
         }
     }
 
@@ -3846,6 +3899,7 @@ mod tests {
             text: text.into(),
             path: std::path::PathBuf::from("source.md"),
             state: flavite_buffer::state::BufferState::Clean,
+            last_edit: None,
         };
         let action = link_action_at(&view, &spans, 4).expect("link activation");
         assert!(matches!(
@@ -4124,6 +4178,7 @@ mod tests {
             text: "long text".into(),
             path: std::path::PathBuf::from("one.md"),
             state: flavite_buffer::state::BufferState::Dirty,
+            last_edit: None,
         };
         let mut state = EditorState {
             buffer_id: Some(old.buffer_id),
@@ -4176,5 +4231,62 @@ mod tests {
         state.selections.replace_with(text, &[(0, 0)], 0);
         state.ensure_caret_visible(text);
         assert_eq!(state.viewport.first_line, 0);
+    }
+
+    /// S7-T3 (flag on/off): the structure-source selection returns identical
+    /// spans for the pulldown and tree-sitter paths on representative docs,
+    /// and the flag defaults off.
+    #[test]
+    fn structure_spans_flag_paths_agree_and_flag_defaults_off() {
+        // Default off without the env override.
+        if std::env::var_os("FLAVITE_TS_STRUCTURE").is_none() {
+            assert!(!ts_structure_enabled());
+        }
+
+        let docs = [
+            "# H [[link]] #tag ^block\n\nBody with ![[embed.png]] and `[[code]]`.\n",
+            "- item [[a]]\n- [x] task #t\n\n| [[c]] | d |\n|---|---|\n| e | [[f]] |\n",
+            "> quote [[q]]\n\n```\n[[fenced]]\n```\n",
+        ];
+        for doc in docs {
+            let mut engine = flavite_syntax::StructureEngine::new();
+            let off = structure_spans(doc, None, false, &mut engine);
+            let mut engine = flavite_syntax::StructureEngine::new();
+            let on = structure_spans(doc, None, true, &mut engine);
+            assert_eq!(
+                on, off,
+                "flag-on structure spans must equal pulldown: {doc}"
+            );
+            assert!(!off.0.is_empty(), "doc must yield links: {doc}");
+        }
+    }
+
+    /// S7-T4 (plain mode): ≥ 64 MiB documents yield zero spans on both
+    /// paths even when the text is full of links; the same content below the
+    /// threshold yields spans, proving the gate — not the parser — is what
+    /// emptied the result.
+    #[test]
+    fn structure_spans_plain_mode_gates_huge_documents() {
+        let mut huge = String::with_capacity(HUGE_TEXT_THRESHOLD + 1024);
+        while huge.len() < HUGE_TEXT_THRESHOLD {
+            huge.push_str("[[link]] #tag ^block\n");
+        }
+        assert!(huge.len() >= HUGE_TEXT_THRESHOLD);
+
+        for ts_enabled in [false, true] {
+            let mut engine = flavite_syntax::StructureEngine::new();
+            let spans = structure_spans(&huge, None, ts_enabled, &mut engine);
+            assert!(
+                spans.0.is_empty() && spans.1.is_empty(),
+                "plain mode must yield zero spans (ts_enabled={ts_enabled})"
+            );
+        }
+
+        // Same content below the threshold does produce spans — the gate is
+        // length, not content.
+        let small = &huge[..HUGE_TEXT_THRESHOLD - 1_000_000];
+        let mut engine = flavite_syntax::StructureEngine::new();
+        let spans = structure_spans(small, None, false, &mut engine);
+        assert!(!spans.0.is_empty() && !spans.1.is_empty());
     }
 }

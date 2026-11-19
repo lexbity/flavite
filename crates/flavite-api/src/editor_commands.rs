@@ -1241,19 +1241,10 @@ pub struct EditorAddCaretsArgs {
 
 fn handle_add_carets(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let args: EditorAddCaretsArgs = decode(invocation)?;
-    eprintln!("[add_carets] positions={:?}", args.positions);
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
     let set = normalize_set(&snapshot.text, &args.selections)?;
     let merged = flavite_buffer::selection::add_carets(&snapshot.text, &set, &args.positions)
         .map_err(|error| error.to_string())?;
-    eprintln!(
-        "[add_carets] merged={:?}",
-        merged
-            .members()
-            .iter()
-            .map(|m| (m.start(), m.end()))
-            .collect::<Vec<_>>()
-    );
     Ok(selections_changed(args.buffer_id, args.revision, &merged))
 }
 

@@ -336,6 +336,7 @@ fn nfr_latency_bench_at_rising_cardinality() {
         text: std::sync::Arc::from(doc.as_str()),
         path: "bench.md".into(),
         state: flavite_buffer::state::BufferState::Clean,
+        last_edit: None,
     };
     let raw: Vec<flavite_buffer::selection::RawSelection> =
         vec![flavite_buffer::selection::RawSelection {

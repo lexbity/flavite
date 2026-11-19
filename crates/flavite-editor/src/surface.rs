@@ -6,6 +6,11 @@ use flavite_buffer::undo::EditOp;
 use flavite_syntax::text::{Span, TextByte};
 use std::path::PathBuf;
 
+/// Single-edit changed-range hint (RFC-0008 D1): defined in flavite-syntax
+/// (the lowest crate shared by vault/api/editor — the session produces it,
+/// the editor consumes it), re-exported here under the editor-facing name.
+pub use flavite_syntax::EditRange;
+
 /// Immutable buffer data required to render and dispatch an editor command.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditorView {
@@ -19,6 +24,10 @@ pub struct EditorView {
     pub path: PathBuf,
     /// State-machine label.
     pub state: flavite_buffer::state::BufferState,
+    /// Single-edit changed-range hint, session-computed (RFC-0008 D1):
+    /// `None` for external reloads, merges, journal patches, first open,
+    /// and multi-op batches.
+    pub last_edit: Option<EditRange>,
 }
 
 /// A note candidate offered while completing a wikilink.
@@ -38,6 +47,9 @@ impl From<&BufferView> for EditorView {
             text: view.text.clone().into(),
             path: view.path.clone(),
             state: view.state,
+            // The serialized BufferView surface carries no session-computed
+            // hint (D9: it never crosses the JSON command surface).
+            last_edit: None,
         }
     }
 }
@@ -50,6 +62,7 @@ impl From<&SharedBufferView> for EditorView {
             text: view.text.clone(),
             path: view.path.clone(),
             state: view.state,
+            last_edit: view.last_edit,
         }
     }
 }
@@ -303,5 +316,55 @@ pub trait EditorSurface {
     /// Translate a selection replacement into a revision-guarded command.
     fn replace_selection(&self, start: usize, end: usize, text: String) -> EditorAction {
         EditorAction::replace(self.view(), start, end, text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flavite_buffer::state::BufferState;
+
+    fn shared_view(last_edit: Option<EditRange>) -> SharedBufferView {
+        SharedBufferView {
+            buffer_id: 7,
+            revision: 42,
+            text: "one\ntwo".into(),
+            base_hash: Vec::new(),
+            state: BufferState::Dirty,
+            path: PathBuf::from("note.md"),
+            source_format: flavite_syntax::SourceFormat::utf8_with_bom(),
+            last_edit,
+        }
+    }
+
+    fn serialized_view() -> BufferView {
+        BufferView {
+            buffer_id: 7,
+            revision: 42,
+            text: "one\ntwo".into(),
+            base_hash: Vec::new(),
+            state: BufferState::Dirty,
+            path: PathBuf::from("note.md"),
+            source_format: flavite_syntax::SourceFormat::utf8_with_bom(),
+        }
+    }
+
+    /// S7-T2: the session-computed hint survives the `From<&SharedBufferView>`
+    /// conversion; the serialized `BufferView` surface carries none (D9).
+    #[test]
+    fn editor_view_preserves_shared_hint_and_omits_serialized_hint() {
+        let hint = EditRange {
+            start: 2,
+            old_end: 2,
+            new_end: 4,
+        };
+        let from_shared = EditorView::from(&shared_view(Some(hint)));
+        assert_eq!(from_shared.last_edit, Some(hint));
+
+        let from_serialized = EditorView::from(&serialized_view());
+        assert_eq!(from_serialized.last_edit, None);
+
+        let none_shared = EditorView::from(&shared_view(None));
+        assert_eq!(none_shared.last_edit, None);
     }
 }

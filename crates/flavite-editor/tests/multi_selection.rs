@@ -15,6 +15,7 @@ fn view_of(text: &str) -> EditorView {
         text: text.to_owned().into(),
         path: "note.md".into(),
         state: flavite_buffer::state::BufferState::Clean,
+        last_edit: None,
     }
 }
 

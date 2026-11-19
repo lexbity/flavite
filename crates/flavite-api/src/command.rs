@@ -392,12 +392,18 @@ impl CommandRegistry {
             })
     }
 
-    /// Validate arguments and dispatch through the handler registered with the
-    /// command specification. Validation finishes before the handler can run.
+    /// Dispatch through the handler registered with the command specification.
+    ///
+    /// Argument validation is the registry's single production enforcement
+    /// point, run by [`CommandRegistry::validate`] before dispatch
+    /// (RFC-0008 S7 debt: `execute_turn` validates once, before the
+    /// replay/precondition gates that need validated args; dispatch itself
+    /// only re-checks under `debug_assert!`). The handler runs only after
+    /// the payload passes the registered schema in debug builds.
     ///
     /// # Errors
-    /// Returns the typed dispatch error; the handler runs only after the
-    /// payload passes the registered schema.
+    /// Returns the typed dispatch error (unavailable command, or a handler
+    /// error).
     pub fn dispatch(
         &self,
         session: &Session,
@@ -407,15 +413,10 @@ impl CommandRegistry {
         let registered = commands
             .get(invocation.command_id)
             .ok_or_else(|| CommandDispatchError::Unavailable(invocation.command_id.to_owned()))?;
-        match registered.spec.args.validate(&invocation.args) {
-            Ok(()) => {}
-            Err(ArgValidationError::Invalid(message)) => {
-                return Err(CommandDispatchError::InvalidArgs(message));
-            }
-            Err(ArgValidationError::PayloadTooLarge { observed, limit }) => {
-                return Err(CommandDispatchError::PayloadTooLarge { observed, limit });
-            }
-        }
+        debug_assert!(
+            registered.spec.args.validate(&invocation.args).is_ok(),
+            "dispatch reached with invalid args (callers must validate via CommandRegistry::validate)"
+        );
         (registered.handler)(session, invocation).map_err(CommandDispatchError::Handler)
     }
 

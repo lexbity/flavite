@@ -779,7 +779,7 @@ fn attach_services(
     // Trigger migration if needed - this loads or creates the v2 settings document
     let _ = settings_store
         .load_or_migrate(&registry, root, data_dir, &vault_uuid)
-        .map_err(|e| eprintln!("Failed to load or migrate settings: {}", e));
+        .map_err(|e| tracing::warn!("failed to load or migrate settings: {e}"));
 
     // OS-backed vaults migrate legacy device-local layout/theme state into
     // the vault root on disk. Hermetic fixtures own virtual roots and must
@@ -801,8 +801,8 @@ fn attach_services(
                 && std::fs::read(&device_layout_path)
                     .is_ok_and(|bytes| std::fs::write(&vault_layout_path, &bytes).is_ok())
             {
-                eprintln!(
-                    "Migrated workspace layout from {} to {}",
+                tracing::info!(
+                    "migrated workspace layout from {} to {}",
                     device_layout_path.display(),
                     vault_layout_path.display()
                 );
@@ -847,8 +847,8 @@ fn attach_services(
                     copied += 1;
                 }
                 if copied > 0 {
-                    eprintln!(
-                        "Migrated {copied} theme(s) from {} to {}",
+                    tracing::info!(
+                        "migrated {copied} theme(s) from {} to {}",
                         device_themes_root.display(),
                         vault_themes_root.display()
                     );
@@ -2530,8 +2530,11 @@ impl Flavite {
         // Every required capability of the spec must be covered; the
         // registry is the single enforcement point (no command-id special
         // cases on the dispatch path).
+        // RFC-0008 S7 (debt): the spec is fetched once per turn — three
+        // clones per keystroke were being made for read-only checks.
+        let spec = self.command_registry.get_spec(invocation.command_id);
         let target = self.command_target(&invocation);
-        if let Some(spec) = self.command_registry.get_spec(invocation.command_id) {
+        if let Some(spec) = &spec {
             for required in &spec.required_capabilities {
                 if !invocation
                     .capabilities
@@ -2559,10 +2562,7 @@ impl Flavite {
         }
         // Replays retain their original completion even after text or view
         // state advances. Capability and vault policy checks still apply.
-        if self
-            .command_registry
-            .get_spec(invocation.command_id)
-            .is_some_and(|spec| spec.requires_write)
+        if spec.as_ref().is_some_and(|spec| spec.requires_write)
             && let Some(buffer) = invocation
                 .args
                 .get("buffer_id")
@@ -2601,10 +2601,7 @@ impl Flavite {
                 }
             }
         }
-        let requires_write = self
-            .command_registry
-            .get_spec(invocation.command_id)
-            .is_some_and(|spec| spec.requires_write)
+        let requires_write = spec.as_ref().is_some_and(|spec| spec.requires_write)
             || invocation.preconditions.requires_write;
         // The write policy is a property of the opened vault, never of the
         // caller's preconditions (TD-17): a read-only vault rejects every
@@ -3633,6 +3630,7 @@ impl Flavite {
             state: snapshot.state,
             path: snapshot.path,
             source_format: snapshot.source_format,
+            last_edit: snapshot.last_edit,
         })
     }
 
@@ -3833,6 +3831,11 @@ pub struct SharedBufferView {
     pub path: PathBuf,
     /// Authoritative save-format descriptor of this revision (§6.10).
     pub source_format: flavite_encoding::SourceFormat,
+    /// Single-edit changed-range hint, session-computed (RFC-0008 D1/D9):
+    /// never crosses the JSON command surface, never client-supplied.
+    /// `None` for external reloads, merges, journal patches, first open,
+    /// and multi-op batches.
+    pub last_edit: Option<flavite_syntax::EditRange>,
 }
 
 /// Result of a query.
