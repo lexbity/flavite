@@ -140,9 +140,10 @@ impl EditOp {
     /// replacement over the `min..max` span cannot be derived by
     /// concatenation — sequential application leaves displaced original
     /// bytes inside the span that concatenation silently drops. (The live
-    /// undo tree recomputes its merged edit from before/after snapshots and
-    /// does not rely on this predicate for text correctness; `coalesce`
-    /// does, which is why adjacency is the whole contract.)
+    /// undo tree merges coalesced edits with the coordinate mapping of
+    /// RFC-0008 §5.3.2 (D4) — [`merge_mapped`] — and does not rely on this
+    /// predicate for text correctness; `coalesce` does, which is why
+    /// adjacency is the whole contract.)
     #[must_use]
     pub fn can_coalesce(&self, other: &EditOp) -> bool {
         if self.boundary || other.boundary || self.journal.is_some() || other.journal.is_some() {
@@ -177,6 +178,179 @@ impl EditOp {
         ))
     }
 }
+
+/// Map one post-`prev` coordinate into pre-`prev` coordinates (RFC-0008
+/// §5.3.2, D4):
+///
+/// | point x (post) | mapped x (pre) |
+/// |---|---|
+/// | x < s | x |
+/// | s ≤ x ≤ s+p | s |
+/// | x > s+p | x − d |
+///
+/// where `prev = [s, e) -> P`, `p = |P|`, `d = p − (e − s)`.
+fn map_post_to_pre(x: usize, s: usize, _e: usize, p: usize, d: isize) -> isize {
+    let x = x as isize;
+    if x < s as isize {
+        x
+    } else if x <= (s + p) as isize {
+        s as isize
+    } else {
+        x - d
+    }
+}
+
+/// Local-window coordinate of a post-`prev` point (RFC-0008 §5.3.2): the
+/// virtual window is `[start, s) + P + [e, end)` laid out linearly.
+fn map_post_to_local(x: usize, s: usize, start: usize, z1: usize, p: usize) -> isize {
+    let x = x as isize;
+    if x < s as isize {
+        x - start as isize
+    } else if x <= (s + p) as isize {
+        z1 as isize + (x - s as isize)
+    } else {
+        z1 as isize + p as isize + (x - (s + p) as isize)
+    }
+}
+
+/// Merge `next` (coordinates in the text AFTER `prev` was applied) into
+/// `prev`, producing one edit in `prev`'s pre-coordinates (RFC-0008 D4,
+/// §5.3.2). Returns `None` when the composition would require original text
+/// bytes the caller did not supply (gap-spanning continuous merges) or when
+/// the inputs violate the coalescing preconditions.
+///
+/// `source` is the original text slice covering the merged window; it is
+/// needed exactly when the merged replacement must carry bytes untouched by
+/// both edits (a gap between `prev`'s span and `next`'s range). With
+/// `source == None` those cases return `None`; adjacent/contained cases are
+/// composed from the two replacements alone.
+#[must_use]
+pub fn merge_mapped_with_source(
+    prev: &EditOp,
+    next: &EditOp,
+    source: Option<&str>,
+) -> Option<EditOp> {
+    if prev.boundary || next.boundary || prev.journal.is_some() || next.journal.is_some() {
+        return None;
+    }
+    let s = prev.range.start.0;
+    let e = prev.range.end.0;
+    let p = prev.replacement.len();
+    let d = p as isize - (e - s) as isize;
+    let a = next.range.start.0;
+    let b = next.range.end.0;
+    if a > b {
+        return None;
+    }
+
+    let a_pre = map_post_to_pre(a, s, e, p, d);
+    let b_pre = map_post_to_pre(b, s, e, p, d);
+    let start = (s as isize).min(a_pre).max(0) as usize;
+    let end = (e as isize).max(b_pre).max(0) as usize;
+
+    let z1 = s - start; // original bytes before the span
+    let z3 = end - e; // original bytes after the span
+    let la = map_post_to_local(a, s, start, z1, p)
+        .max(0)
+        .min((z1 + p + z3) as isize) as usize;
+    let lb = map_post_to_local(b, s, start, z1, p)
+        .max(0)
+        .min((z1 + p + z3) as isize) as usize;
+
+    // Push an original-text slice (zone-local offsets, unambiguous). Empty
+    // slices are free; non-empty ones require the source.
+    let push_orig = |out: &mut String, from: usize, to: usize| -> bool {
+        if from >= to {
+            return true;
+        }
+        let Some(text) = source else {
+            return false;
+        };
+        if to > text.len() {
+            return false;
+        }
+        out.push_str(&text[from..to]);
+        true
+    };
+
+    let mut out = String::with_capacity(p + next.replacement.len() + z1 + z3);
+
+    // Zone 1: original bytes [start, s), local [0, z1). Insertion at
+    // `la` sits before the span when la < z1.
+    if z1 > 0 {
+        if la < z1 {
+            if !push_orig(&mut out, start, start + la) {
+                return None;
+            }
+            out.push_str(&next.replacement);
+            if !push_orig(&mut out, start + lb.min(z1), s) {
+                return None;
+            }
+        } else if !push_orig(&mut out, start, s) {
+            return None;
+        }
+    }
+
+    // Zone 2: prev's replacement P, local [z1, z1+p). The zone owns the
+    // insertion at the exact span end (la == z1+p) so the replacement
+    // survives when zone 3 is empty; zone 3's condition is strictly-after.
+    {
+        let p_lo = z1;
+        let p_hi = z1 + p;
+        let del_s = la.max(p_lo).min(p_hi) - p_lo;
+        let del_e = lb.max(p_lo).min(p_hi) - p_lo;
+        if del_s > del_e {
+            return None;
+        }
+        if la >= p_lo && la <= p_hi {
+            out.push_str(&prev.replacement[..la - p_lo]);
+            out.push_str(&next.replacement);
+            out.push_str(&prev.replacement[del_e..]);
+        } else {
+            out.push_str(&prev.replacement[..del_s]);
+            out.push_str(&prev.replacement[del_e..]);
+        }
+    }
+
+    // Zone 3: original bytes [e, end), local [z1+p, z1+p+z3).
+    if z3 > 0 {
+        let base = z1 + p;
+        if la > base {
+            let off = la - base;
+            if !push_orig(&mut out, e, e + off) {
+                return None;
+            }
+            out.push_str(&next.replacement);
+            let del_end = lb.min(base + z3);
+            if !push_orig(&mut out, e + (del_end - base), end) {
+                return None;
+            }
+        } else {
+            let del_s = la.max(base).min(base + z3) - base;
+            let del_e = lb.max(base).min(base + z3) - base;
+            if del_s > del_e {
+                return None;
+            }
+            if !push_orig(&mut out, e, e + del_s) {
+                return None;
+            }
+            if !push_orig(&mut out, e + del_e, end) {
+                return None;
+            }
+        }
+    }
+
+    Some(EditOp::new(Span::new(TextByte(start), TextByte(end)), out))
+}
+
+/// [`merge_mapped_with_source`] without a source: exact for every composition
+/// that needs no original gap bytes; `None` otherwise (caller installs a new
+/// node — RFC-0008 D4).
+#[must_use]
+pub fn merge_mapped(prev: &EditOp, next: &EditOp) -> Option<EditOp> {
+    merge_mapped_with_source(prev, next, None)
+}
+
 /// A node in the undo tree.
 ///
 /// Each node represents a state of the buffer and can have:
@@ -592,40 +766,28 @@ impl UndoTree {
         let _undo_coalesce =
             tracing::info_span!("edit.undo_coalesce", coalesced = should_coalesce,).entered();
         if should_coalesce {
-            let parent_text = self
-                .get(position_id)
-                .and_then(|node| node.parent_id)
-                .and_then(|id| self.get(id))
-                .and_then(|node| node.snapshot.as_ref())
-                .map(TextSnapshot::text);
-            if let Some(before) = parent_text {
-                let after = snapshot.text();
-                let mut prefix = before
-                    .bytes()
-                    .zip(after.bytes())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                while prefix > 0
-                    && (!before.is_char_boundary(prefix) || !after.is_char_boundary(prefix))
-                {
-                    prefix -= 1;
-                }
-                let mut suffix = before.as_bytes()[prefix..]
-                    .iter()
-                    .rev()
-                    .zip(after.as_bytes()[prefix..].iter().rev())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                while suffix > 0
-                    && (!before.is_char_boundary(before.len() - suffix)
-                        || !after.is_char_boundary(after.len() - suffix))
-                {
-                    suffix -= 1;
-                }
-                let coalesced = EditOp::new(
-                    Span::new(TextByte(prefix), TextByte(before.len() - suffix)),
-                    after[prefix..after.len() - suffix].into(),
-                );
+            // RFC-0008 S4 (D4): merge by coordinate mapping — no snapshot diff.
+            // The pure table handles adjacent/contained compositions; a
+            // gap-spanning continuous merge borrows only the gap slice from
+            // the parent snapshot (O(gap), never an O(document) scan).
+            let coalesced = self
+                .nodes
+                .get(position_id as usize)
+                .and_then(|node| node.edit.as_ref())
+                .and_then(|current| {
+                    if let Some(op) = merge_mapped(current, &edit) {
+                        return Some(op);
+                    }
+                    let parent_text = self
+                        .get(position_id)
+                        .and_then(|node| node.parent_id)
+                        .and_then(|id| self.get(id))
+                        .and_then(|node| node.snapshot.as_ref())
+                        .map(TextSnapshot::text);
+                    parent_text
+                        .and_then(|text| merge_mapped_with_source(current, &edit, Some(text)))
+                });
+            if let Some(coalesced) = coalesced {
                 {
                     let node = self
                         .nodes
@@ -1537,6 +1699,173 @@ mod tests {
         assert!(!right.can_coalesce(&left));
         assert_eq!(left.coalesce(&right), None);
     }
+    /// The S4 oracle: the pre-S4 coalesce implementation (parent-snapshot
+    /// byte diff). Kept under `#[cfg(test)]` to prove `merge_mapped` ≡
+    /// recompute-from-snapshots (RFC-0008 D4, AC-3).
+    fn coalesce_by_snapshot_diff(_prev: &EditOp, before: &str, after: &str) -> EditOp {
+        let before_bytes = before.as_bytes();
+        let after_bytes = after.as_bytes();
+        let mut prefix = before_bytes
+            .iter()
+            .zip(after_bytes.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while prefix > 0 && (!before.is_char_boundary(prefix) || !after.is_char_boundary(prefix)) {
+            prefix -= 1;
+        }
+        let mut suffix = before_bytes[prefix..]
+            .iter()
+            .rev()
+            .zip(after_bytes[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while suffix > 0
+            && (!before.is_char_boundary(before.len() - suffix)
+                || !after.is_char_boundary(after.len() - suffix))
+        {
+            suffix -= 1;
+        }
+        EditOp::new(
+            Span::new(TextByte(prefix), TextByte(before.len() - suffix)),
+            after[prefix..after.len() - suffix].into(),
+        )
+    }
+
+    #[test]
+    fn merge_mapped_corner_cases_from_the_table() {
+        // S4-T3: the exact §5.3.2 corner cases.
+        let parent = "abc";
+        // Insert at span start: prev [1,1)->"X", next insert at post 1.
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(1)), "X".into());
+        let next = EditOp::new(Span::new(TextByte(1), TextByte(1)), "Y".into());
+        let merged = merge_mapped(&prev, &next).expect("insert-at-span-start merges");
+        assert_eq!(merged.range, Span::new(TextByte(1), TextByte(1)));
+        assert_eq!(merged.replacement, "YX");
+        assert_eq!(merged.apply(parent), "aYXbc");
+
+        // Insert at span end: next insert at post 2 (just after "X").
+        let next = EditOp::new(Span::new(TextByte(2), TextByte(2)), "Y".into());
+        let merged = merge_mapped(&prev, &next).expect("insert-at-span-end merges");
+        assert_eq!(merged.replacement, "XY");
+        assert_eq!(merged.apply(parent), "aXYbc");
+
+        // Backspace into the typed run: prev inserts "XYZ", delete middle.
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(1)), "XYZ".into());
+        let next = EditOp::new(Span::new(TextByte(2), TextByte(3)), "".into());
+        let merged = merge_mapped(&prev, &next).expect("backspace-into-run merges");
+        assert_eq!(merged.replacement, "XZ");
+        assert_eq!(merged.apply(parent), "aXZbc");
+
+        // Whole-span replacement (crossing both sides): prev [1,3)->"X".
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(3)), "X".into());
+        let next = EditOp::new(Span::new(TextByte(0), TextByte(4)), "Z".into());
+        let merged = merge_mapped_with_source(&prev, &next, Some("abcde"))
+            .expect("crossing replace merges with source");
+        assert_eq!(merged.range, Span::new(TextByte(0), TextByte(5)));
+        assert_eq!(merged.replacement, "Z");
+        assert_eq!(merged.apply("abcde"), "Z");
+        // The crossing replace consumes the whole span/gap, so it is also
+        // exact without a source.
+        let merged_no_source = merge_mapped(&prev, &next).expect("crossing replace is source-free");
+        assert_eq!(merged_no_source, merged);
+
+        // Continuous distant insert: prev [1,1)->"X", next insert at post 4
+        // (end of "aXbc").
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(1)), "X".into());
+        let next = EditOp::new(Span::new(TextByte(4), TextByte(4)), "Y".into());
+        assert_eq!(merge_mapped(&prev, &next), None, "gap needs source");
+        let merged = merge_mapped_with_source(&prev, &next, Some(parent))
+            .expect("distant insert merges with source");
+        assert_eq!(merged.apply(parent), "aXbcY");
+        assert_eq!(merged.replacement, "XbcY");
+    }
+
+    #[test]
+    fn merge_mapped_rejects_boundary_and_journal_ops() {
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(1)), "X".into());
+        let mut boundary = EditOp::new(Span::new(TextByte(2), TextByte(2)), "Y".into());
+        boundary.boundary = true;
+        assert_eq!(merge_mapped(&prev, &boundary), None);
+        assert_eq!(merge_mapped(&boundary, &prev), None);
+        let mut journal = EditOp::new(Span::new(TextByte(2), TextByte(2)), "Y".into());
+        journal.journal = Some(JournalTag {
+            txn_id: "t".into(),
+            item_id: 1,
+        });
+        assert_eq!(merge_mapped(&prev, &journal), None);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 128, ..proptest::test_runner::Config::default()
+        })]
+
+        /// S4-T1 (AC-3): `merge_mapped` (with the parent source when gap bytes
+        /// are needed) equals the old recompute-from-snapshots oracle on
+        /// randomized edit sequences — byte-for-byte, including replacement
+        /// content — and applying it equals sequential application.
+        #[test]
+        fn merge_mapped_equals_the_snapshot_diff_oracle(
+            base in "[a-zA-Z0-9 .,!?]{0,24}",
+            steps in proptest::collection::vec(
+                (".{0,12}", 0usize..64, 0usize..64, proptest::bool::ANY),
+                1..60,
+            ),
+        ) {
+            let mut parent = base.clone(); // text at the node owning `prev`
+            let mut prev: Option<EditOp> = None;
+            for (repl, x, y, coalesce) in steps {
+                let current = prev
+                    .as_ref()
+                    .map(|op| op.apply(&parent))
+                    .unwrap_or_else(|| parent.clone());
+                let len = current.len();
+                let mut a = x % (len + 1);
+                while !current.is_char_boundary(a) {
+                    a -= 1;
+                }
+                let mut b = (a + y % (len + 1 - a)).min(len);
+                while b < len && !current.is_char_boundary(b) {
+                    b += 1;
+                }
+                let next_op = EditOp::new(Span::new(TextByte(a), TextByte(b)), repl);
+
+                match (prev.take(), coalesce) {
+                    (Some(p), true) => {
+                        let after = next_op.apply(&p.apply(&parent));
+                        let oracle = coalesce_by_snapshot_diff(&p, &parent, &after);
+                        if let Some(merged) =
+                            merge_mapped_with_source(&p, &next_op, Some(&parent))
+                        {
+                            // Application equivalence is the correctness
+                            // contract: the oracle may trim boundary bytes
+                            // identical to the untouched context (and thus
+                            // shift its range), so literal op equality is
+                            // not required — both must yield the exact
+                            // final text.
+                            proptest::prop_assert_eq!(&merged.apply(&parent), &after);
+                            proptest::prop_assert_eq!(&oracle.apply(&parent), &after);
+                            if let Some(no_source) = merge_mapped(&p, &next_op) {
+                                proptest::prop_assert_eq!(&no_source.apply(&parent), &after);
+                            }
+                            prev = Some(merged);
+                        } else {
+                            parent = p.apply(&parent);
+                            prev = Some(next_op);
+                        }
+                    }
+                    (Some(p), false) => {
+                        parent = p.apply(&parent);
+                        prev = Some(next_op);
+                    }
+                    (None, _) => {
+                        prev = Some(next_op);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn undo_tree_basic() {
         let snapshot = TextSnapshot::new(b"hello").unwrap();
