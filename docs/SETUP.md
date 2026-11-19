@@ -107,6 +107,25 @@ fail the command.
   install them manually).
 - CI uses `just gpu-setup` (mesa-vulkan-drivers / lavapipe) on machines
   without a GPU.
+- **Linker (mold).** Debug/dev builds link through [mold](https://github.com/rui314/mold) —
+  `.cargo/config.toml` passes `-C link-arg=-fuse-ld=mold` for linux targets, because the gate builds
+  ~200 static-linked test binaries and BFD `ld` is orders of magnitude slower on them. `just setup`
+  installs mold (apt on Debian-style systems; it is a hard requirement there — without it every
+  build fails at link time). **Fallback without mold:** prefix any cargo command with an empty
+  `RUSTFLAGS=` to override the tracked config and link with the system `ld`:
+
+  ```sh
+  RUSTFLAGS= just build     # or: RUSTFLAGS= cargo build --locked
+  RUSTFLAGS= cargo test --locked -p flavite-buffer
+  ```
+
+  The empty-but-set `RUSTFLAGS` replaces the config's rustflags wholesale (verified: no
+  `-fuse-ld=mold` reaches rustc, the system linker is used). Toggling it invalidates the dev
+  fingerprint cache — expect one full rebuild after switching either way, and both artifact sets
+  coexist in `target/` until `just gc` / `just clean` reclaims the stale one. A convenience recipe
+  `just build-nomold` wraps the build case. Disk note: dev artifacts also build without dependency
+  debuginfo (root `Cargo.toml` `[profile.dev.package."*"]`), which keeps a full workspace test
+  graph at ~17 GB instead of ~74 GB.
 
 ### macOS / Windows
 

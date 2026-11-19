@@ -3,3 +3,14 @@
 [alias]
 # `cargo xtask <args>` → `cargo run -p xtask -- <args>` (§10.2, §10.10).
 xtask = "run -p xtask --"
+
+# Linker: mold (installed 2026-11-19, v3.0.0) — 5-20x faster than BFD ld on
+# the ~200 static-linked test binaries the gate produces. Note: rustflags
+# changes invalidate the whole dev graph once — the next build after any
+# change here is a full rebuild, then stable. Fallbacks when mold cannot be
+# installed: `RUSTFLAGS= cargo build` (empty-but-set env overrides this file's
+# rustflags entirely — system ld links; `just build-nomold` wraps it) or
+# -fuse-ld=gold (present on Arch base installs).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# rustflags = ["-C", "link-arg=-fuse-ld=gold"]

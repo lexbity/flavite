@@ -14,6 +14,13 @@ fmt-fix:
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
 
+# Build with the system ld instead of mold: the empty-but-set RUSTFLAGS
+# overrides the tracked -fuse-ld=mold in .cargo/config.toml (verified — the
+# flag never reaches rustc). For hosts where mold cannot be installed.
+# Toggling fingerprints the dev graph: one full rebuild per switch.
+build-nomold:
+    RUSTFLAGS= cargo build --locked
+
 # Run all workspace tests. On failure, the failed-test lines are appended to
 # $GITHUB_STEP_SUMMARY in CI (audit L1) and the full log is kept in
 # target/last-test.log.

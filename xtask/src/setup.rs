@@ -100,6 +100,39 @@ fn install_ripgrep() -> Result<()> {
     Ok(())
 }
 
+/// Install the mold linker on Linux. `.cargo/config.toml` passes
+/// `-C link-arg=-fuse-ld=mold` for x86_64-unknown-linux-gnu, so a missing
+/// `mold` fails EVERY link on that target — this is a hard requirement, same
+/// class as ripgrep above (bail on failure). macOS/Windows builds use other
+/// targets and never see the flag, so this is a no-op there. Idempotent.
+fn install_mold() -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        println!("  - mold not needed on this platform (linker flag is linux-only)");
+        return Ok(());
+    }
+    if command_exists("mold") {
+        println!("  ✓ mold already installed");
+        return Ok(());
+    }
+    let status = Command::new("sudo")
+        .args(["apt-get", "install", "-y", "mold"])
+        .status()
+        .context("failed to spawn the mold installer")?;
+    if !status.success() {
+        anyhow::bail!(
+            "mold install failed with {status}; .cargo/config.toml requires mold to link \
+             linux targets — install it manually (apt/pacman: mold, or `cargo install mold`), \
+             or build without it via `just build-nomold` / `RUSTFLAGS= <cargo command>` \
+             (system ld; see docs/SETUP.md)"
+        );
+    }
+    if !command_exists("mold") {
+        anyhow::bail!("mold install reported success but `mold --version` still fails");
+    }
+    println!("  ✓ mold installed and verified");
+    Ok(())
+}
+
 /// Ensure Python Pillow is available for workbench visual pixel checks
 /// (scripts/workbench-visual-linux.sh, xtask/tests/workbench_runner.rs).
 /// Like ripgrep this is a hard Linux requirement: a missing PIL turns the
@@ -356,6 +389,10 @@ pub fn setup() -> Result<()> {
     // scripts/lib/source-gates.sh and `just lint-arch`. Hard failure if it
     // cannot be installed — a missing `rg` must never silently skip a gate.
     install_ripgrep()?;
+
+    // mold: required by .cargo/config.toml's linux link flags (every build
+    // links through it). Hard failure on linux, no-op elsewhere.
+    install_mold()?;
 
     // Pillow: workbench visual acceptance (xtask/tests/workbench_runner.rs
     // and scripts/workbench-visual-linux.sh) requires it for pixel checks.
