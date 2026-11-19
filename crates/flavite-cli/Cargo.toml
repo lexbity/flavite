@@ -41,3 +41,6 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 # Testing utilities
 tempfile = "3"
+# Minimal xpi fixture construction for the CLI theme flows (zip is already
+# in the workspace lockfile via the API's theme tests; test-only).
+zip = { workspace = true }

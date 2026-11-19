@@ -91,19 +91,81 @@ pub fn collect_matches(
     if cancelled.load(std::sync::atomic::Ordering::Acquire) {
         return Err(PrepareError::Cancelled);
     }
-    match request.mode {
+    // The exact total comes from the engine's complete scan (budget exceeded
+    // is a typed refusal, never a silent stop); ship at most the
+    // selection-bound spans. A cancelled collection stops at the next match
+    // boundary (E-11).
+    let (matches, total) = collect_contained_matches(
+        text,
+        &ContainedMatchQuery {
+            query: &request.query,
+            mode: request.mode,
+            case_sensitive: request.case_sensitive,
+            whole_word: request.whole_word,
+            scope_spans: &request.scope_spans,
+        },
+        MAX_SELECTION_SPANS,
+        cancelled,
+    )?;
+    let zero_width_count = matches.iter().filter(|&&(start, end)| start == end).count();
+    // The helper proved the exact total over the complete scan; the parent
+    // re-validates every shipped span against the frozen source (bounds +
+    // scalar alignment + ascending order).
+    let mut spans = Vec::with_capacity(matches.len());
+    for (start, end) in matches {
+        if spans.len() >= MAX_SELECTION_SPANS {
+            break;
+        }
+        spans.push((start, end));
+    }
+    let expected = total.min(u64::try_from(MAX_SELECTION_SPANS).unwrap_or(u64::MAX));
+    if u64::try_from(spans.len()).unwrap_or(u64::MAX) != expected {
+        return Err(PrepareError::RegexUnavailable {
+            reason: "unsound-helper-proof".to_owned(),
+        });
+    }
+    Ok(MatchCollectionOutcome {
+        spans,
+        total_matches: total,
+        zero_width_count: u64::try_from(zero_width_count).unwrap_or(u64::MAX),
+    })
+}
+
+/// The matcher inputs shared by match collection and keep-matching.
+struct ContainedMatchQuery<'a> {
+    query: &'a str,
+    mode: MatchMode,
+    case_sensitive: bool,
+    whole_word: bool,
+    scope_spans: &'a [(usize, usize)],
+}
+
+/// Collect every match fully contained in `scope_spans` (empty = whole
+/// source) on the delivered engine paths: regex through the isolated helper
+/// worker (D-14), literal in-process (FEUX-0002 §5.7). `report_matches`
+/// bounds the helper's shipped match list; the returned total is the exact
+/// complete-scan count. The returned spans are ascending, non-overlapping,
+/// scalar-aligned, and bounds-checked against `text`.
+fn collect_contained_matches(
+    text: &str,
+    query: &ContainedMatchQuery<'_>,
+    report_matches: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(Vec<(usize, usize)>, u64), crate::text_edit::PrepareError> {
+    use crate::text_edit::PrepareError;
+    match query.mode {
         MatchMode::Regex => {
             let run = crate::text_worker::run_match(
                 &crate::text_worker::HelperRequest {
                     kind: RequestKind::Find,
                     source: text,
-                    pattern: &request.query,
+                    pattern: query.query,
                     mode: MatchMode::Regex,
-                    case_sensitive: request.case_sensitive,
-                    whole_word: request.whole_word,
-                    scope_spans: request.scope_spans.clone(),
+                    case_sensitive: query.case_sensitive,
+                    whole_word: query.whole_word,
+                    scope_spans: query.scope_spans.to_vec(),
                     max_matches: crate::text_edit::MAX_MATCHES_PER_JOB,
-                    report_matches: MAX_SELECTION_SPANS,
+                    report_matches,
                     skip_matches: 0,
                     max_output: 0,
                     template_raw: "",
@@ -111,9 +173,6 @@ pub fn collect_matches(
                 cancelled,
             )
             .map_err(crate::text_edit::worker_error)?;
-            // The helper proved the exact total over the complete scan; the
-            // parent re-validates every shipped span against the frozen
-            // source (bounds + scalar alignment + ascending order).
             let mut spans = Vec::with_capacity(run.matches.len());
             let mut last_end = 0usize;
             for hit in &run.matches {
@@ -129,67 +188,48 @@ pub fn collect_matches(
                 last_end = end;
                 spans.push((start, end));
             }
-            let expected = run
-                .total_matches
-                .min(u64::try_from(MAX_SELECTION_SPANS).unwrap_or(u64::MAX));
-            if u64::try_from(spans.len()).unwrap_or(u64::MAX) != expected {
-                return Err(PrepareError::RegexUnavailable {
-                    reason: "unsound-helper-proof".to_owned(),
-                });
-            }
-            Ok(collection(spans, run.total_matches))
+            Ok((spans, run.total_matches))
         }
         MatchMode::Literal => {
             let options = MatchOptions {
                 mode: MatchMode::Literal,
-                case_sensitive: request.case_sensitive,
-                whole_word: request.whole_word,
+                case_sensitive: query.case_sensitive,
+                whole_word: query.whole_word,
             };
             let matcher = Matcher::new(
-                &request.query,
+                query.query,
                 options,
                 MatchLimits {
                     max_matches: crate::text_edit::MAX_MATCHES_PER_JOB,
                 },
             )
             .map_err(matcher_error)?;
-            // Count every match for the exact total (budget exceeded is a
-            // typed refusal, never a silent stop); ship at most the
-            // selection-bound spans. A cancelled collection stops at the
-            // next match boundary (E-11).
-            let mut spans = Vec::new();
-            let mut total = 0u64;
-            // Use matcher.find_in_spans which handles both cases internally
-            let results = if request.scope_spans.is_empty() {
+            // Use matcher.find_in_spans which handles both cases internally.
+            let results = if query.scope_spans.is_empty() {
                 matcher.find(text).map_err(matcher_error)?
             } else {
                 matcher
-                    .find_in_spans(text, &request.scope_spans)
+                    .find_in_spans(text, query.scope_spans)
                     .map_err(matcher_error)?
             };
-            for hit in results {
-                total = total.saturating_add(1);
-                if spans.len() < MAX_SELECTION_SPANS {
-                    spans.push((hit.span.start.0, hit.span.end.0));
-                }
-            }
-            Ok(collection(spans, total))
+            let spans: Vec<(usize, usize)> = results
+                .into_iter()
+                .map(|hit| (hit.span.start.0, hit.span.end.0))
+                .collect();
+            let total = spans.len() as u64;
+            Ok((spans, total))
         }
-    }
-}
-
-fn collection(spans: Vec<(usize, usize)>, total_matches: u64) -> MatchCollectionOutcome {
-    let zero_width_count = spans.iter().filter(|&&(start, end)| start == end).count();
-    MatchCollectionOutcome {
-        spans,
-        total_matches,
-        zero_width_count: u64::try_from(zero_width_count).unwrap_or(u64::MAX),
     }
 }
 
 /// Collect matches for keep-matching: filter selections to those containing
 /// at least one match (FEUX-0006 E-4). Returns indices of selections to keep
 /// and the total match count.
+///
+/// The same engine paths as [`collect_matches`] run here (regex through the
+/// isolated helper, literal in-process — E-11); keep never compiles or
+/// executes a regex on this thread. Zero-width matches count as contained
+/// (E-4: `^` with multi_line keeps every line-spanning member).
 pub fn collect_keep_matches(
     text: &str,
     request: &KeepMatchingRequest,
@@ -208,47 +248,46 @@ pub fn collect_keep_matches(
         });
     }
 
-    // Build matcher
-    let options = MatchOptions {
-        mode: request.mode,
-        case_sensitive: request.case_sensitive,
-        whole_word: false, // keep_matching doesn't use whole_word per spec
-    };
-    let matcher = Matcher::new(
-        &request.query,
-        options,
-        MatchLimits {
-            max_matches: crate::text_edit::MAX_MATCHES_PER_JOB,
+    let (matches, match_count) = collect_contained_matches(
+        text,
+        &ContainedMatchQuery {
+            query: &request.query,
+            mode: request.mode,
+            case_sensitive: request.case_sensitive,
+            whole_word: false, // keep_matching doesn't use whole_word per spec
+            scope_spans: &request.scope_spans,
         },
-    )
-    .map_err(matcher_error)?;
+        usize::MAX,
+        cancelled,
+    )?;
 
-    // For each selection span, check if it contains at least one match
+    // For each selection span, check if it contains at least one match. The
+    // members and the contained matches are both ascending/non-overlapping,
+    // so one two-pointer pass decides membership.
     let mut keep_indices = Vec::new();
-    let mut total_matches = 0u64;
-
+    let mut mi = 0usize;
     for (index, &(sel_start, sel_end)) in request.scope_spans.iter().enumerate() {
-        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(PrepareError::Cancelled);
+        // Skip matches wholly before this member. A zero-width match exactly
+        // at the member's start is contained (it lies inside [start, end)),
+        // so the skip key is the raw start, not the end.
+        while mi < matches.len() && matches[mi].0 < sel_start {
+            mi += 1;
         }
-
-        // Collect all matches within this selection span
-        // Use find_in_spans with a single span
-        let span_vec = vec![(sel_start, sel_end)];
-        let results = matcher
-            .find_in_spans(text, &span_vec)
-            .map_err(matcher_error)?;
-        let has_match = !results.is_empty();
-        total_matches = total_matches.saturating_add(results.len() as u64);
-
+        // A fully-contained match decides this member (zero-width counts).
+        let has_match =
+            mi < matches.len() && matches[mi].0 >= sel_start && matches[mi].1 <= sel_end;
         if request.keep == has_match {
             keep_indices.push(index);
+        }
+        // Consume every match contained in this member.
+        while mi < matches.len() && matches[mi].1 <= sel_end {
+            mi += 1;
         }
     }
 
     Ok(KeepMatchingOutcome {
         selection_indices: keep_indices,
-        match_count: total_matches,
+        match_count,
     })
 }
 
@@ -386,5 +425,57 @@ mod tests {
         }
         .expect_err("cancelled before the scan");
         assert!(matches!(error, PrepareError::Cancelled));
+    }
+
+    fn keep_request(query: &str, keep: bool, spans: Vec<(usize, usize)>) -> KeepMatchingRequest {
+        KeepMatchingRequest {
+            buffer_id: BufferId::from(1),
+            revision: Revision::new(1),
+            query: query.to_owned(),
+            mode: MatchMode::Literal,
+            case_sensitive: false,
+            keep,
+            scope_spans: spans,
+        }
+    }
+
+    #[test]
+    fn keep_collection_filters_members_by_contained_literal_matches() {
+        let text = "aa bb\naa cc\n";
+        // Members: [0,6) ("aa bb") and [6,12) ("aa cc"); both contain "aa".
+        let request = keep_request("aa", true, vec![(0, 6), (6, 12)]);
+        let outcome =
+            collect_keep_matches(text, &request, &std::sync::atomic::AtomicBool::new(false))
+                .expect("keep");
+        assert_eq!(outcome.selection_indices, vec![0, 1]);
+        assert_eq!(outcome.match_count, 2);
+
+        // A member with no contained match is filtered out.
+        let request = keep_request("bb", true, vec![(0, 6), (6, 12)]);
+        let outcome =
+            collect_keep_matches(text, &request, &std::sync::atomic::AtomicBool::new(false))
+                .expect("keep");
+        assert_eq!(outcome.selection_indices, vec![0]);
+        assert_eq!(outcome.match_count, 1);
+
+        // The complement keeps the non-matching member.
+        let request = keep_request("bb", false, vec![(0, 6), (6, 12)]);
+        let outcome =
+            collect_keep_matches(text, &request, &std::sync::atomic::AtomicBool::new(false))
+                .expect("keep");
+        assert_eq!(outcome.selection_indices, vec![1]);
+        assert_eq!(outcome.match_count, 1);
+    }
+
+    #[test]
+    fn keep_collection_with_no_selections_is_empty() {
+        let outcome = collect_keep_matches(
+            "abc",
+            &keep_request("a", true, vec![]),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("keep");
+        assert!(outcome.selection_indices.is_empty());
+        assert_eq!(outcome.match_count, 0);
     }
 }

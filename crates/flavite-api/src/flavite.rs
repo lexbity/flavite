@@ -625,6 +625,8 @@ const READ_NOTES_COMMAND_IDS: &[&str] = &[
     "editor.flip_selections",
     "editor.trim_selections",
     "editor.invert_selections",
+    "editor.goto_line",
+    "text.replace_plan",
 ];
 
 /// Stable token for one notice presentation acknowledgement.

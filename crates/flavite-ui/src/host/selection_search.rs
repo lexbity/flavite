@@ -78,13 +78,16 @@ impl PreviewKey {
 }
 
 /// The accepted overlay candidate: canonical spans plus the exact totals
-/// from the collection.
+/// from the collection. For keep-matching the spans are the surviving
+/// members' spans (for the outline) and `keep_indices` carries the kept
+/// member indices the apply echoes back.
 #[derive(Debug, Clone)]
 pub struct Overlay {
     pub key: PreviewKey,
     pub spans: Arc<[(usize, usize)]>,
     pub total_matches: u64,
     pub zero_width_count: u64,
+    pub keep_indices: Option<Arc<[usize]>>,
 }
 
 /// Per-view match-selection row state.
@@ -307,11 +310,15 @@ pub fn handle(app: &mut App, message: SelectionSearchMessage) -> iced::Task<Mess
         SelectionSearchMessage::ToggleInSelections(tab) => {
             let mut changed = false;
             if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
-                state.in_selections = !state.in_selections;
-                state.query_version = state.query_version.wrapping_add(1);
-                state.overlay = None;
-                state.error = None;
-                changed = true;
+                // Keep/drop is inherently selection-scoped; the toggle only
+                // applies to the select/split rows (E-4).
+                if matches!(state.kind, ApplyKind::Select | ApplyKind::Split) {
+                    state.in_selections = !state.in_selections;
+                    state.query_version = state.query_version.wrapping_add(1);
+                    state.overlay = None;
+                    state.error = None;
+                    changed = true;
+                }
             }
             if changed {
                 request_collection(app, tab);
@@ -365,6 +372,13 @@ pub fn apply_enabled(app: &App, tab: TabId) -> bool {
     PreviewKey::current(app, tab).as_ref() == Some(&overlay.key)
 }
 
+/// The current editor text for a tab (for caption-side gap derivation).
+fn view_text(app: &App, tab: TabId) -> String {
+    app.note_editor_view(tab)
+        .map(|view| view.text.to_string())
+        .unwrap_or_default()
+}
+
 /// The caption for the toolbar detail line while a row is open.
 #[must_use]
 pub fn caption(app: &App, tab: TabId) -> Option<String> {
@@ -389,7 +403,22 @@ pub fn caption(app: &App, tab: TabId) -> Option<String> {
             scope
         ),
         ApplyKind::Split => {
-            let gaps = overlay.spans.len();
+            // The overlay holds matches; gaps are derived by the same
+            // helpers the apply uses (document-wide or per-member), so the
+            // caption is exact and never diverges from the applied set.
+            let gaps = if state.in_selections {
+                let members = EditorTarget::capture(app, tab)
+                    .map(|target| target.selections)
+                    .unwrap_or_default();
+                flavite_buffer::selection::split_gaps_per_member(
+                    &view_text(app, tab),
+                    &overlay.spans,
+                    &members,
+                )
+            } else {
+                flavite_buffer::selection::split_gaps(&view_text(app, tab), &overlay.spans)
+            };
+            let gaps = gaps.len();
             format!(
                 "{gaps} gap{} in scope{}",
                 if gaps == 1 { "" } else { "s" },
@@ -534,17 +563,11 @@ fn request_collection(app: &mut App, tab: TabId) {
         .unwrap_or(ApplyKind::Select);
     let request_id = api.command_registry().next_request_id();
 
-    // Build scope_spans from current selections if in_selections is true
-    let scope_spans: Option<Vec<(usize, usize)>> = if in_selections {
-        Some(target.selections.clone())
-    } else {
-        None
-    };
-
-    let result = api.execute(Invocation::new(
-        request_id,
-        kind.command_id(),
-        serde_json::json!({
+    // Keep/drop filters the live selection set: the request carries `keep`
+    // and no scope fields (the handler derives the spans from `selections`).
+    // Select/split carry the scope toggle + spans (FEUX-0006 E-2/E-4).
+    let args = match kind {
+        ApplyKind::Keep { keep } => serde_json::json!({
             "buffer_id": view.buffer_id,
             "revision": view.revision,
             "selections": target.selections_json(),
@@ -553,9 +576,35 @@ fn request_collection(app: &mut App, tab: TabId) {
                 "regex": regex,
                 "case_sensitive": case_sensitive,
             },
-            "in_selections": in_selections,
-            "scope_spans": scope_spans,
+            "keep": keep,
+            "apply": false,
         }),
+        _ => {
+            // Build scope_spans from current selections if in_selections is true
+            let scope_spans: Option<Vec<(usize, usize)>> = if in_selections {
+                Some(target.selections.clone())
+            } else {
+                None
+            };
+            serde_json::json!({
+                "buffer_id": view.buffer_id,
+                "revision": view.revision,
+                "selections": target.selections_json(),
+                "query": {
+                    "text": query,
+                    "regex": regex,
+                    "case_sensitive": case_sensitive,
+                },
+                "in_selections": in_selections,
+                "scope_spans": scope_spans,
+            })
+        }
+    };
+
+    let result = api.execute(Invocation::new(
+        request_id,
+        kind.command_id(),
+        args,
         Origin::Gui,
     ));
     match result {
@@ -609,9 +658,6 @@ fn install_collection(app: &mut App, tab: TabId, key: &PreviewKey, data: &serde_
     let Some(view) = app.note_editor_view(tab) else {
         return;
     };
-    let Some(raw_spans) = data.get("spans").and_then(serde_json::Value::as_array) else {
-        return;
-    };
     if current.as_ref() != Some(key) {
         // Stale or out-of-order: reject by exact key match (E-11).
         if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
@@ -620,6 +666,68 @@ fn install_collection(app: &mut App, tab: TabId, key: &PreviewKey, data: &serde_
         }
         return;
     }
+    let kind = app
+        .selection_search
+        .tabs
+        .get(&tab)
+        .map(|s| s.kind)
+        .unwrap_or(ApplyKind::Select);
+    // Keep-matching completes with the kept member indices and the match
+    // total; the survivor spans are derived from the (key-fresh) selection
+    // set for the outline.
+    if matches!(kind, ApplyKind::Keep { .. }) {
+        let Some(raw_indices) = data
+            .get("selection_indices")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return;
+        };
+        let mut indices = Vec::with_capacity(raw_indices.len());
+        for raw in raw_indices {
+            let Some(index) = raw.as_u64() else {
+                return;
+            };
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            indices.push(index);
+        }
+        let Some(match_count) = data.get("match_count").and_then(serde_json::Value::as_u64) else {
+            return;
+        };
+        let Some(target) = EditorTarget::capture(app, tab) else {
+            return;
+        };
+        let mut spans = Vec::with_capacity(indices.len());
+        for &index in &indices {
+            let Some(&(start, end)) = target.selections.get(index) else {
+                return;
+            };
+            spans.push((start, end));
+        }
+        if let Some(state) = app.selection_search.tabs.get_mut(&tab) {
+            state.pending = None;
+            state.error = None;
+            state.overlay = Some(Overlay {
+                key: key.clone(),
+                spans: Arc::from(spans.into_boxed_slice()),
+                total_matches: match_count,
+                zero_width_count: 0,
+                keep_indices: Some(Arc::from(indices.into_boxed_slice())),
+            });
+        }
+        diag(
+            app,
+            tab,
+            EventKind::MatchPreview,
+            Outcome::Ready,
+            u32::try_from(match_count).ok(),
+        );
+        return;
+    }
+    let Some(raw_spans) = data.get("spans").and_then(serde_json::Value::as_array) else {
+        return;
+    };
     let mut spans = Vec::with_capacity(raw_spans.len());
     for raw in raw_spans {
         let Some(pair) = raw.as_array() else {
@@ -660,6 +768,7 @@ fn install_collection(app: &mut App, tab: TabId, key: &PreviewKey, data: &serde_
             spans: Arc::from(spans.into_boxed_slice()),
             total_matches,
             zero_width_count,
+            keep_indices: None,
         });
     }
     diag(
@@ -703,23 +812,50 @@ fn apply(app: &mut App, tab: TabId) -> iced::Task<Message> {
     // refusals.
     let total_matches = overlay.total_matches;
     let zero_width_count = overlay.zero_width_count;
-    let installed = crate::host::context_mode::selections_only(
-        app,
-        &target,
-        kind.command_id(),
-        serde_json::json!({
-            "query": {
-                "text": query,
-                "regex": regex,
-                "case_sensitive": case_sensitive,
-            },
-            "in_selections": in_selections,
-            "apply": true,
-            "spans": spans,
-            "total_matches": total_matches,
-            "zero_width_count": zero_width_count,
-        }),
-    );
+    let installed = if let ApplyKind::Keep { keep } = kind {
+        // Keep/drop apply echoes back the kept member indices and the
+        // match total; the survivor set is rebuilt api-side from the live
+        // set (E-4).
+        let indices: Vec<usize> = overlay
+            .keep_indices
+            .as_ref()
+            .map(|slice| slice.to_vec())
+            .unwrap_or_default();
+        crate::host::context_mode::selections_only(
+            app,
+            &target,
+            kind.command_id(),
+            serde_json::json!({
+                "query": {
+                    "text": query,
+                    "regex": regex,
+                    "case_sensitive": case_sensitive,
+                },
+                "keep": keep,
+                "apply": true,
+                "selection_indices": indices,
+                "match_count": total_matches,
+            }),
+        )
+    } else {
+        crate::host::context_mode::selections_only(
+            app,
+            &target,
+            kind.command_id(),
+            serde_json::json!({
+                "query": {
+                    "text": query,
+                    "regex": regex,
+                    "case_sensitive": case_sensitive,
+                },
+                "in_selections": in_selections,
+                "apply": true,
+                "spans": spans,
+                "total_matches": total_matches,
+                "zero_width_count": zero_width_count,
+            }),
+        )
+    };
     if installed.is_some() {
         // The committed set replaced the overlay; the row stays open for a
         // refined query.

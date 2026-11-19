@@ -1229,6 +1229,71 @@ pub fn split_gaps(text: &str, spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
     gaps
 }
 
+/// The gaps *within* each member between consecutive matches fully contained
+/// in that member (FEUX-0006 E-2 `S` in-selections): per member, the leading
+/// gap (start → first match) and trailing gap (last match → end) are included
+/// iff non-empty; a member with **no** matches contributes its whole span
+/// (Kakoune semantics — `S` on unmatched text keeps it); zero-width matches
+/// collapse to a boundary and adjacent zero-width matches collapse to one
+/// boundary (delivered rule).
+///
+/// `matches` MUST be ascending and non-overlapping and fully contained in
+/// some member (the scoped matcher's guarantee); `members` MUST be sorted
+/// ascending and non-overlapping (a canonical selection set). Matches that
+/// are not fully contained in any member are ignored — edge-straddlers
+/// belong to no member (E-2).
+#[must_use]
+pub fn split_gaps_per_member(
+    text: &str,
+    matches: &[(usize, usize)],
+    members: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut gaps = Vec::new();
+    let mut i = 0usize;
+    for &(member_start, member_end) in members {
+        let member_end = member_end.min(text.len());
+        // Skip matches wholly before this member. A zero-width match exactly
+        // at the member's start is contained (it lies inside [start, end)),
+        // so the skip key is the raw start, not the end.
+        while i < matches.len() && matches[i].0 < member_start {
+            i += 1;
+        }
+        // Collect the contiguous block of matches fully contained here; any
+        // match that overlaps this member but is not fully contained
+        // (edge-straddler) is skipped — matches wholly after the member are
+        // left for their own member.
+        while i < matches.len()
+            && matches[i].0 < member_end
+            && (matches[i].0 < member_start || matches[i].1 > member_end)
+        {
+            i += 1;
+        }
+        let first = i;
+        while i < matches.len() && matches[i].1 <= member_end {
+            i += 1;
+        }
+        let contained = &matches[first..i];
+        if contained.is_empty() {
+            // Unmatched member contributes itself (Kakoune `S` on plain text).
+            if member_start < member_end {
+                gaps.push((member_start, member_end));
+            }
+            continue;
+        }
+        let mut cursor = member_start;
+        for &(start, end) in contained {
+            if start > cursor {
+                gaps.push((cursor, start));
+            }
+            cursor = end.max(cursor);
+        }
+        if cursor < member_end {
+            gaps.push((cursor, member_end));
+        }
+    }
+    gaps
+}
+
 /// The delivered `editor.select_line` range: the line containing `at`
 /// including its line break when one follows.
 #[must_use]
@@ -1570,6 +1635,99 @@ mod tests {
         let gaps = split_gaps(text, &spans);
         assert_eq!(gaps.len(), text.len());
         assert!(gaps.iter().all(|&(start, end)| start < end));
+    }
+
+    #[test]
+    fn split_gaps_per_member_keeps_member_edges_and_unmatched_members() {
+        let text = "aa|bb|cc"; // 8 bytes
+        // Members: [0,3), [3,6), [6,8). Matches fully inside members 0 and 2.
+        let matches = [(0, 2), (6, 7)];
+        let members = [(0, 3), (3, 6), (6, 8)];
+        // Member 0: leading gap none, trailing (2,3). Member 1: unmatched →
+        // contributes itself (3,6). Member 2: leading (6,6)? none, trailing (7,8).
+        assert_eq!(
+            split_gaps_per_member(text, &matches, &members),
+            vec![(2, 3), (3, 6), (7, 8)]
+        );
+    }
+
+    #[test]
+    fn split_gaps_per_member_matches_at_edges_and_zero_width_collapse() {
+        let text = "abc"; // 3 bytes
+        // Match ends exactly at member end; match starts exactly at member start.
+        let members = [(0, 3)];
+        assert_eq!(
+            split_gaps_per_member(text, &[(0, 3)], &members),
+            Vec::<(usize, usize)>::new(),
+            "full coverage yields no gaps"
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(1, 2)], &members),
+            vec![(0, 1), (2, 3)]
+        );
+        // Zero-width matches at 1 and 2 form boundaries; adjacent zero-width
+        // matches at the same position (1) collapse to one boundary.
+        assert_eq!(
+            split_gaps_per_member(text, &[(1, 1), (2, 2)], &members),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(1, 1), (1, 1)], &members),
+            vec![(0, 1), (1, 3)]
+        );
+        // A zero-width match exactly at a member bound is contained: it does
+        // not make the member look unmatched.
+        assert_eq!(
+            split_gaps_per_member(text, &[(0, 0)], &members),
+            vec![(0, 3)]
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(3, 3)], &members),
+            vec![(0, 3)]
+        );
+        // A straddler belongs to no member, so every member is unmatched and
+        // contributes itself.
+        assert_eq!(
+            split_gaps_per_member(text, &[(0, 3)], &[(0, 2), (2, 3)]),
+            vec![(0, 2), (2, 3)]
+        );
+        // A match wholly inside a later member is left for that member, never
+        // consumed as a straddler of an earlier member.
+        assert_eq!(
+            split_gaps_per_member(text, &[(2, 3)], &[(0, 2), (2, 3)]),
+            vec![(0, 2)]
+        );
+    }
+
+    #[test]
+    fn split_gaps_per_member_caret_members_and_document_edges() {
+        // A caret member (start == end) contributes nothing and cannot
+        // produce gaps.
+        let text = "abcdef";
+        let members = [(0, 2), (2, 2), (2, 6)];
+        assert_eq!(
+            split_gaps_per_member(text, &[(3, 4)], &members),
+            vec![(0, 2), (2, 3), (4, 6)]
+        );
+        // Members at the document edges: the first member's leading gap and
+        // the last member's trailing gap are bounded by the text.
+        assert_eq!(
+            split_gaps_per_member(text, &[(2, 4)], &[(0, 6)]),
+            vec![(0, 2), (4, 6)]
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(0, 2)], &[(0, 6)]),
+            vec![(2, 6)]
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(4, 6)], &[(0, 6)]),
+            vec![(0, 4)]
+        );
+        // A member extending to the end of the text still bounds its gaps.
+        assert_eq!(
+            split_gaps_per_member(text, &[(2, 4)], &[(0, 4), (4, 6)]),
+            vec![(0, 2), (4, 6)]
+        );
     }
 }
 

@@ -4145,6 +4145,9 @@ impl App {
         if crate::host::selection_search::completion(self, &completion) {
             return;
         }
+        if crate::host::command_args::completion(self, &completion) {
+            return;
+        }
         if self.replace.observe(&completion) {
             return;
         }

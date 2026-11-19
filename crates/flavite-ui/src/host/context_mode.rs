@@ -326,13 +326,23 @@ pub fn available(app: &App, target: EditorTarget, command: ContextCommand) -> bo
     {
         return false;
     }
+    let requires_write = command.mutates() || command.enters_typing();
+    // ReplaceRegex opens its draft even in read-only vaults: the live
+    // preview is compute-only ReadNotes; commit is refused at Enter when
+    // the vault state demands it (E-12). Every other mutating command keeps
+    // the delivered write gate.
+    let write_ok = if command == ContextCommand::ReplaceRegex {
+        !too_narrow(app, target.tab)
+    } else {
+        !requires_write
+            || (!too_narrow(app, target.tab)
+                && app.flavite.as_ref().is_some_and(|api| !api.is_read_only()))
+    };
     valid(app, target.clone(), false)
         && !app.has_composition()
         && app.dialog.is_none()
         && app.shutdown.is_none()
-        && (!(command.mutates() || command.enters_typing())
-            || (!too_narrow(app, target.tab)
-                && app.flavite.as_ref().is_some_and(|api| !api.is_read_only())))
+        && write_ok
 }
 
 pub(crate) fn seal(app: &App, tab: TabId) {
@@ -1046,6 +1056,152 @@ pub(crate) fn kernel_mutate(
         Some(target.selections.len() as u32),
     );
     Some(success)
+}
+
+/// Commit a computed regex-replace plan through the delivered editor kernel
+/// (FEUX-0006 E-5): the worker computed the ops; this path issues the
+/// operation ticket, validates the ops at admission (ascending,
+/// non-overlapping, in-bounds scalar boundaries), maps the live selection
+/// set through the ops to the exact recorded after-set (§5.5), and runs
+/// `apply_edits` with one origin-sealed undo node. The initiating view gets
+/// its exact after-set (never the passive clamp); passive views map through
+/// the delivered movement-delta path.
+pub(crate) fn replace_commit(
+    app: &mut App,
+    tab: TabId,
+    target: &EditorTarget,
+    ops: Vec<(usize, usize, String)>,
+) -> Result<(), String> {
+    let Some(view) = app.note_editor_view(tab) else {
+        return Err("Source changed; replace was refused".into());
+    };
+    let text = &view.text;
+    // Admission validation of the worker-computed ops — primary here, the
+    // worker guarantee is defense-in-depth (mirrors §5.4 layering).
+    let mut cursor = 0usize;
+    for (start, end, _) in &ops {
+        if *start > *end
+            || *end > text.len()
+            || *start < cursor
+            || !text.is_char_boundary(*start)
+            || !text.is_char_boundary(*end)
+        {
+            return Err("Replace plan ops are invalid; refusing".into());
+        }
+        cursor = *end;
+    }
+    let Some(api) = &app.flavite else {
+        return Err("Vault unavailable".into());
+    };
+    let issue = Invocation::new(
+        api.command_registry().next_request_id(),
+        "editor.issue_operation",
+        serde_json::json!({
+            "buffer_id": target.buffer,
+            "revision": target.revision,
+            "view": {
+                "view": format!("{:032x}", tab.raw()),
+                "incarnation": target.incarnation,
+                "selection_version": target.selection_version,
+            },
+        }),
+        Origin::Gui,
+    );
+    let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = api.execute(issue)
+    else {
+        return Err("Operation could not be started".into());
+    };
+    let Some(operation) = success.data.get("operation").cloned() else {
+        return Err("Operation could not be started".into());
+    };
+    // The recorded before-set from the live selection set (canonical
+    // triples), then the exact after-set mapped through the ops (§5.5).
+    let candidates: Vec<flavite_buffer::selection::RawSelection> = target
+        .selections
+        .iter()
+        .enumerate()
+        .map(
+            |(index, &(anchor, head))| flavite_buffer::selection::RawSelection {
+                id: Some(u32::try_from(index).unwrap_or(u32::MAX)),
+                anchor,
+                head,
+            },
+        )
+        .collect();
+    let hint = u32::try_from(target.primary).ok();
+    let (before, _) = flavite_buffer::selection::SelectionSet::normalize(text, candidates, hint)
+        .map_err(|error| error.to_string())?;
+    let edits: Vec<flavite_buffer::selection::SpanEdit> = ops
+        .iter()
+        .map(|&(start, end, ref replacement)| {
+            flavite_buffer::selection::SpanEdit::new(start, end, replacement.len())
+        })
+        .collect();
+    let (after, _) = before.map_through(&edits);
+    let before_triples = before.to_triples();
+    let after_triples = after.to_triples();
+    let before_primary = before_triples
+        .iter()
+        .position(|triple| triple[0] == before.primary_id().as_raw() as usize)
+        .unwrap_or(0);
+    let after_primary = after_triples
+        .iter()
+        .position(|triple| triple[0] == after.primary_id().as_raw() as usize)
+        .unwrap_or(0);
+    let record = flavite_buffer::history::EditorEdit {
+        before_primary,
+        origin: format!("{:032x}", tab.raw()),
+        kind: flavite_buffer::history::EditKind::Replace,
+        before: before_triples,
+        after: after_triples,
+        primary: after_primary,
+    };
+    let ops_wire: Vec<serde_json::Value> = ops
+        .into_iter()
+        .map(|(start, end, replacement)| {
+            serde_json::json!({"range": [start, end], "replacement": replacement})
+        })
+        .collect();
+    let result = api.execute(Invocation::new(
+        api.command_registry().next_request_id(),
+        "apply_edits",
+        serde_json::json!({
+            "buffer_id": target.buffer,
+            "revision": target.revision,
+            "operation": operation,
+            "ops": ops_wire,
+            "undo_policy": "isolated",
+            "editor": record,
+        }),
+        Origin::Gui,
+    ));
+    let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result else {
+        let message = match &result {
+            ExecutionResult::Rejected(rejected) => rejected
+                .message
+                .clone()
+                .unwrap_or_else(|| "Replace was refused".into()),
+            ExecutionResult::Local(flavite_api::LocalResult::Error(error)) => error.message.clone(),
+            _ => "Replace was refused".into(),
+        };
+        diag(
+            app,
+            tab,
+            EventKind::OperationRefused,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
+        return Err(message);
+    };
+    install_receipt(app, target, &success);
+    diag(
+        app,
+        tab,
+        EventKind::OperationApplied,
+        Outcome::Applied,
+        Some(target.selections.len() as u32),
+    );
+    Ok(())
 }
 
 /// Interpret a mutating receipt: map passive views once, install the exact

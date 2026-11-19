@@ -28,9 +28,10 @@ fn doctor_uses_vault_identity_and_reports_corrupt_cache() {
         .lines()
         .find_map(|line| line.strip_prefix("uuid = \"")?.strip_suffix('"'))
         .unwrap();
-    let db = cache_root
+    let db = root
         .path()
-        .join("flavite/flavite")
+        .join(".flavite")
+        .join("cache")
         .join(uuid)
         .join("v4/index.sqlite3");
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();

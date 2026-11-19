@@ -1419,7 +1419,7 @@ pub(crate) fn handle_keep_matching(
     let args: EditorKeepMatchingArgs = decode(invocation)?;
     let buffer_id = BufferId::from(args.buffer_id);
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    normalize_set(&snapshot.text, &args.selections)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
     let mode = decode_mode(args.query.regex);
 
     if !args.apply {
@@ -1458,9 +1458,9 @@ pub(crate) fn handle_keep_matching(
 
     apply_keep_matching(
         &snapshot.text,
+        &set,
         &selection_indices,
         match_count,
-        args.keep,
         args.buffer_id,
         args.revision,
     )
@@ -1474,30 +1474,42 @@ fn selection_set_to_spans(args: &SelectionSetArg) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Apply keep_matching: filter the current selections based on the indices.
+/// Apply keep_matching: filter the current selections to those named by
+/// `selection_indices` (indices into the canonical `set`, in document
+/// order). A filter that would empty the set is refused whole with the count
+/// (E-4), prior set kept. The result is re-normalized with the delivered
+/// primary-hint rule (survivor containing the old primary, else last).
 fn apply_keep_matching(
     text: &str,
+    set: &SelectionSet,
     selection_indices: &[usize],
-    _match_count: u64,
-    _keep: bool,
+    match_count: u64,
     buffer_id: u64,
     revision: u64,
 ) -> Result<SessionResult, String> {
-    // For FEUX-0006, we need to filter the original selections
-    // Based on the spec, if the result would empty the set, we refuse
-    if selection_indices.is_empty() {
-        return Err("All selections would be dropped".into());
+    if match_count == 0 {
+        return Err(format!("All {} selections would be dropped", set.len()));
     }
-
-    // This is a simplified implementation
-    // In reality, we need to map the indices back to the actual selections
-    // For now, we'll use an empty set as placeholder
-    // The actual implementation would filter based on selection_indices
-    let (empty_set, _id_remap) =
-        flavite_buffer::selection::SelectionSet::normalize(text, vec![], None)
-            .map_err(|e| e.to_string())?;
-
-    Ok(selections_changed(buffer_id, revision, &empty_set))
+    let members = set.members();
+    let survivors: Vec<RawSelection> = selection_indices
+        .iter()
+        .map(|&index| {
+            let member = members
+                .get(index)
+                .ok_or_else(|| format!("selection index {index} is out of range"))?;
+            Ok(RawSelection {
+                id: Some(member.id().as_raw()),
+                anchor: member.anchor(),
+                head: member.head(),
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    if survivors.is_empty() {
+        return Err(format!("All {} selections would be dropped", members.len()));
+    }
+    let (filtered, _) = SelectionSet::normalize(text, survivors, Some(set.primary_id().as_raw()))
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(buffer_id, revision, &filtered))
 }
 
 // FEUX-0004 X01: Transform family handlers
@@ -2162,7 +2174,7 @@ fn handle_match_selection(
     // Both paths validate the committed set against the live snapshot; a
     // stale capture is refused before any collection or install.
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    normalize_set(&snapshot.text, &args.selections)?;
+    let set = normalize_set(&snapshot.text, &args.selections)?;
     let mode = decode_mode(args.query.regex);
 
     // Build scope_spans from current selections if in_selections is true
@@ -2214,10 +2226,17 @@ fn handle_match_selection(
             args.revision,
         )
     } else {
+        let members: Vec<(usize, usize)> = set
+            .members()
+            .iter()
+            .map(|member| (member.start(), member.end()))
+            .collect();
         apply_split_selection(
             &snapshot.text,
             &spans,
             total_matches,
+            args.in_selections,
+            &members,
             args.buffer_id,
             args.revision,
         )
@@ -2255,12 +2274,15 @@ fn apply_select_matches(
 
 /// The split apply: refuse an oversize match set with the exact observed
 /// count (a truncated span list cannot derive exact gaps), canonicalize,
-/// compute the document-wide gaps, refuse an empty gap set (`NoGaps`), then
+/// compute the gaps — document-wide by default, per-member (§5.2) when the
+/// search was selection-scoped — refuse an empty gap set (`NoGaps`), then
 /// install the gap set.
 fn apply_split_selection(
     text: &str,
     spans: &[(usize, usize)],
     total_matches: u64,
+    in_selections: bool,
+    members: &[(usize, usize)],
     buffer_id: u64,
     revision: u64,
 ) -> Result<SessionResult, String> {
@@ -2273,14 +2295,11 @@ fn apply_split_selection(
     if spans.len() as u64 != total_matches {
         return Err("collection spans do not match the observed total".into());
     }
-    let set = flavite_buffer::selection::selection_set_from_spans(text, spans, None)
-        .map_err(|error| error.to_string())?;
-    let members: Vec<(usize, usize)> = set
-        .members()
-        .iter()
-        .map(|member| (member.start(), member.end()))
-        .collect();
-    let gaps = flavite_buffer::selection::split_gaps(text, &members);
+    let gaps = if in_selections {
+        flavite_buffer::selection::split_gaps_per_member(text, spans, members)
+    } else {
+        flavite_buffer::selection::split_gaps(text, spans)
+    };
     if gaps.is_empty() {
         return Err("NoGaps".into());
     }

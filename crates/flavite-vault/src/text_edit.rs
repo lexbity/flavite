@@ -959,6 +959,263 @@ mod tests {
     }
 
     #[test]
+    fn prepare_error_messages_cover_every_typed_variant() {
+        use flavite_text_search::matcher::MatchError;
+        use flavite_text_search::template::TemplateError;
+        let regex_err = match Matcher::new(
+            "(",
+            MatchOptions {
+                mode: MatchMode::Regex,
+                case_sensitive: false,
+                whole_word: false,
+            },
+            MatchLimits {
+                max_matches: MAX_MATCHES_PER_JOB,
+            },
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an invalid regex unexpectedly compiled"),
+        };
+        let cases: Vec<(PrepareError, &str)> = vec![
+            (PrepareError::InvalidQuery("bad"), "bad"),
+            (
+                PrepareError::Matcher(MatchError::EmptyQuery),
+                "query is empty",
+            ),
+            (
+                PrepareError::Matcher(MatchError::PatternTooLong {
+                    observed: 9999,
+                    limit: 8192,
+                }),
+                "8 KiB",
+            ),
+            (PrepareError::Matcher(regex_err), "invalid"),
+            (
+                PrepareError::Matcher(MatchError::RegexTooManyGroups {
+                    observed: 65,
+                    limit: 64,
+                }),
+                "64",
+            ),
+            (
+                PrepareError::Matcher(MatchError::InvalidScope { offset: 7 }),
+                "7",
+            ),
+            (
+                PrepareError::Matcher(MatchError::LimitExceeded {
+                    observed: 1_000_001,
+                    limit: 1_000_000,
+                }),
+                "too many",
+            ),
+            (
+                PrepareError::Matcher(MatchError::OrdinalOutOfRange {
+                    ordinal: 9,
+                    total: 5,
+                }),
+                "ordinal",
+            ),
+            (
+                PrepareError::Template(TemplateError::TooLong {
+                    observed: 70_000,
+                    limit: 65_536,
+                }),
+                "64 KiB",
+            ),
+            (
+                PrepareError::Template(TemplateError::DanglingDollar { offset: 3 }),
+                "3",
+            ),
+            (
+                PrepareError::Template(TemplateError::MalformedBraces { offset: 4 }),
+                "4",
+            ),
+            (
+                PrepareError::Template(TemplateError::UnknownGroup { group: "9".into() }),
+                "unknown",
+            ),
+            (
+                PrepareError::Template(TemplateError::LengthOverflow),
+                "invalid",
+            ),
+            (
+                PrepareError::Template(TemplateError::OutputTooLarge {
+                    observed: 9,
+                    limit: 4,
+                }),
+                "invalid",
+            ),
+            (PrepareError::MatchLimitExceeded, "too many"),
+            (PrepareError::MatchOffsetOutOfRange, "out of range"),
+            (PrepareError::OutputLimitExceeded, "bound"),
+            (PrepareError::InvalidScope, "scope"),
+            (PrepareError::Cancelled, "cancelled"),
+            (
+                PrepareError::RegexUnavailable {
+                    reason: "helper-not-installed".into(),
+                },
+                "regex is unavailable",
+            ),
+            (PrepareError::RegexTimeout, "5-second"),
+            (
+                PrepareError::Worker(crate::text_worker::TextWorkerError::Busy),
+                "busy",
+            ),
+            (
+                PrepareError::Worker(crate::text_worker::TextWorkerError::Unavailable {
+                    reason: "spawn",
+                }),
+                "helper",
+            ),
+        ];
+        for (error, needle) in cases {
+            let message = error.message();
+            assert!(
+                message.contains(needle),
+                "message {message:?} should mention {needle:?} for {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_replace_plan_computes_ops_and_totals_and_respects_scope() {
+        let plan = prepare_replace_plan(
+            "aa bb aa",
+            &ReplacePlanRequest {
+                buffer_id: BufferId::from(1),
+                revision: Revision::new(1),
+                query: "aa".into(),
+                replacement: "[$0]".into(),
+                case_sensitive: false,
+                whole_word: false,
+                mode: MatchMode::Literal,
+                scope_spans: vec![],
+            },
+        )
+        .expect("literal plan");
+        // Literal grammar keeps `$` verbatim.
+        assert_eq!(plan.match_count, 2);
+        assert_eq!(plan.ops[0].replacement, "[$0]");
+        assert_eq!(plan.ops[1].replacement, "[$0]");
+        assert_eq!(plan.ops[0].range.start.0, 0);
+        assert_eq!(plan.ops[1].range.start.0, 6);
+        // Output length is the source length adjusted by the spans and their
+        // expansions (the parent's own arithmetic).
+        let span_len: u64 = plan
+            .ops
+            .iter()
+            .map(|op| (op.range.end.0 - op.range.start.0) as u64)
+            .sum();
+        let expansion_len: u64 = plan.ops.iter().map(|op| op.replacement.len() as u64).sum();
+        assert_eq!(plan.output_len, 8 - span_len + expansion_len);
+
+        let scoped = prepare_replace_plan(
+            "aa bb aa",
+            &ReplacePlanRequest {
+                buffer_id: BufferId::from(1),
+                revision: Revision::new(1),
+                query: "aa".into(),
+                replacement: "X".into(),
+                case_sensitive: false,
+                whole_word: false,
+                mode: MatchMode::Literal,
+                scope_spans: vec![(0, 5)],
+            },
+        )
+        .expect("scoped plan");
+        assert_eq!(scoped.match_count, 1);
+        assert_eq!(scoped.ops[0].range.start.0, 0);
+        assert_eq!(scoped.output_len, 7, "8 - 2 + 1");
+    }
+
+    #[test]
+    fn literal_replace_plan_empty_query_is_idle_and_oversize_template_refuses() {
+        let idle = prepare_replace_plan(
+            "text",
+            &ReplacePlanRequest {
+                buffer_id: BufferId::from(1),
+                revision: Revision::new(1),
+                query: String::new(),
+                replacement: "X".into(),
+                case_sensitive: false,
+                whole_word: false,
+                mode: MatchMode::Literal,
+                scope_spans: vec![],
+            },
+        );
+        assert!(matches!(idle, Err(PrepareError::InvalidQuery(_))));
+
+        let huge = "a".repeat(64 * 1024 * 1024);
+        let oversized = prepare_replace_plan(
+            "match",
+            &ReplacePlanRequest {
+                buffer_id: BufferId::from(1),
+                revision: Revision::new(1),
+                query: "match".into(),
+                replacement: huge,
+                case_sensitive: false,
+                whole_word: false,
+                mode: MatchMode::Literal,
+                scope_spans: vec![],
+            },
+        );
+        assert!(matches!(oversized, Err(PrepareError::OutputLimitExceeded)));
+    }
+
+    #[test]
+    fn regex_plan_template_preflight_reports_dangling_dollar_and_braces() {
+        // Template validation runs before any helper work (typed, exact).
+        let draft = |replacement: &str| ReplacePlanRequest {
+            buffer_id: BufferId::from(1),
+            revision: Revision::new(1),
+            query: "a".into(),
+            replacement: replacement.into(),
+            case_sensitive: false,
+            whole_word: false,
+            mode: MatchMode::Regex,
+            scope_spans: vec![],
+        };
+        match prepare_replace_plan("a", &draft("x$")) {
+            Err(PrepareError::Template(
+                flavite_text_search::template::TemplateError::DanglingDollar { .. },
+            )) => {}
+            other => panic!("expected dangling dollar, got {other:?}"),
+        }
+        match prepare_replace_plan("a", &draft("x${")) {
+            Err(PrepareError::Template(
+                flavite_text_search::template::TemplateError::MalformedBraces { .. },
+            )) => {}
+            other => panic!("expected malformed braces, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn literal_find_refuses_out_of_range_continuations_and_empty_queries() {
+        let find = |query: &str, offset: u64| FindRequest {
+            buffer_id: BufferId::from(1),
+            revision: Revision::new(1),
+            query: query.to_owned(),
+            mode: MatchMode::Literal,
+            case_sensitive: false,
+            whole_word: false,
+            offset,
+            scope_spans: vec![],
+        };
+        assert!(matches!(
+            prepare_find("text", &find("", 0)),
+            Err(PrepareError::InvalidQuery(message)) if message == "query is empty: find is idle"
+        ));
+        assert!(matches!(
+            prepare_find("aa", &find("aa", 3)),
+            Err(PrepareError::MatchOffsetOutOfRange)
+        ));
+        let truncated = prepare_find(&"x ".repeat(600), &find("x", 0)).expect("truncated page");
+        assert_eq!(truncated.spans.len(), 256);
+        assert!(truncated.truncated);
+        assert_eq!(truncated.next_offset, Some(256));
+    }
+
+    #[test]
     fn literal_find_continuation_uses_zero_based_ordinals() {
         let source = "x ".repeat(600);
         let outcome = prepare_find(

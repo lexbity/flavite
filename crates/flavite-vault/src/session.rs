@@ -4257,6 +4257,7 @@ impl Session {
         if self.text_queue_full() {
             return SessionResult::Busy;
         }
+        let cancelled = Arc::new(AtomicBool::new(false));
         match &self.text_jobs {
             Some(jobs)
                 if jobs
@@ -4264,11 +4265,14 @@ impl Session {
                         request_id,
                         text,
                         work: TextWork::ReplacePlan(request),
-                        cancelled: Arc::new(AtomicBool::new(false)),
+                        cancelled: cancelled.clone(),
                     })
                     .is_ok() =>
             {
                 self.pending_text.lock_recovering().insert(request_id);
+                self.text_cancels
+                    .lock_recovering()
+                    .insert(request_id, cancelled);
                 SessionResult::Pending { request_id }
             }
             _ => SessionResult::Error {

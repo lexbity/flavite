@@ -241,6 +241,120 @@ fn run(
 }
 
 #[test]
+fn replace_plan_regex_computes_ops_through_the_helper() {
+    // FEUX-0006 E-5: `text.replace_plan`'s worker computation runs regex
+    // through the isolated helper and expands `$1` per match.
+    let _lock = acquire_sibling_lock();
+    install_helper();
+    let plan = flavite_vault::text_edit::prepare_replace_plan(
+        "one two one",
+        &flavite_vault::text_edit::ReplacePlanRequest {
+            buffer_id: flavite_buffer::revision::BufferId::from(1),
+            revision: flavite_buffer::revision::Revision::new(1),
+            query: "(o)(n)".to_owned(),
+            replacement: "<$2$1>".to_owned(),
+            case_sensitive: false,
+            whole_word: false,
+            mode: MatchMode::Regex,
+            scope_spans: vec![],
+        },
+    )
+    .expect("regex plan");
+    assert_eq!(plan.match_count, 2);
+    assert_eq!(plan.ops[0].replacement, "<no>");
+    assert_eq!(plan.ops[1].replacement, "<no>");
+    assert_eq!(plan.ops[0].range.start.0, 0);
+    assert_eq!(plan.ops[1].range.start.0, 8);
+    assert_eq!(plan.output_len, 11 - 4 + 8, "11 - 2*2 span + 2*4 expansion");
+}
+
+#[test]
+fn match_collection_regex_uses_helper_and_proves_totals() {
+    // FEUX-0006 E-3/E-8: regex collection runs through the isolated helper
+    // and honors scope spans; whole-source and scoped results both return
+    // proven totals.
+    let _lock = acquire_sibling_lock();
+    install_helper();
+    let cancelled = AtomicBool::new(false);
+    let request = flavite_vault::text_select::SelectMatchesRequest {
+        buffer_id: flavite_buffer::revision::BufferId::from(1),
+        revision: flavite_buffer::revision::Revision::new(1),
+        query: "TODO".to_owned(),
+        mode: MatchMode::Regex,
+        case_sensitive: false,
+        whole_word: false,
+        scope_spans: vec![],
+    };
+    let outcome =
+        flavite_vault::text_select::collect_matches("TODO one\nTODO two\n", &request, &cancelled)
+            .expect("collect");
+    assert_eq!(outcome.spans, vec![(0, 4), (9, 13)]);
+    assert_eq!(outcome.total_matches, 2);
+    assert_eq!(outcome.zero_width_count, 0);
+
+    // Scoped: only matches fully inside the span are reported.
+    let mut scoped = request;
+    scoped.scope_spans = vec![(0, 8)];
+    let outcome =
+        flavite_vault::text_select::collect_matches("TODO one\nTODO two\n", &scoped, &cancelled)
+            .expect("collect");
+    assert_eq!(outcome.spans, vec![(0, 4)]);
+    assert_eq!(outcome.total_matches, 1);
+}
+
+#[test]
+fn keep_collection_regex_zero_width_counts_and_filters_members() {
+    // FEUX-0006 E-4/E-11: keep-matching runs regex through the isolated
+    // helper (never in-process) and counts zero-width matches as contained —
+    // `^` (multi_line) keeps every member whose span contains a line start.
+    let _lock = acquire_sibling_lock();
+    install_helper();
+    let cancelled = AtomicBool::new(false);
+    // "aa\nbb\ncc\n": line starts at 0, 3, and 6 (multi_line `^`).
+    // Containment is inclusive on both ends (E-2: s.start ≤ start ∧ end ≤
+    // s.end), so a zero-width match exactly at a member boundary counts.
+    // Member [1,2) contains no line start; member [3,5) contains (3,3).
+    let family =
+        |keep: bool, spans: Vec<(usize, usize)>| flavite_vault::text_select::KeepMatchingRequest {
+            buffer_id: flavite_buffer::revision::BufferId::from(1),
+            revision: flavite_buffer::revision::Revision::new(1),
+            query: "^".to_owned(),
+            mode: MatchMode::Regex,
+            case_sensitive: false,
+            keep,
+            scope_spans: spans,
+        };
+    let outcome = flavite_vault::text_select::collect_keep_matches(
+        "aa\nbb\ncc\n",
+        &family(true, vec![(1, 2), (3, 5)]),
+        &cancelled,
+    )
+    .expect("keep");
+    assert_eq!(outcome.selection_indices, vec![1]);
+    assert_eq!(outcome.match_count, 1);
+    // The complement keeps the non-matching member.
+    let outcome = flavite_vault::text_select::collect_keep_matches(
+        "aa\nbb\ncc\n",
+        &family(false, vec![(1, 2), (3, 5)]),
+        &cancelled,
+    )
+    .expect("keep");
+    assert_eq!(outcome.selection_indices, vec![0]);
+    assert_eq!(outcome.match_count, 1);
+
+    // A zero-width match exactly at a member's start is contained: both
+    // members keep `^` (line starts 0 and 3 are each at a member start).
+    let outcome = flavite_vault::text_select::collect_keep_matches(
+        "aa\nbb\n",
+        &family(true, vec![(0, 2), (3, 5)]),
+        &cancelled,
+    )
+    .expect("keep");
+    assert_eq!(outcome.selection_indices, vec![0, 1]);
+    assert_eq!(outcome.match_count, 2);
+}
+
+#[test]
 fn missing_helper_is_typed_unavailable_and_literal_is_unaffected() {
     let _lock = acquire_sibling_lock();
     uninstall_helper();

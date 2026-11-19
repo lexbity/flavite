@@ -10,11 +10,13 @@
 //! per-field validation.
 
 use crate::app::{App, Message};
-use crate::host::context_mode::{EditorTarget, kernel_mutate};
-use flavite_api::{Invocation, Origin};
+use crate::host::context_mode::{EditorTarget, kernel_mutate, replace_commit};
+use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
+use flavite_api::{ExecutionResult, Invocation, LocalResult, Origin};
 use flavite_edit_context::vocabulary::ContextCommand;
 use flavite_workspace::TabId;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Pattern size bound (8 KiB) - matches flavite_text_search::PATTERN_MAX_BYTES
 const PATTERN_MAX_BYTES: usize = 8 * 1024;
@@ -138,6 +140,15 @@ impl FieldState {
     }
 }
 
+/// A computed replace preview: the exact match/op totals and the op ranges
+/// (for the outline). Compute-only (FEUX-0006 E-6): never a commit input.
+#[derive(Debug, Clone)]
+pub struct ReplacePreview {
+    pub match_count: u64,
+    pub output_len: u64,
+    pub spans: Arc<[(usize, usize)]>,
+}
+
 /// Per-view command-argument row state.
 #[derive(Debug)]
 pub struct CommandArgsState {
@@ -153,6 +164,17 @@ pub struct CommandArgsState {
     pub target: EditorTarget,
     /// Scope for replace_regex: true = Selections, false = Document.
     pub in_selections: bool,
+    /// The in-flight replace_plan request (preview or commit), if any.
+    pub pending: Option<u64>,
+    /// A preview/commit refresh queued behind the in-flight request: with at
+    /// most one worker job per draft, a new draft pass waits for the current
+    /// one to settle instead of double-firing (the helper pool is app-wide).
+    pub refresh_pending: Option<bool>,
+    /// The latest computed preview (replace_regex only).
+    pub preview: Option<ReplacePreview>,
+    /// Plan-level error (replace_regex): shown on the row independent of any
+    /// single field's validation error.
+    pub state_error: Option<String>,
 }
 
 impl CommandArgsState {
@@ -165,6 +187,10 @@ impl CommandArgsState {
             focused: true,
             target,
             in_selections: false,
+            pending: None,
+            refresh_pending: None,
+            preview: None,
+            state_error: None,
         }
     }
 
@@ -279,15 +305,18 @@ fn validate_regex_compile(pattern: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Host state: one row per tab.
+/// Host state: one row per tab plus draft request correlation.
 #[derive(Debug, Default)]
 pub struct CommandArgsHost {
     pub tabs: BTreeMap<TabId, CommandArgsState>,
+    /// In-flight replace_plan requests: request id → (tab, is_commit).
+    pub requests: BTreeMap<u64, (TabId, bool)>,
 }
 
 impl CommandArgsHost {
     pub(crate) fn detach(&mut self, tab: TabId) {
         self.tabs.remove(&tab);
+        self.requests.retain(|_, (owner, _)| *owner != tab);
     }
 
     /// Check if any tab has an open draft.
@@ -361,9 +390,48 @@ pub enum CommandArgsMessage {
     InputBounds { tab: TabId, rect: iced::Rectangle },
 }
 
+/// Record one diagnostics outcome for the command-args path.
+fn diag(app: &mut App, tab: TabId, kind: EventKind, outcome: Outcome) {
+    app.diagnostics.record(
+        Some(tab),
+        DiagMode::from(app.context_mode.mode(tab)),
+        kind,
+        outcome,
+        None,
+        None,
+    );
+}
+
+/// Cancel one in-flight replace_plan request at the source (cancel-
+/// supersersede): the Session stops the worker job and drops its outcome;
+/// the UI retires its correlation state.
+fn cancel_plan(app: &mut App, request_id: u64) {
+    if let Some(api) = app.flavite.as_ref() {
+        let _ = api.execute(Invocation::new(
+            api.command_registry().next_request_id(),
+            "editor.cancel_selection",
+            serde_json::json!({"request_id": request_id}),
+            Origin::Gui,
+        ));
+    }
+    app.command_args.requests.remove(&request_id);
+    app.operations.cancel(request_id);
+}
+
 /// Cancel the draft on a tab (called when mode exits or tab closes).
 pub(crate) fn cancel_tab(app: &mut App, tab: TabId) {
+    let pending = app
+        .command_args
+        .tabs
+        .get(&tab)
+        .and_then(|state| state.pending);
+    if let Some(request_id) = pending {
+        cancel_plan(app, request_id);
+    }
     app.command_args.tabs.remove(&tab);
+    app.command_args
+        .requests
+        .retain(|_, (owner, _)| *owner != tab);
 }
 
 /// Open a lines-align draft for the given target.
@@ -382,7 +450,7 @@ pub(crate) fn open_lines_align(app: &mut App, target: EditorTarget) {
 /// Open a replace-regex draft for the given target (FEUX-0006 E-6).
 pub(crate) fn open_replace_regex(app: &mut App, target: EditorTarget) {
     // Close any existing draft on this tab
-    app.command_args.tabs.remove(&target.tab);
+    cancel_tab(app, target.tab);
     // Close matches draft for mutual exclusion
     app.selection_search.tabs.remove(&target.tab);
 
@@ -391,6 +459,7 @@ pub(crate) fn open_replace_regex(app: &mut App, target: EditorTarget) {
     // Initialize with empty fields for pattern and template
     state.fields = vec![FieldState::new(), FieldState::new()];
     app.command_args.tabs.insert(target.tab, state);
+    request_plan(app, target.tab, false);
 }
 
 /// Open a goto-line draft for the given target.
@@ -407,6 +476,260 @@ pub(crate) fn open_goto_line(app: &mut App, target: EditorTarget) {
     let mut state = CommandArgsState::new(draft, target.clone());
     state.fields = vec![FieldState::new()];
     app.command_args.tabs.insert(target.tab, state);
+}
+
+/// Build the `text.replace_plan` invocation args for a draft row. Returns
+/// None when the pattern is empty (idle — no worker pass).
+fn build_replace_plan_args(state: &CommandArgsState) -> Option<serde_json::Value> {
+    let pattern = state.fields.first()?.text.trim();
+    if pattern.is_empty() {
+        return None;
+    }
+    let template = state
+        .fields
+        .get(1)
+        .map(|field| field.text.clone())
+        .unwrap_or_default();
+    let target = &state.target;
+    let scope_spans = if state.in_selections {
+        target.selections.clone()
+    } else {
+        Vec::new()
+    };
+    Some(serde_json::json!({
+        "buffer_id": target.buffer,
+        "revision": target.revision,
+        "query": pattern,
+        "replacement": template,
+        "mode": "regex",
+        "case_sensitive": false,
+        "whole_word": false,
+        "scope_spans": scope_spans,
+    }))
+}
+
+/// Admit one replace_plan compute through the bounded worker. At most one
+/// request per draft: a new pass while one is in flight queues as a refresh
+/// and lands when the in-flight request settles (no double-fire — the
+/// helper pool is app-wide). `is_commit` marks the Enter-time fresh
+/// computation — the only input a commit ever uses (E-6: the preview is
+/// never the commit input).
+fn request_plan(app: &mut App, tab: TabId, is_commit: bool) {
+    let Some(state) = app.command_args.tabs.get(&tab) else {
+        return;
+    };
+    if !matches!(state.draft.command, ContextCommand::ReplaceRegex) {
+        return;
+    }
+    if state.pending.is_some() {
+        // Queue behind the in-flight request; it settles on completion.
+        if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+            state.refresh_pending = Some(is_commit);
+        }
+        return;
+    }
+    let Some(args) = build_replace_plan_args(state) else {
+        // Idle: no pattern yet — clear any stale preview.
+        if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+            state.pending = None;
+            state.refresh_pending = None;
+            state.preview = None;
+            state.state_error = None;
+        }
+        return;
+    };
+    let Some(api) = app.flavite.as_ref() else {
+        return;
+    };
+    let request_id = api.command_registry().next_request_id();
+    let result = api.execute(Invocation::new(
+        request_id,
+        "text.replace_plan",
+        args,
+        Origin::Gui,
+    ));
+    match result {
+        ExecutionResult::Pending { request_id } => {
+            app.operations.accept(
+                request_id,
+                if is_commit {
+                    "replace.commit"
+                } else {
+                    "replace.preview"
+                },
+            );
+            app.command_args
+                .requests
+                .insert(request_id, (tab, is_commit));
+            if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+                state.pending = Some(request_id);
+                state.state_error = None;
+            }
+            diag(app, tab, EventKind::MatchCollect, Outcome::Started);
+        }
+        ExecutionResult::Local(LocalResult::Success(success)) => {
+            if is_commit {
+                finish_commit(app, tab, &success.data);
+            } else {
+                install_preview(app, tab, &success.data);
+            }
+        }
+        ExecutionResult::Local(LocalResult::Error(error)) => {
+            if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+                state.pending = None;
+                state.refresh_pending = None;
+                state.state_error = Some(error.message.clone());
+            }
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused);
+        }
+        ExecutionResult::Rejected(rejected) => {
+            if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+                state.pending = None;
+                state.refresh_pending = None;
+                state.state_error = Some(
+                    rejected
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Replace plan was refused".into()),
+                );
+            }
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused);
+        }
+        _ => {
+            if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+                state.pending = None;
+                state.refresh_pending = None;
+                state.state_error = Some("Replace plan could not be admitted; retry".into());
+            }
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused);
+        }
+    }
+}
+
+/// Install a completed replace_plan preview when the target is still the one
+/// the draft was captured under (stale results drop exactly like the match
+/// collection pipeline).
+fn install_preview(app: &mut App, tab: TabId, data: &serde_json::Value) {
+    let Some(current) = EditorTarget::capture(app, tab) else {
+        return;
+    };
+    let Some(state) = app.command_args.tabs.get(&tab) else {
+        return;
+    };
+    if current.buffer != state.target.buffer
+        || current.revision != state.target.revision
+        || current.selection_version != state.target.selection_version
+    {
+        return;
+    }
+    let Some(match_count) = data.get("match_count").and_then(serde_json::Value::as_u64) else {
+        return;
+    };
+    let Some(output_len) = data.get("output_len").and_then(serde_json::Value::as_u64) else {
+        return;
+    };
+    let Some(raw_ops) = data.get("ops").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let Some(view) = app.note_editor_view(tab) else {
+        return;
+    };
+    let mut spans = Vec::with_capacity(raw_ops.len());
+    for raw in raw_ops {
+        let Some(pair) = raw.as_array() else {
+            return;
+        };
+        if pair.len() != 3 {
+            return;
+        }
+        let (Some(start), Some(end)) = (pair[0].as_u64(), pair[1].as_u64()) else {
+            return;
+        };
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            return;
+        };
+        if start > end
+            || end > view.text.len()
+            || !view.text.is_char_boundary(start)
+            || !view.text.is_char_boundary(end)
+        {
+            return;
+        }
+        spans.push((start, end));
+    }
+    if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+        state.pending = None;
+        state.state_error = None;
+        state.preview = Some(ReplacePreview {
+            match_count,
+            output_len,
+            spans: Arc::from(spans.into_boxed_slice()),
+        });
+    }
+    diag(app, tab, EventKind::MatchPreview, Outcome::Ready);
+    // A refresh queued behind this request lands now.
+    let queued = app
+        .command_args
+        .tabs
+        .get(&tab)
+        .and_then(|state| state.refresh_pending);
+    if let Some(is_commit) = queued {
+        if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+            state.refresh_pending = None;
+        }
+        request_plan(app, tab, is_commit);
+    }
+}
+
+/// Finish an Enter-time replace_plan: validate the computed ops, commit
+/// through the editor kernel (E-5), and close the draft on success. Any
+/// refusal leaves the text untouched and the draft open with the error.
+fn finish_commit(app: &mut App, tab: TabId, data: &serde_json::Value) {
+    let Some(raw_ops) = data.get("ops").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let mut ops = Vec::with_capacity(raw_ops.len());
+    for raw in raw_ops {
+        let Some(pair) = raw.as_array() else {
+            return;
+        };
+        if pair.len() != 3 {
+            return;
+        }
+        let (Some(start), Some(end)) = (pair[0].as_u64(), pair[1].as_u64()) else {
+            return;
+        };
+        let Some(replacement) = pair[2].as_str() else {
+            return;
+        };
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            return;
+        };
+        ops.push((start, end, replacement.to_string()));
+    }
+    // No matches: a no-op replace — close the draft without committing.
+    if ops.is_empty() {
+        app.command_args.tabs.remove(&tab);
+        return;
+    }
+    let Some(target) = EditorTarget::capture(app, tab) else {
+        if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+            state.pending = None;
+            state.state_error = Some("Source changed; replace was refused".into());
+        }
+        return;
+    };
+    match replace_commit(app, tab, &target, ops) {
+        Ok(()) => {
+            app.command_args.tabs.remove(&tab);
+        }
+        Err(message) => {
+            if let Some(state) = app.command_args.tabs.get_mut(&tab) {
+                state.pending = None;
+                state.state_error = Some(message);
+            }
+        }
+    }
 }
 
 /// Handle one command-args message.
@@ -436,14 +759,19 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
             iced::Task::none()
         }
         CommandArgsMessage::Close(tab) => {
-            app.command_args.tabs.remove(&tab);
+            cancel_tab(app, tab);
             iced::Task::none()
         }
         CommandArgsMessage::Cancel(tab) => {
-            app.command_args.tabs.remove(&tab);
+            cancel_tab(app, tab);
             iced::Task::none()
         }
         CommandArgsMessage::DraftAction { tab, action } => {
+            let is_replace = app
+                .command_args
+                .tabs
+                .get(&tab)
+                .is_some_and(|state| state.draft.command == ContextCommand::ReplaceRegex);
             if let Some(state) = app.command_args.tabs.get_mut(&tab)
                 && let Some(field_state) = state.active_field_state_mut()
             {
@@ -451,6 +779,9 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                 field_state.text = field_state.input.text();
                 // Clear error on edit
                 field_state.error = None;
+            }
+            if is_replace {
+                request_plan(app, tab, false);
             }
             iced::Task::none()
         }
@@ -471,10 +802,17 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
             iced::Task::none()
         }
         CommandArgsMessage::ToggleScope(tab) => {
+            let mut toggled = false;
             if let Some(state) = app.command_args.tabs.get_mut(&tab)
                 && state.draft.command == ContextCommand::ReplaceRegex
             {
                 state.in_selections = !state.in_selections;
+                state.preview = None;
+                state.state_error = None;
+                toggled = true;
+            }
+            if toggled {
+                request_plan(app, tab, false);
             }
             iced::Task::none()
         }
@@ -552,84 +890,12 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
                             return iced::Task::none();
                         }
 
-                        // For ReplaceRegex, handle specially (FEUX-0006 E-5)
+                        // For ReplaceRegex, Enter runs a FRESH replace_plan at
+                        // the current revision and commits on its completion
+                        // (FEUX-0006 E-5/E-6): the preview is never the commit
+                        // input.
                         if command == ContextCommand::ReplaceRegex {
-                            let pattern =
-                                values.first().and_then(|v| v.clone()).unwrap_or_default();
-                            let template =
-                                values.get(1).and_then(|v| v.clone()).unwrap_or_default();
-
-                            // Build scope spans from current selections
-                            let scope_spans: Vec<(usize, usize)> = if state.in_selections {
-                                target.selections.clone()
-                            } else {
-                                Vec::new() // Empty = whole document
-                            };
-
-                            // Call text.replace_plan (ReadNotes) to compute the plan
-                            let api = app.flavite.as_ref();
-                            if let Some(api) = api {
-                                let request_id = api.command_registry().next_request_id();
-                                let invocation = Invocation::new(
-                                    request_id,
-                                    "text.replace_plan",
-                                    serde_json::json!({
-                                        "buffer_id": target.buffer,
-                                        "revision": target.revision,
-                                        "query": pattern,
-                                        "replacement": template,
-                                        "mode": "regex",
-                                        "case_sensitive": false,
-                                        "whole_word": false,
-                                        "scope_spans": scope_spans,
-                                    }),
-                                    Origin::Gui,
-                                );
-
-                                // Execute the replace_plan request
-                                match api.execute(invocation) {
-                                    flavite_api::ExecutionResult::Local(
-                                        flavite_api::LocalResult::Success(success),
-                                    ) => {
-                                        // Extract ops from the result
-                                        if let Some(plan) = success.data.get("plan")
-                                            && let (Some(_), Some(_), Some(ops)) = (
-                                                plan.get("match_count").and_then(|v| v.as_u64()),
-                                                plan.get("output_len").and_then(|v| v.as_u64()),
-                                                plan.get("ops").and_then(|v| {
-                                                    serde_json::from_value::<
-                                                            Vec<serde_json::Value>,
-                                                        >(
-                                                            v.clone()
-                                                        )
-                                                        .ok()
-                                                }),
-                                            )
-                                        {
-                                            // Now commit via apply_edits
-                                            let _ = super::context_mode::kernel_mutate(
-                                                app,
-                                                &target,
-                                                "editor.apply_edits",
-                                                serde_json::json!({
-                                                    "buffer_id": target.buffer,
-                                                    "revision": target.revision,
-                                                    "ops": ops,
-                                                    "undo_policy": "Isolated",
-                                                }),
-                                                "Replace was refused; source changed",
-                                            );
-
-                                            // Close the draft
-                                            app.command_args.tabs.remove(&tab);
-                                        }
-                                    }
-                                    _ => {
-                                        // Failed to execute replace_plan
-                                        app.context_mode.notice("Replace plan failed");
-                                    }
-                                }
-                            }
+                            request_plan(app, tab, true);
                         } else {
                             // For single-field commands (LinesAlign, GotoLine)
                             if let Some(Some(arg)) = values.first() {
@@ -695,6 +961,57 @@ pub fn handle(app: &mut App, message: CommandArgsMessage) -> iced::Task<Message>
             iced::Task::none()
         }
     }
+}
+
+/// Route one replace_plan completion; returns whether it belonged to the
+/// command-args host.
+pub fn completion(app: &mut App, completion: &flavite_api::OperationCompletion) -> bool {
+    let Some((tab, is_commit)) = app.command_args.requests.remove(&completion.request_id) else {
+        return false;
+    };
+    if app.workspace.tab(&tab).is_none() {
+        return true;
+    }
+    let Some(state) = app.command_args.tabs.get_mut(&tab) else {
+        return true;
+    };
+    if state.pending != Some(completion.request_id) {
+        return true;
+    }
+    state.pending = None;
+    match &completion.result {
+        ExecutionResult::Local(LocalResult::Success(success)) => {
+            if is_commit {
+                finish_commit(app, tab, &success.data);
+            } else {
+                install_preview(app, tab, &success.data);
+            }
+        }
+        ExecutionResult::Local(LocalResult::Error(error)) => {
+            state.preview = None;
+            state.refresh_pending = None;
+            state.state_error = Some(error.message.clone());
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused);
+        }
+        ExecutionResult::Rejected(rejected) => {
+            state.preview = None;
+            state.refresh_pending = None;
+            state.state_error = Some(
+                rejected
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "Replace plan was refused".into()),
+            );
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused);
+        }
+        _ => {
+            state.preview = None;
+            state.refresh_pending = None;
+            state.state_error = Some("Replace plan is stale; try again".into());
+            diag(app, tab, EventKind::MatchRefused, Outcome::Refused);
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -873,5 +1190,45 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0], "pattern");
         assert_eq!(values[1], "template");
+    }
+
+    #[test]
+    fn build_replace_plan_args_maps_fields_and_scope() {
+        let mut state = CommandArgsState::new(DraftCommand::replace_regex(), test_target());
+        state.fields = vec![FieldState::with_text(r"\d+"), FieldState::with_text("[$0]")];
+        state.in_selections = false;
+        let args = build_replace_plan_args(&state).expect("args");
+        assert_eq!(args["query"], r"\d+");
+        assert_eq!(args["replacement"], "[$0]");
+        assert_eq!(args["mode"], "regex");
+        assert_eq!(args["case_sensitive"], false);
+        assert_eq!(args["whole_word"], false);
+        assert_eq!(args["scope_spans"].as_array().map(|a| a.len()), Some(0));
+
+        // Selections scope carries the committed member spans.
+        state.in_selections = true;
+        state.target.selections = vec![(0, 4), (8, 12)];
+        let args = build_replace_plan_args(&state).expect("args");
+        let spans = args["scope_spans"].as_array().expect("spans");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0][0].as_u64(), Some(0));
+        assert_eq!(spans[0][1].as_u64(), Some(4));
+        assert_eq!(spans[1][0].as_u64(), Some(8));
+        assert_eq!(spans[1][1].as_u64(), Some(12));
+
+        // Empty pattern is idle (no worker pass).
+        state.fields[0] = FieldState::new();
+        assert!(build_replace_plan_args(&state).is_none());
+    }
+
+    #[test]
+    fn replace_draft_state_starts_idle_without_preview_or_error() {
+        let state = CommandArgsState::new(DraftCommand::replace_regex(), test_target());
+        assert!(state.pending.is_none());
+        assert!(state.refresh_pending.is_none());
+        assert!(state.preview.is_none());
+        assert!(state.state_error.is_none());
+        assert_eq!(state.active_field, 0);
+        assert_eq!(state.fields.len(), 2);
     }
 }

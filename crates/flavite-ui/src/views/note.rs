@@ -595,13 +595,19 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                                     tab,
                                 ),
                             )),
-                        button(if search.in_selections { "Selections" } else { "Document" })
-                            .style(style::ghost())
-                            .on_press(Message::SelectionSearch(
-                                crate::host::selection_search::SelectionSearchMessage::ToggleInSelections(
-                                    tab,
-                                ),
-                            )),
+                        // The scope toggle applies to select/split; keep/drop is
+                        // inherently selection-scoped (FEUX-0006 E-4).
+                        if !matches!(search.kind, crate::host::selection_search::ApplyKind::Keep { .. }) {
+                            button(if search.in_selections { "Selections" } else { "Document" })
+                                .style(style::ghost())
+                                .on_press(Message::SelectionSearch(
+                                    crate::host::selection_search::SelectionSearchMessage::ToggleInSelections(
+                                        tab,
+                                    ),
+                                ))
+                        } else {
+                            button("").style(style::ghost()).width(Length::Fixed(0.0))
+                        },
                         button("Apply")
                             .style(style::ghost())
                             .on_press_maybe(apply_enabled.then_some(Message::SelectionSearch(
@@ -656,6 +662,36 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         });
         let active_input = &active_input.input;
 
+        // Replace-regex live preview caption (FEUX-0006 E-6): exact totals
+        // from the compute-only replace_plan pass.
+        let replace_caption: Element<Message> = if args.draft.command
+            == flavite_edit_context::vocabulary::ContextCommand::ReplaceRegex
+        {
+            use iced::widget::Text;
+            if let Some(preview) = &args.preview {
+                Text::new(format!(
+                    "{} match{} · output {} chars",
+                    preview.match_count,
+                    if preview.match_count == 1 { "" } else { "es" },
+                    preview.output_len
+                ))
+                .size(12)
+                .into()
+            } else if args.pending.is_some() {
+                Text::new("Planning…").size(12).into()
+            } else {
+                Space::new().width(Length::Fixed(0.0)).into()
+            }
+        } else {
+            Space::new().width(Length::Fixed(0.0)).into()
+        };
+        let state_error: Element<Message> = if let Some(ref error) = args.state_error {
+            use iced::widget::Text;
+            Text::new(error.as_str()).size(12).into()
+        } else {
+            Space::new().width(Length::Fixed(0.0)).into()
+        };
+
         content = content.push(bounds::observe(
             container(
                 row![
@@ -706,6 +742,8 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                         button("").style(style::ghost()).width(Length::Fixed(0.0))
                     },
                     error_widget,
+                    replace_caption,
+                    state_error,
                 ]
                 .spacing(8),
             )

@@ -11,16 +11,9 @@ tier3 = 0.0
 
 # Temporary, reviewed waivers from the fresh workspace coverage run on
 # 2026-10-28. Each expires after 30 days; expired or malformed waivers fail G1.
-[waivers.flavite-index]
-floor = 87.5
-expires = "2026-11-30"
-reason = "Index actor error and cache-recovery branches remain uncovered; raise the floor after the next index fault-path test slice."
-
-[waivers.flavite-fs]
-floor = 86.8
-expires = "2026-11-30"
-reason = "Platform-specific filesystem failure branches remain uncovered in the Linux report; add portable FaultFs cases before expiry."
-
+# flavite-fs and flavite-index have since cleared their permanent 90% floors
+# and their waivers were removed. flavite-vault remains below 90% until the
+# journal-recovery/actor-shutdown branches gain deterministic fault cases.
 [waivers.flavite-vault]
 floor = 84.4
 expires = "2026-11-30"
@@ -40,7 +33,7 @@ flavite-index = "tier1"
 flavite-workspace = "tier1"
 flavite-api = "tier2"
 flavite-graph = "tier2"
-flavite-cli = "tier3"
+flavite-cli = "tier2"
 flavite-editor = "tier3"
 flavite-ui = "tier3"
 

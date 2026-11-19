@@ -1209,13 +1209,18 @@ impl CliDriver {
             if !consume_all || (next_note.is_none() && next_match.is_none()) {
                 break;
             }
+            // Continue from the page's *next* note ordinal when one is
+            // advertised; falling back to the current note keeps a match
+            // continuation inside the same note. Using the page start
+            // (`note_index`) again would replay the same page forever.
+            let start_note = next_note.unwrap_or(note_index);
             let request_id = flavite.command_registry().next_request_id();
             let result = flavite.execute(Invocation::new(
                 request_id,
                 "source_find.page",
                 serde_json::json!({
                     "finder_id": finder,
-                    "note_index": note_index,
+                    "note_index": start_note,
                     "match_offset": next_match.unwrap_or(0),
                     "page_len": page_size,
                 }),
