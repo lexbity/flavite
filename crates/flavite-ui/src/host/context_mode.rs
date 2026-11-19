@@ -1368,7 +1368,10 @@ fn kernel_task(
     match kernel_mutate(app, target, api_id, args, refused) {
         Some(success) => {
             install_receipt(app, target, &success);
-            // FEUX-0005 E-9: Report unit in completion message for width-consuming commands
+            // FEUX-0005 E-9: the completion message names the unit the planner
+            // used (rides the receipt — never re-detected from the edited
+            // text). Zero-effect no-ops stay silent (delivered no-op rule):
+            // the revision is unchanged when the batch was empty.
             if matches!(
                 api_id,
                 "editor.indent"
@@ -1376,21 +1379,16 @@ fn kernel_task(
                     | "editor.tabs_to_spaces"
                     | "editor.spaces_to_tabs"
             ) {
-                // Detect unit from the current buffer text
-                if let Some(view) = app.note_editor_view(target.tab) {
-                    let detected_unit = flavite_buffer::indent::detect_unit(&view.text);
-                    let message = match api_id {
-                        "editor.indent" => format!("Indent · unit: {}", detected_unit.display()),
-                        "editor.dedent" => format!("Dedent · unit: {}", detected_unit.display()),
-                        "editor.tabs_to_spaces" => {
-                            format!("Tabs → Spaces · unit: {}", detected_unit.display())
-                        }
-                        "editor.spaces_to_tabs" => {
-                            format!("Spaces → Tabs · unit: {}", detected_unit.display())
-                        }
-                        _ => String::new(),
+                let zero_effect = success.data["revision"].as_u64() == Some(target.revision);
+                if !zero_effect && let Some(unit) = success.data["unit"].as_str() {
+                    let title = match api_id {
+                        "editor.indent" => "Indent",
+                        "editor.dedent" => "Dedent",
+                        "editor.tabs_to_spaces" => "Tabs → Spaces",
+                        "editor.spaces_to_tabs" => "Spaces → Tabs",
+                        _ => "",
                     };
-                    app.context_mode.notice(&message);
+                    app.context_mode.notice(&format!("{title} · unit: {unit}"));
                 }
             }
 

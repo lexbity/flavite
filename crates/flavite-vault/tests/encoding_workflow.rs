@@ -213,6 +213,7 @@ fn utf16le_bom_open_edit_save_preserves_descriptor_and_bytes() {
                 None,
             )
             .expect("fixture activation"),
+        unit: None,
     });
     let applied = expect_success(result, "apply edits");
     let CommandResult::EditsApplied { new_revision, .. } = applied else {
@@ -347,6 +348,7 @@ fn reopen_encoding_refuses_dirty_buffer() {
                 None,
             )
             .expect("fixture activation"),
+        unit: None,
     });
     expect_success(result, "apply edits");
 

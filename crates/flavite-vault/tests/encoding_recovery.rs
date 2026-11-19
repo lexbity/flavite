@@ -183,6 +183,7 @@ fn utf16_dirty_draft_recovery_replays_recorded_format() {
                 None,
             )
             .expect("fixture activation"),
+        unit: None,
     });
     expect_success(result, "apply draft edit");
 
@@ -317,6 +318,7 @@ fn utf16_save_retires_intent_and_binds_saved_hash() {
                 None,
             )
             .expect("fixture activation"),
+        unit: None,
     });
     expect_success(result, "apply edit");
 

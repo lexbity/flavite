@@ -345,6 +345,10 @@ pub enum SessionCommand {
         editor: Option<flavite_buffer::history::EditorEdit>,
         /// Mandatory Session-issued activation authority.
         operation: crate::editor_receipts::OperationId,
+        /// The indentation unit the planner used (FEUX-0005 E-9); `None`
+        /// for operations that do not consume one. Rides the receipt so a
+        /// replay carries the identical unit.
+        unit: Option<flavite_buffer::indent::Unit>,
     },
     EditingHistory {
         buffer_id: BufferId,
@@ -700,6 +704,10 @@ pub enum CommandResult {
         /// The canonical after-set as `[id, anchor, head]` triples, when the
         /// activation carried recorded editor metadata.
         after_selections: Option<Vec<[usize; 3]>>,
+        /// The indentation unit the planner used (FEUX-0005 E-9). `None`
+        /// for operations that do not consume a unit. This is the planner's
+        /// unit — never a post-mutation re-detection.
+        unit: Option<flavite_buffer::indent::Unit>,
     },
     /// A Session-issued editor operation ticket (FEUX-0002 E-5).
     OperationIssued {
@@ -2838,7 +2846,8 @@ impl Session {
                 undo_policy,
                 editor,
                 operation: _,
-            } => self.apply_edits(buffer_id, revision, ops, undo_policy, editor),
+                unit,
+            } => self.apply_edits(buffer_id, revision, ops, undo_policy, editor, unit),
             SessionCommand::EditingHistory {
                 buffer_id,
                 revision,
@@ -3224,6 +3233,7 @@ impl Session {
                             new_revision: Revision::new(new_revision),
                             movement: None,
                             after_selections: None,
+                            unit: None,
                         }
                     } else {
                         CommandResult::LinkInserted {
@@ -3354,6 +3364,7 @@ impl Session {
             vec![edit],
             flavite_buffer::undo::UndoPolicy::Isolated,
             None,
+            None,
         );
         let result = match applied {
             SessionResult::Success(CommandResult::EditsApplied {
@@ -3412,6 +3423,7 @@ impl Session {
                 new_revision,
                 movement: None,
                 after_selections: None,
+                unit: None,
             });
         }
         result
@@ -4520,6 +4532,7 @@ impl Session {
                     new_revision,
                     movement: None,
                     after_selections: None,
+                    unit: None,
                 }),
                 Err(flavite_buffer::model::BatchError::LimitExceeded { needed, budget }) => {
                     SessionResult::HistoryLimitExceeded {
@@ -6375,6 +6388,7 @@ impl Session {
                 new_revision,
                 movement: None,
                 after_selections: None,
+                unit: None,
             }),
             None => SessionResult::Error {
                 message: "Invalid structure edit".into(),
@@ -6389,6 +6403,7 @@ impl Session {
         ops: Vec<EditOp>,
         undo_policy: flavite_buffer::undo::UndoPolicy,
         editor: Option<flavite_buffer::history::EditorEdit>,
+        unit: Option<flavite_buffer::indent::Unit>,
     ) -> SessionResult {
         let mut buffer_manager = self.buffer_manager.lock_recovering();
         if let Some(path) = buffer_manager.path_for_id(buffer_id)
@@ -6440,6 +6455,7 @@ impl Session {
                     step_ends: Vec::new(),
                     truncated: false,
                 }),
+                unit,
             });
         }
         if let Some(projected) = buffer.model().history_projection(&ops, editor.as_ref()) {
@@ -6551,6 +6567,7 @@ impl Session {
             new_revision,
             movement,
             after_selections,
+            unit,
         })
     }
 
@@ -7367,6 +7384,7 @@ impl Session {
                 new_revision,
                 movement: None,
                 after_selections: None,
+                unit: None,
             }),
             None => SessionResult::Error {
                 message: "merge output is invalid UTF-8 or exceeds the note size limit".into(),
@@ -8787,6 +8805,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -8870,6 +8889,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -8900,6 +8920,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -8929,6 +8950,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         }) {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
                 new_revision
@@ -9024,6 +9046,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         });
         assert!(matches!(
             edited,
@@ -9046,6 +9069,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -9227,6 +9251,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -9322,6 +9347,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -9369,6 +9395,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -9936,6 +9963,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -10209,6 +10237,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         });
         assert!(matches!(bad_edit, SessionResult::Error { .. }));
         assert!(matches!(
@@ -10262,6 +10291,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         });
         let dirty_revision = match changed {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -10296,6 +10326,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -10368,6 +10399,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::Success(_)
         ));
@@ -10542,6 +10574,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::StaleRevision { .. }
         ));
@@ -10615,6 +10648,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         });
         session
             .buffer_manager()
@@ -10697,6 +10731,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         });
         let new_revision = match applied {
             SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
@@ -10754,6 +10789,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));
@@ -10854,6 +10890,7 @@ mod tests {
                         None
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
             SessionResult::Success(CommandResult::EditsApplied { .. })
         ));

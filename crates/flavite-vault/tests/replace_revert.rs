@@ -241,6 +241,7 @@ fn edit(session: &Session, buffer_id: u64, revision: u64, ops: Vec<flavite_buffe
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         }),
     );
     match expect_success(result, "edit") {

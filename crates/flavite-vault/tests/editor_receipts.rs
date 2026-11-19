@@ -88,6 +88,7 @@ fn issued_operation_applies_once_and_replays_refuse() {
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
         editor: None,
         operation: op,
+        unit: None,
     });
     assert!(
         matches!(
@@ -106,6 +107,7 @@ fn issued_operation_applies_once_and_replays_refuse() {
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
         editor: None,
         operation: op,
+        unit: None,
     });
     assert_eq!(
         format!("{second:?}"),
@@ -135,6 +137,7 @@ fn cancelled_operation_reports_cancelled_and_unknown_is_refused() {
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
         editor: None,
         operation: op,
+        unit: None,
     });
     assert!(
         matches!(
@@ -159,6 +162,7 @@ fn cancelled_operation_reports_cancelled_and_unknown_is_refused() {
         undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
         editor: None,
         operation: forged,
+        unit: None,
     });
     assert!(
         matches!(
@@ -206,6 +210,7 @@ fn cancellation_and_install_share_one_linearization_turn() {
             undo_policy: flavite_buffer::undo::UndoPolicy::Isolated,
             editor: None,
             operation: op,
+            unit: None,
         });
         let cancelled = cancel.join().unwrap();
         let after = session.shared_buffer_snapshot(buffer_id, None).unwrap();

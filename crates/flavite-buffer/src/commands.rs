@@ -432,7 +432,11 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                         } else {
                             member.start()
                         };
-                        (at, Some(member.id().as_raw()))
+                        CollapsePoint {
+                            at,
+                            id: Some(member.id().as_raw()),
+                            delta: 0,
+                        }
                     })
                     .collect(),
                 Affinity::Right,
@@ -469,51 +473,59 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
         EditOperation::OpenLine { above } => {
             // FEUX-0005 E-4: Auto-indent: copy the source line's leading whitespace verbatim
             // Above: insert leading_ws + "\n" at line start, caret on new line after ws
-            // Below: insert "\n" + leading_ws at line end, caret after ws
+            // Below: insert "\n" + leading_ws at the head (mid-line split) or line end,
+            //        caret after ws
 
-            // Group members by unique head line to match the delivered behavior
-            let mut points: std::collections::BTreeMap<usize, (usize, usize, u32)> =
+            // Group members by unique head line (delivered O: two carets on
+            // one line open one line).
+            let mut lines: std::collections::BTreeMap<usize, Vec<(u32, usize)>> =
                 std::collections::BTreeMap::new();
             for member in set.iter() {
                 let line_start = line_boundary(text, member.head(), true);
-                let line_end = line_boundary(text, member.head(), false);
-                let at = if *above { line_start } else { line_end };
-                let id = member.id().as_raw();
-                points
-                    .entry(at)
-                    .and_modify(|(_, _, kept)| *kept = (*kept).min(id))
-                    .or_insert((line_start, line_end, id));
+                lines
+                    .entry(line_start)
+                    .or_default()
+                    .push((member.id().as_raw(), member.head()));
             }
 
-            // For each unique line, compute the leading whitespace and create the insertion
-            let mut collapse_points = Vec::new();
-            for (&at, (line_start, line_end, id)) in &points {
-                // Extract the line to get its leading whitespace
-                let line_text = &text[*line_start..*line_end];
-                let leading_ws = leading_whitespace(line_text);
+            let mut collapse_points = Vec::with_capacity(lines.len());
+            for (&line_start, members) in &lines {
+                let id = members.iter().map(|(id, _)| *id).min().unwrap_or(0);
+                let line_end = line_boundary(text, line_start, false);
+                let leading_ws = leading_whitespace(&text[line_start..line_end]);
 
-                // Compute insertion text
-                let insertion = if *above {
-                    // open_above: insert leading_ws + "\n" at line start
-                    format!("{}\n", leading_ws)
+                let (at, insertion, delta) = if *above {
+                    // open_above: insert leading_ws + "\n" at the line start;
+                    // the caret lands after the copied whitespace (delta).
+                    (line_start, format!("{}\n", leading_ws), leading_ws.len())
                 } else {
-                    // open_below: insert "\n" + leading_ws at line end
-                    format!("\n{}", leading_ws)
+                    // open_below: a mid-line head splits the line at the head
+                    // (the new line becomes leading_ws + tail). Heads inside
+                    // the line's leading-whitespace run (or at its start)
+                    // open below at the line end — splitting inside the
+                    // indent run would double-indent the tail (E-4).
+                    let ws_len = leading_ws.len();
+                    let inside_min = members
+                        .iter()
+                        .filter(|(_, head)| {
+                            *head > line_start && *head >= line_start + ws_len && *head < line_end
+                        })
+                        .map(|(_, head)| *head)
+                        .min();
+                    let at = inside_min.unwrap_or(line_end);
+                    (at, format!("\n{}", leading_ws), 0)
                 };
 
-                if !insertion.is_empty() {
-                    planned.push(PlannedEdit {
-                        start: at,
-                        end: at,
-                        replacement: insertion,
-                    });
-                }
-
-                // Collapse points: at the insertion position for both
-                // Affinity determines where the caret lands:
-                // - open_above: Affinity::Left → caret at beginning of new line
-                // - open_below: Affinity::Right → caret after the insertion (after leading_ws)
-                collapse_points.push((at, Some(*id)));
+                planned.push(PlannedEdit {
+                    start: at,
+                    end: at,
+                    replacement: insertion,
+                });
+                collapse_points.push(CollapsePoint {
+                    at,
+                    id: Some(id),
+                    delta,
+                });
             }
 
             let affinity = if *above {
@@ -1130,6 +1142,12 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                     let mut any_change = false;
 
                     for line in &lines {
+                        // E-3: blank and whitespace-only lines are untouched by
+                        // BOTH indent and dedent.
+                        if is_blank_or_ws(line) {
+                            new_lines.push(line.to_string());
+                            continue;
+                        }
                         let leading = leading_whitespace(line);
                         if leading.is_empty() {
                             // No leading whitespace, cannot dedent
@@ -1151,7 +1169,15 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
 
                             if new_leading != leading {
                                 any_change = true;
-                                new_lines.push(format!("{}{}", new_leading, line.trim_start()));
+                                // Preserve the content after the ASCII leading
+                                // run byte-exactly (`line.trim_start()` would
+                                // strip non-ASCII whitespace content such as
+                                // NBSP).
+                                new_lines.push(format!(
+                                    "{}{}",
+                                    new_leading,
+                                    &line[leading.len()..]
+                                ));
                             } else {
                                 new_lines.push(line.to_string());
                             }
@@ -1250,14 +1276,21 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                     replacement_len: edit.replacement_len,
                 })
                 .collect();
+            // Per-point caret deltas (FEUX-0005 E-4: open-above lands after
+            // the copied whitespace). Identity travels through normalization,
+            // so deltas are keyed by the member id.
+            let deltas: std::collections::HashMap<u32, usize> = points
+                .iter()
+                .filter_map(|point| point.id.map(|id| (id, point.delta)))
+                .collect();
             let (carets, _) = SelectionSet::normalize(
                 text,
                 points
                     .iter()
-                    .map(|&(at, id)| crate::selection::RawSelection {
-                        id,
-                        anchor: at,
-                        head: at,
+                    .map(|point| crate::selection::RawSelection {
+                        id: point.id,
+                        anchor: point.at,
+                        head: point.at,
                     })
                     .collect(),
                 Some(set.primary_id().as_raw()),
@@ -1280,8 +1313,8 @@ pub fn plan(text: &str, set: &SelectionSet, op: &EditOperation) -> Result<Prepar
                 .zip(mapped_points)
                 .map(|(member, at)| crate::selection::RawSelection {
                     id: Some(member.id().as_raw()),
-                    anchor: at,
-                    head: at,
+                    anchor: at + deltas.get(&member.id().as_raw()).copied().unwrap_or(0),
+                    head: at + deltas.get(&member.id().as_raw()).copied().unwrap_or(0),
                 })
                 .collect();
             // The primary identity travels with its member through both
@@ -1402,8 +1435,16 @@ fn positions_affinity(affinity: Affinity) -> crate::positions::Affinity {
 
 /// One collapse-point insertion: the byte offset plus the contributing
 /// member's id (identity travels with the member through both
-/// normalizations, FEUX-0002 E-4/FR-4).
-type CollapsePoint = (usize, Option<u32>);
+/// normalizations, FEUX-0002 E-4/FR-4). `delta` is a post-mapping caret
+/// offset applied when the caret should land *inside* an insertion rather
+/// than at one of its affinity boundaries (FEUX-0005 E-4: open-above lands
+/// after the copied whitespace); it is 0 for every other collapse op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollapsePoint {
+    at: usize,
+    id: Option<u32>,
+    delta: usize,
+}
 
 /// Plan point insertions: one `PlannedEdit` per unique insertion point
 /// (dedup identical points — duplicate members merge into one insertion and
@@ -1415,7 +1456,7 @@ fn plan_point_insertions(
     set: &SelectionSet,
     insertion: &str,
     point_of: impl Fn(&crate::selection::Selection) -> usize,
-) -> Vec<(usize, Option<u32>)> {
+) -> Vec<CollapsePoint> {
     // Duplicate points merge into one insertion; the merged member keeps
     // the earliest (smallest) id, matching the normalization survivor rule.
     let mut points: std::collections::BTreeMap<usize, u32> = std::collections::BTreeMap::new();
@@ -1436,7 +1477,14 @@ fn plan_point_insertions(
             });
         }
     }
-    points.into_iter().map(|(at, id)| (at, Some(id))).collect()
+    points
+        .into_iter()
+        .map(|(at, id)| CollapsePoint {
+            at,
+            id: Some(id),
+            delta: 0,
+        })
+        .collect()
 }
 
 /// The line start (`true`) or line end (`false`) byte of the line containing
@@ -1669,9 +1717,15 @@ fn containing_line_range(
         // Otherwise, the last line is the line containing range.1 - 1 (the last byte in the range)
         // But if range.1 is at a newline, it might be the start of the next line
         let last_line_pos = if range.1 > range.0 && range.1 <= text.len() {
-            // Try range.1 first - if it's at a newline, line_range might put it in the next line
-            // So try range.1 - 1 instead
-            if range.1 > 0 { range.1 - 1 } else { range.1 }
+            // The last byte of the range is range.1 - 1; if it is not a
+            // grapheme boundary (e.g. inside a CRLF pair), step back to the
+            // preceding boundary so the containing line still resolves
+            // (FEUX-0005 §5.3: CRLF-safe line blocks).
+            if range.1 > 0 {
+                prev_grapheme_boundary(text, TextByte(range.1)).0
+            } else {
+                range.1
+            }
         } else {
             range.1
         };
@@ -1912,18 +1966,21 @@ mod tests {
         assert_eq!(
             prepared.after_set.primary().head(),
             0,
-            "the caret lands on the new empty line above (delivered O)"
+            "the caret lands on the new line above (delivered O)"
         );
 
+        // A mid-line head splits the line at the head (E-4): the new line
+        // carries the copied leading whitespace (none here) plus the tail.
         let prepared = plan(text, &set, &EditOperation::OpenLine { above: false }).unwrap();
-        assert_eq!(prepared.after_text, "ab\n\ncd");
+        assert_eq!(prepared.after_text, "a\nb\ncd");
         assert_eq!(
             prepared.after_set.primary().head(),
-            3,
+            2,
             "caret on the new line (past the inserted break)"
         );
 
-        // Unique lines: two carets on one line open one line.
+        // Unique lines: two carets on one line open one line (the earliest
+        // mid-line head decides the split point).
         let set = SelectionSet::normalize(
             text,
             vec![
@@ -1943,7 +2000,7 @@ mod tests {
         .unwrap()
         .0;
         let prepared = plan(text, &set, &EditOperation::OpenLine { above: false }).unwrap();
-        assert_eq!(prepared.after_text, "ab\n\ncd");
+        assert_eq!(prepared.after_text, "a\nb\ncd");
         assert_eq!(prepared.after_set.len(), 1, "merged members after dedup");
     }
 
@@ -1973,10 +2030,8 @@ mod tests {
         // Insert "    \n" (5 chars: 4 spaces + newline) at position 0
         // Result: "    \n" + "    fn main() {}\n" = "    \n    fn main() {}\n"
         assert_eq!(prepared.after_text, "    \n    fn main() {}\n");
-        // The caret lands at the beginning of the new line (position 0)
-        // Note: FEUX-0005 specifies "after its whitespace" but the current collapse
-        // mechanism places it at the beginning. This is a known limitation.
-        assert_eq!(prepared.after_set.primary().head(), 0);
+        // The caret lands after the copied whitespace (E-4): position 4.
+        assert_eq!(prepared.after_set.primary().head(), 4);
 
         // Test with tabs
         let text = "\t\tfn main() {}\n";
@@ -1993,6 +2048,90 @@ mod tests {
         // Original: "  \tfn main() {}\n" (14 chars)
         // Insert "\n  \t" at position 14: "  \tfn main() {}" + "\n  \t" + "\n"
         assert_eq!(prepared.after_text, "  \tfn main() {}\n  \t\n");
+    }
+
+    #[test]
+    fn open_line_mid_line_split_copies_leading_whitespace() {
+        // FEUX-0005 E-4: a mid-line head splits the line; the new line is
+        // leading_ws + tail and the caret lands after the copied ws.
+        let text = "    foo bar";
+        let set = set_of(text, 8); // after "    foo " and before "bar"
+        let prepared = plan(text, &set, &EditOperation::OpenLine { above: false }).unwrap();
+        assert_eq!(prepared.after_text, "    foo \n    bar");
+        assert_eq!(prepared.after_set.primary().head(), 13);
+
+        // open_above on a mid-line head still opens above the whole line and
+        // copies the source line's leading whitespace verbatim.
+        let prepared = plan(text, &set, &EditOperation::OpenLine { above: true }).unwrap();
+        assert_eq!(prepared.after_text, "    \n    foo bar");
+        assert_eq!(prepared.after_set.primary().head(), 4);
+    }
+
+    #[test]
+    fn open_line_whitespace_only_and_eof_lines_copy_verbatim() {
+        // Whitespace-only source: its whitespace is the whole line (E-4).
+        let text = "    \n";
+        let set = set_of(text, 0);
+        let below = plan(text, &set, &EditOperation::OpenLine { above: false }).unwrap();
+        assert_eq!(below.after_text, "    \n    \n");
+        assert_eq!(below.after_set.primary().head(), 9);
+        let above = plan(text, &set, &EditOperation::OpenLine { above: true }).unwrap();
+        assert_eq!(above.after_text, "    \n    \n");
+        assert_eq!(above.after_set.primary().head(), 4);
+
+        // EOF final line without a trailing newline (inherited EOF rule).
+        let text = "a\n    b";
+        let set = set_of(text, 7);
+        let below = plan(text, &set, &EditOperation::OpenLine { above: false }).unwrap();
+        assert_eq!(below.after_text, "a\n    b\n    ");
+        assert_eq!(below.after_set.primary().head(), 12);
+    }
+
+    #[test]
+    fn open_line_multi_member_unique_head_lines() {
+        // Two unique lines: one insertion per line, each caret after its own
+        // copied whitespace. Heads are at each line's start (column 0), so
+        // both open at their line ends.
+        let text = "    a\n    b";
+        let set = SelectionSet::normalize(
+            text,
+            vec![
+                RawSelection {
+                    id: Some(1),
+                    anchor: 0,
+                    head: 0,
+                },
+                RawSelection {
+                    id: Some(2),
+                    anchor: 6,
+                    head: 6,
+                },
+            ],
+            None,
+        )
+        .unwrap()
+        .0;
+        let prepared = plan(text, &set, &EditOperation::OpenLine { above: false }).unwrap();
+        assert_eq!(prepared.after_text, "    a\n    \n    b\n    ");
+        let heads: Vec<usize> = prepared
+            .after_set
+            .members()
+            .iter()
+            .map(|m| m.head())
+            .collect();
+        assert_eq!(heads, vec![10, 21]);
+    }
+
+    #[test]
+    fn open_line_head_inside_leading_whitespace_opens_below_at_line_end() {
+        // A caret inside the leading-whitespace run is not a content tail:
+        // splitting there would double-indent (E-4). It opens below at the
+        // line end like a column-0 caret.
+        let text = "    a\n    b\n";
+        let set = set_of(text, 8); // inside the indentation of line 2
+        let prepared = plan(text, &set, &EditOperation::OpenLine { above: false }).unwrap();
+        assert_eq!(prepared.after_text, "    a\n    b\n    \n");
+        assert_eq!(prepared.after_set.primary().head(), 16);
     }
 
     #[test]

@@ -408,6 +408,7 @@ fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionRes
         undo_policy,
         editor: args.editor,
         operation: args.operation.decode(args.buffer_id)?,
+        unit: None,
     }))
 }
 #[derive(Debug, Deserialize)]
@@ -3021,12 +3022,14 @@ impl Flavite {
                         new_revision,
                         movement,
                         after_selections,
+                        unit,
                     } => {
                         serde_json::json!({
                             "buffer_id": buffer_id.as_u64(),
                             "revision": new_revision.as_u64(),
                             "movement": movement,
                             "after_selections": after_selections,
+                            "unit": unit.map(|u| u.display()),
                         })
                     }
                     crate::session::CommandResult::OperationIssued {
@@ -4345,6 +4348,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         });
         assert!(matches!(
             flavite.get_buffer_view(buffer_id, Some(Revision::new(initial.revision))),
@@ -4600,6 +4604,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         });
         fs.write_new(&root.join(".external"), b"external").unwrap();
         fs.rename_replace(&root.join(".external"), &root.join("note.md"))
@@ -5139,6 +5144,7 @@ mod tests {
                 new_revision: revision,
                 movement: None,
                 after_selections: None,
+                unit: None,
             },
             CommandResult::NoteSaved {
                 buffer_id: buffer,

@@ -460,6 +460,7 @@ mod tests {
             new_revision: flavite_buffer::Revision::new(1),
             movement: None,
             after_selections: Some(vec![[0, 0, 0]; 10_000]),
+            unit: None,
         });
         ledger.record_receipt(&first, &receipt);
         ledger.record_receipt(

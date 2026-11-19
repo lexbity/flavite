@@ -174,6 +174,7 @@ fn session_refuses_save_edit_and_rename_on_a_leased_source() {
                 None,
             )
             .expect("fixture activation"),
+        unit: None,
     });
     assert!(
         matches!(

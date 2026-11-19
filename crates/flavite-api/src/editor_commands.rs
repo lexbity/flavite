@@ -272,6 +272,7 @@ pub(crate) fn handle_editor_delete(
         },
         editor: Some(record),
         operation: op,
+        unit: None,
     }))
 }
 
@@ -608,7 +609,7 @@ fn handle_ticketed_edit(
         after: triples(&prepared.after_set),
         primary: primary_index(&prepared.after_set),
     };
-    Ok(session.execute(SessionCommand::ApplyEdits {
+    let result = session.execute(SessionCommand::ApplyEdits {
         buffer_id: BufferId::from(buffer_id),
         revision: Revision::new(revision),
         ops: prepared.ops,
@@ -617,7 +618,12 @@ fn handle_ticketed_edit(
         }),
         editor: Some(record),
         operation,
-    }))
+        // FEUX-0005 E-9: the planner's unit rides the receipt (recording
+        // included) so the host's completion message never re-derives it
+        // from the edited text.
+        unit: prepared.unit,
+    });
+    Ok(result)
 }
 
 /// `editor.change`: delete each member's D-11 effective range; the host

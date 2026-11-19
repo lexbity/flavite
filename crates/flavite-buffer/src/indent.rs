@@ -131,25 +131,28 @@ pub fn detect_unit(text: &str) -> Unit {
         let first_char = leading.chars().next().unwrap();
 
         if first_char == '\t' {
+            // Tab-first lines (including mixed runs starting with a tab) vote
+            // tab; width candidates come only from all-space runs.
             tab_votes += 1;
         } else if first_char == ' ' {
-            // All-spaces run: check length
+            // A leading run starting with a space may be all-spaces (a real
+            // width signal) or mixed (spaces then tab). Both vote space by
+            // first char (E-2); ONLY all-space runs of 1..=8 contribute a
+            // width candidate.
+            if leading.contains('\t') {
+                // Mixed run (spaces then tab): vote by first char (space),
+                // NO width candidate (E-2).
+                space_votes += 1;
+                continue;
+            }
             let len = leading.len() as u8;
             if len <= 8 {
                 space_votes += 1;
                 // Width candidates are 1..=8
                 *width_candidates.entry(len).or_insert(0) += 1;
             } else {
-                // 9..=16 spaces: vote on style only (space), no width candidate
-                space_votes += 1;
-            }
-        } else {
-            // Mixed run (spaces then tab): first char decides
-            // This should not happen since we only have \t and ' ' in leading
-            // But if it does, treat as the first char
-            if first_char == '\t' {
-                tab_votes += 1;
-            } else {
+                // 9+ spaces: vote on style only (space), no width candidate
+                // (alignment padding, E-2).
                 space_votes += 1;
             }
         }
@@ -459,6 +462,41 @@ mod tests {
     fn test_detect_unit_mixed_space_tab() {
         // More space votes than tab votes
         let text = "  fn a() {}\n  fn b() {}\n\tfn c() {}\n";
+        let unit = detect_unit(text);
+        assert_eq!(unit.style, Style::Space);
+        assert_eq!(unit.width, 2);
+    }
+
+    #[test]
+    fn test_detect_unit_space_first_mixed_run_contributes_no_width_candidate() {
+        // E-2: space-first mixed runs (spaces then tab) vote space by first
+        // char but contribute NO width candidate. A file whose only width
+        // signal is a mixed run must fall back to width 4.
+        let text = "  \tfn a() {}\n  \tfn b() {}\n";
+        let unit = detect_unit(text);
+        assert_eq!(unit.style, Style::Space);
+        assert_eq!(
+            unit.width, 4,
+            "mixed runs never contribute width candidates"
+        );
+    }
+
+    #[test]
+    fn test_detect_unit_space_first_mixed_run_still_votes_style() {
+        // The mixed run votes space; with a tab run present, both styles get
+        // one vote -> tie -> Space (ties and zero vote Space).
+        let text = "  \tfn a() {}\n\tfn b() {}\n";
+        let unit = detect_unit(text);
+        assert_eq!(unit.style, Style::Space);
+        assert_eq!(unit.width, 4);
+    }
+
+    #[test]
+    fn test_detect_unit_tab_first_mixed_run_votes_tab_no_width_candidate() {
+        // A tab-first mixed run votes tab and also never contributes a width
+        // candidate: the file's only width signal is the 2-space run. The
+        // style vote ties (1 tab vs 1 space) -> Space (ties vote Space).
+        let text = "\t  fn a() {}\n  fn b() {}\n";
         let unit = detect_unit(text);
         assert_eq!(unit.style, Style::Space);
         assert_eq!(unit.width, 2);

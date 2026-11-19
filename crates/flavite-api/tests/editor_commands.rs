@@ -193,6 +193,74 @@ fn kernel_delete_empty_line_is_a_zero_effect_command() {
 }
 
 #[test]
+fn indent_dedent_conversion_receipts_carry_the_planner_unit() {
+    // FEUX-0005 E-9: the unit on the receipt is the planner's unit — never
+    // a host-side re-detection of the edited text.
+    let f = support::fixture(&[("note.md", "    a\n    b\n")]);
+    let buffer = open_note(&f, "note.md");
+    let before = revision(&f.flavite, buffer);
+    let op = issue_operation(&f.flavite, buffer);
+    let args = json!({
+        "buffer_id": buffer,
+        "revision": before,
+        "operation": op,
+        "origin": {"view": format!("{:032x}", 1), "incarnation": 1},
+        "selections": {"primary": 0, "items": items(&[(0, 12)])},
+    });
+    let receipt = data(execute(&f.flavite, "editor.indent", args.clone()));
+    assert_eq!(receipt["unit"].as_str(), Some("4 spaces"));
+    assert_ne!(receipt["revision"].as_u64(), Some(before));
+
+    let receipt = data(execute(&f.flavite, "editor.dedent", args.clone()));
+    assert_eq!(receipt["unit"].as_str(), Some("4 spaces"));
+
+    // Tab-styled file: the unit is "tabs" (fallback width 4).
+    let f = support::fixture(&[("tabs.md", "\ta\n\tb\n")]);
+    let buffer = open_note(&f, "tabs.md");
+    let before = revision(&f.flavite, buffer);
+    let op = issue_operation(&f.flavite, buffer);
+    let args = json!({
+        "buffer_id": buffer,
+        "revision": before,
+        "operation": op,
+        "origin": {"view": format!("{:032x}", 1), "incarnation": 1},
+        "selections": {"primary": 0, "items": items(&[(0, 6)])},
+    });
+    let receipt = data(execute(&f.flavite, "editor.tabs_to_spaces", args.clone()));
+    assert_eq!(receipt["unit"].as_str(), Some("tabs"));
+    let receipt = data(execute(&f.flavite, "editor.spaces_to_tabs", args.clone()));
+    assert_eq!(receipt["unit"].as_str(), Some("tabs"));
+}
+
+#[test]
+fn dedent_all_at_column_zero_is_zero_effect_with_same_revision() {
+    // Zero-effect dedent: no revision bump, no movement spans, but the
+    // planner's unit still rides the receipt (the host uses revision
+    // equality to keep the notice silent).
+    let f = support::fixture(&[("note.md", "a\nb\n")]);
+    let buffer = open_note(&f, "note.md");
+    let before = revision(&f.flavite, buffer);
+    let op = issue_operation(&f.flavite, buffer);
+    let args = json!({
+        "buffer_id": buffer,
+        "revision": before,
+        "operation": op,
+        "origin": {"view": format!("{:032x}", 1), "incarnation": 1},
+        "selections": {"primary": 0, "items": items(&[(0, 4)])},
+    });
+    let receipt = data(execute(&f.flavite, "editor.dedent", args));
+    assert_eq!(
+        receipt["revision"].as_u64(),
+        Some(before),
+        "no revision bump"
+    );
+    assert_eq!(receipt["movement"]["spans"].as_array().unwrap().len(), 0);
+    assert_eq!(receipt["unit"].as_str(), Some("4 spaces"));
+    let view = f.flavite.get_buffer_view(buffer.into(), None).unwrap();
+    assert_eq!(view.text, "a\nb\n");
+}
+
+#[test]
 fn stale_revision_delete_leaves_everything_byte_identical() {
     let f = support::fixture(&[("note.md", "abc\n")]);
     let buffer = open_note(&f, "note.md");
