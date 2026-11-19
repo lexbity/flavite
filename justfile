@@ -505,10 +505,12 @@ gc:
     cargo xtask gc
 
 # Budget-independent sweep of previous-build artifacts (default: older than
-# 14 days): keeps the current build, drops what cargo would otherwise retain
-# forever. Cheap enough to run after heavy build sessions.
-gc-stale:
-    cargo xtask gc --stale-only
+# 1 day — variant sets accumulate within minutes, not days, so the window is
+# tight on purpose; the cost of sweeping a still-valid old artifact is one
+# cheap recompile). `just gc-stale` keeps everything from the last 24h;
+# `just gc-stale 0` is equivalent to a full clean.
+gc-stale days="1":
+    cargo xtask gc --stale-only --stale-days {{days}}
 
 # --- Releases (GoReleaser, see .goreleaser.yaml and docs/RELEASING.md) ---
 # CI (release.yml) runs these verbatim, so local == CI (D-9). All three need
