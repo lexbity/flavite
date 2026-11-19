@@ -22,3 +22,7 @@ iced_winit = "=0.14.1"
 
 # Argument parsing: `--help`/`--version` must never launch the window loop.
 clap = { version = "4", features = ["derive", "env"] }
+
+# RFC-0008 S1 (FR-10): env-gated fmt subscriber for the keystroke observability
+# spine. App-only — no library crate may install a subscriber.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

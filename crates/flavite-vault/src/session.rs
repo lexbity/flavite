@@ -2184,7 +2184,13 @@ impl Session {
     /// collections are memory-safe after unwind) — the host decides
     /// whether to continue or restart.
     pub fn execute(&self, command: SessionCommand) -> SessionResult {
-        let _turn = self.driving_turn.lock_recovering();
+        // RFC-0008 S1 (FR-10): the keystroke turn's `driving_turn` acquire.
+        // The span covers the lock wait and records its duration into the
+        // `wait_us` field when the span closes.
+        let lock_started = std::time::Instant::now();
+        let lock_wait = tracing::info_span!("edit.lock_wait", wait_us = tracing::field::Empty);
+        let _turn = lock_wait.in_scope(|| self.driving_turn.lock_recovering());
+        lock_wait.record("wait_us", lock_started.elapsed().as_micros());
         let activation = match &command {
             SessionCommand::ApplyEdits {
                 buffer_id,
@@ -6405,6 +6411,11 @@ impl Session {
         editor: Option<flavite_buffer::history::EditorEdit>,
         unit: Option<flavite_buffer::indent::Unit>,
     ) -> SessionResult {
+        // RFC-0008 S1 (FR-10): the session turn phase of the keystroke path.
+        // Debug-formatting of buffer/revision only happens when a subscriber
+        // is enabled — never on the quiet path.
+        let _session_turn =
+            tracing::info_span!("edit.session_turn", ?buffer_id, ?revision).entered();
         let mut buffer_manager = self.buffer_manager.lock_recovering();
         if let Some(path) = buffer_manager.path_for_id(buffer_id)
             && self.leased_by_replace(path)

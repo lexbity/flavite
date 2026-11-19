@@ -38,6 +38,8 @@ rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "t
 # error type (`graph::instance::GeometryError`).
 thiserror = { workspace = true }
 regex = { workspace = true }
+# RFC-0008 S1 (FR-10): keystroke host-turn span (`edit.host_turn`).
+tracing = { workspace = true }
 
 [features]
 # Fixture/harness support for integration tests and the visual runner. The

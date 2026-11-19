@@ -1388,7 +1388,7 @@ fn kernel_task(
                         "editor.spaces_to_tabs" => "Spaces → Tabs",
                         _ => "",
                     };
-                    app.context_mode.notice(&format!("{title} · unit: {unit}"));
+                    app.context_mode.notice(format!("{title} · unit: {unit}"));
                 }
             }
 

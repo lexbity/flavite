@@ -270,6 +270,11 @@
       "kind": "normal"
     },
     {
+      "from": "flavite-buffer",
+      "to": "tracing",
+      "kind": "normal"
+    },
+    {
       "from": "flavite-cli",
       "to": "blake3",
       "kind": "normal"
@@ -342,6 +347,11 @@
     {
       "from": "flavite-editor",
       "to": "nucleo-matcher",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-editor",
+      "to": "tracing",
       "kind": "normal"
     },
     {
@@ -517,6 +527,11 @@
     {
       "from": "flavite-ui",
       "to": "nucleo",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "tracing",
       "kind": "normal"
     },
     {

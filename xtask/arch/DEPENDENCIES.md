@@ -71,6 +71,7 @@ Normal/build:
 - `flavite-encoding` (normal)
 - `flavite-syntax` (normal)
 - `ropey` (normal)
+- `tracing` (normal)
 
 ### `flavite-cli`
 
@@ -103,6 +104,7 @@ Normal/build:
 - `flavite-syntax` (normal)
 - `iced` (normal)
 - `nucleo-matcher` (normal)
+- `tracing` (normal)
 
 Dev-only:
 
@@ -194,6 +196,7 @@ Normal/build:
 - `iced` (normal)
 - `iced_winit` (normal)
 - `nucleo` (normal)
+- `tracing` (normal)
 
 Dev-only:
 
@@ -255,7 +258,7 @@ Normal/build:
 - `rusqlite` ← flavite-api, flavite-index, xtask
 - `similar` ← flavite-vault
 - `tantivy` ← flavite-index, xtask
-- `tracing` ← flavite-api, flavite-cli, flavite-index, flavite-vault
+- `tracing` ← flavite-api, flavite-buffer, flavite-cli, flavite-editor, flavite-index, flavite-ui, flavite-vault
 - `tree-sitter` ← flavite-syntax
 - `zip` ← flavite-api, flavite-cli, flavite-theme, flavite-ui
 - `zstd` ← flavite-vault

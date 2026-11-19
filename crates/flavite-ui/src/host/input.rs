@@ -209,6 +209,15 @@ fn handle_inner(
     mut input: CapturedInput,
     composition_commit: bool,
 ) -> iced::Task<Message> {
+    // RFC-0008 S1 (FR-10): the host turn phase of the keystroke path. The
+    // span covers the whole handler; every early-return path drops the guard.
+    // Fields are plain integers (no string formatting on the hot path).
+    let _host_turn = tracing::info_span!(
+        "edit.host_turn",
+        buffer = input.buffer,
+        revision = input.observed_revision,
+    )
+    .entered();
     if super::context_mode::too_narrow(app, tab) {
         app.context_mode
             .notice("Pane too narrow · expand the pane to continue editing");

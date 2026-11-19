@@ -65,6 +65,13 @@ reconcile-bench:
 bench-scale:
     cargo test --workspace --release -- --ignored --nocapture
 
+# RFC-0008 S1: scoped release benches for the edit/shaping paths (S1-T3).
+# Runs the ignored `perf_keystroke.rs` (buffer) and `perf_shaping.rs`
+# (editor) benches in release. Absolute hard-fail gates engage only with
+# FLAVITE_REFERENCE_PERF set (selection_performance.rs convention).
+bench-edit:
+    cargo test -p flavite-buffer -p flavite-editor --release --locked -- --ignored --nocapture
+
 # Architecture debt gates from RFC-0002 §7; zero matches are required.
 lint-arch:
     #!/usr/bin/env bash

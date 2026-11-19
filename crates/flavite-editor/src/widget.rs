@@ -1410,6 +1410,10 @@ impl EditorState {
         }
         self.buffer_id = Some(view.buffer_id);
         if self.revision != Some(view.revision) {
+            // RFC-0008 S1 (FR-10): the structure-parse phase (pulldown
+            // `scan_note` today; the tree-sitter path in S6–S8).
+            let _scan_span =
+                tracing::info_span!("render.scan", doc_len = view.text.len()).entered();
             let (link_spans, decorations) = scan_note(&view.text);
             self.link_spans = link_spans;
             self.decorations = decorations;
@@ -1566,6 +1570,8 @@ impl EditorState {
         width: f32,
     ) -> ShapedView<'_> {
         let (band_start, band_lines) = self.shaping_band(text, revision, viewport, width.to_bits());
+        // RFC-0008 S1 (FR-10): the shaping phase. Plain integer fields.
+        let _shaping_span = tracing::info_span!("render.shaping", band_start, band_lines).entered();
         let key = ShapingKey::new(
             revision,
             text.as_ptr() as usize,
@@ -1714,6 +1720,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 line_starts: &local_starts,
             }
         };
+        // RFC-0008 S1 (FR-10): the paint phase (per-frame fill_text + quad
+        // geometry). Emission happens on the real render path; the S3
+        // headless-renderer double drives it in tests.
+        let _paint_span = tracing::info_span!("render.paint").entered();
         let paint_offset = shaped_view.paint_offset(state.viewport);
         // Bound selection work by the physical rows being painted, even
         // when one logical line wraps far below the viewport. Band rows
@@ -3924,6 +3934,61 @@ mod tests {
                 .into();
         reopened.as_widget().diff(&mut tree);
         assert_eq!(tree.state.downcast_ref::<EditorState>().caret(), 3);
+    }
+
+    #[test]
+    fn s1_observability_emits_render_spans_for_scan_and_shaping() {
+        // RFC-0008 S1-T1 (render half): the widget emits `render.scan` on
+        // revision reconcile and `render.shaping` on shaping. `render.paint`
+        // emits on the real render path (driven by the S3 headless-renderer
+        // double); the other FR-10 phases are asserted by the flavite-ui
+        // keystroke-spans integration test.
+        struct Recording(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+        impl tracing::subscriber::Subscriber for Recording {
+            fn register_callsite(
+                &self,
+                _metadata: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::always()
+            }
+            fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                self.0
+                    .lock()
+                    .expect("recorder lock")
+                    .push(attrs.metadata().name());
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, _event: &tracing::Event<'_>) {}
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+            fn clone_span(&self, _span: &tracing::span::Id) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+        }
+
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Recording(recorded.clone()), || {
+            let mut state = EditorState::default();
+            let view = EditorView::from(&test_view("one\ntwo\nthree\n", 77));
+            state.reconcile(&view, &HashMap::new());
+            let shaped = state.shaped(&view.text, view.revision, Viewport::default(), 300.0);
+            let _ = shaped.visible; // the shaped view stays alive for the span
+        });
+        let names = recorded.lock().expect("recorder lock").clone();
+        assert!(
+            names.contains(&"render.scan"),
+            "missing render.scan in {names:?}"
+        );
+        assert!(
+            names.contains(&"render.shaping"),
+            "missing render.shaping in {names:?}"
+        );
     }
 
     fn test_view(text: &str, buffer_id: u64) -> BufferView {

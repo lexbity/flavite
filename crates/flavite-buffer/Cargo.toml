@@ -22,6 +22,9 @@ serde_json = { workspace = true }
 blake3 = { workspace = true }
 unicode-segmentation = { workspace = true }
 uuid = { version = "1", features = ["v7"] }
+# RFC-0008 S1 (FR-10): model/undo keystroke spans (`edit.model_apply`,
+# `edit.undo_coalesce`). Zero cost with no subscriber installed (S1-T2).
+tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }

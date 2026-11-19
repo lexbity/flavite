@@ -2497,6 +2497,11 @@ impl Flavite {
 
     /// The turn body: ingress-serialized validation + dispatch + conversion.
     fn execute_turn(&self, invocation: Invocation) -> ExecutionResult {
+        // RFC-0008 S1 (FR-10): the api turn phase of the keystroke path. The
+        // command id is a borrowed &str — no string formatting on the hot
+        // path; args are never logged.
+        let _api_turn =
+            tracing::info_span!("edit.api_turn", command = %invocation.command_id).entered();
         let _turn = self.ingress.lock_recovering();
         if let Err(error) = self
             .command_registry

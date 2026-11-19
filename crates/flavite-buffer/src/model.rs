@@ -790,6 +790,14 @@ impl EditorModel {
         edits: &[EditOp],
         journal: Option<crate::undo::JournalTag>,
     ) -> Revision {
+        // RFC-0008 S1 (FR-10): buffer-apply phase. `ops` and `doc_len` are
+        // plain integers — no formatting on the hot path.
+        let _model_apply = tracing::info_span!(
+            "edit.model_apply",
+            ops = edits.len(),
+            doc_len = self.text().len()
+        )
+        .entered();
         if edits.is_empty() {
             return self.revision;
         }
@@ -1103,6 +1111,13 @@ impl EditorModel {
         policy: crate::undo::UndoPolicy,
         record: crate::history::EditorEdit,
     ) -> Result<Revision, RecordedBatchError> {
+        // RFC-0008 S1 (FR-10): the interactive recorded-batch apply phase.
+        let _model_apply = tracing::info_span!(
+            "edit.model_apply",
+            ops = edits.len(),
+            doc_len = self.text().len()
+        )
+        .entered();
         let batch = self
             .prepare_batch(edits)
             .map_err(RecordedBatchError::from)?;

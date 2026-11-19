@@ -587,6 +587,10 @@ impl UndoTree {
             } else {
                 false
             };
+        // RFC-0008 S1 (FR-10): the undo-coalescing decision/merge phase. The
+        // `coalesced` field records which branch ran (merge vs new-node).
+        let _undo_coalesce =
+            tracing::info_span!("edit.undo_coalesce", coalesced = should_coalesce,).entered();
         if should_coalesce {
             let parent_text = self
                 .get(position_id)

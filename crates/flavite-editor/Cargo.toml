@@ -16,6 +16,9 @@ flavite-edit-context = { path = "../flavite-edit-context" }
 nucleo-matcher = { workspace = true }
 serde_json = { workspace = true }
 unicode-segmentation = { workspace = true }
+# RFC-0008 S1 (FR-10): render-side keystroke spans (`render.shaping`,
+# `render.paint`, `render.scan`).
+tracing = { workspace = true }
 
 [features]
 # Test-only constructors (`EditorWidget::new` copy view, `state_for_test`).
