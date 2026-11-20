@@ -11,6 +11,13 @@
 //! The widget is driven with `()` as its renderer — iced_core's debug null
 //! renderer — so no GPU, window, or event loop is required. CI runs these on
 //! Linux, macOS, and Windows via `cargo test --workspace` (G0/G1).
+//!
+//! The null renderer (`impl Renderer for ()`) exists only under
+//! `#[cfg(debug_assertions)]` in iced_core 0.14, so this probe is a
+//! debug-build suite: release profiles (`just bench-scale`) gate it out
+//! (RFC-0008 S9 consolidation; the probe's purpose is event-delivery
+//! semantics, not release perf).
+#![cfg(debug_assertions)]
 
 use iced::advanced::clipboard::Null as NullClipboard;
 use iced::advanced::input_method;

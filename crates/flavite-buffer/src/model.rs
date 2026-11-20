@@ -142,10 +142,13 @@ pub struct PreparedBatch {
 /// Splice an EOL table from `old_text` to `new_text`: unchanged prefix and
 /// suffix lines keep their recorded endings; changed lines inherit the old
 /// dominant ending; a new final unterminated line stays unterminated. This
-/// is the affected-range splice (§6.9), never a whole-document
-/// reconstruction fallback.
+/// is the whole-document reference splice (RFC-0008 D6): the production
+/// path uses the bounded `spliced_eol_table_in_window`; this reference
+/// exists only as a `#[cfg(test)]` oracle for the randomized equivalence
+/// proptests (AC-8).
+#[cfg(test)]
 #[must_use]
-pub fn spliced_eol_table(old: &EolTable, old_text: &str, new_text: &str) -> EolTable {
+pub(crate) fn spliced_eol_table(old: &EolTable, old_text: &str, new_text: &str) -> EolTable {
     let dominant = match old.dominant_eol() {
         crate::eol::LineEnding::None => crate::eol::LineEnding::Lf,
         ending => ending,
