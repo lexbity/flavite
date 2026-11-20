@@ -41,7 +41,6 @@ use flavite_editor::widget::{
 use flavite_syntax::structure::EditRange;
 use flavite_syntax::text::{Span, TextByte};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const FILLER: &str =
@@ -189,7 +188,7 @@ fn band_fixture() -> (String, flavite_editor::EditorView, Viewport) {
     let view = flavite_editor::EditorView {
         buffer_id: 1,
         revision: 1,
-        text: Arc::from(text.as_str()),
+        text: flavite_buffer::chunks::DocumentText::from(text.as_str()),
         path: PathBuf::from("note.md"),
         state: flavite_buffer::state::BufferState::Clean,
         last_edit: None,
@@ -211,7 +210,7 @@ fn render_phases_ms() -> (f64, f64) {
     edited.replace_range(at..at + 1, "A");
     let edited_view = flavite_editor::EditorView {
         revision: 2,
-        text: Arc::from(edited.as_str()),
+        text: flavite_buffer::chunks::DocumentText::from(edited.as_str()),
         last_edit: Some(EditRange {
             start: at,
             old_end: at + 1,
@@ -225,14 +224,15 @@ fn render_phases_ms() -> (f64, f64) {
     for _ in 0..200 {
         let mut state = EditorState::default();
         state.reconcile(&view, &std::collections::HashMap::new());
-        state.sync_shaped_for_perf(&view.text, 1, viewport, width);
+        let view_text = view.text.materialize();
+        let edited_text = edited_view.text.materialize();
+        state.sync_shaped_for_perf(&view_text, 1, viewport, width);
         state.reconcile(&edited_view, &std::collections::HashMap::new());
         let start = Instant::now();
-        state.sync_shaped_for_perf(&edited_view.text, 2, viewport, width);
+        state.sync_shaped_for_perf(&edited_text, 2, viewport, width);
         shaping.push(start.elapsed());
         let start = Instant::now();
-        let painted =
-            state.painted_line_count_for_perf(&edited_view.text, 2, viewport, width, paint_height);
+        let painted = state.painted_line_count_for_perf(&edited_text, 2, viewport, width, paint_height);
         assert!(painted > 0, "paint collection paints lines");
         paint.push(start.elapsed());
     }

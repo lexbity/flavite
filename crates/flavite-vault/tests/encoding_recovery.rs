@@ -258,7 +258,7 @@ fn utf16_dirty_draft_recovery_replays_recorded_format() {
         .shared_buffer_snapshot(restored_id, None)
         .expect("snapshot after restore");
     assert_eq!(
-        snapshot.text.to_string(),
+        snapshot.text.materialize().to_string(),
         "DIRTY DRAFT saved base\nsecond line\n",
         "the draft edit survived the crash"
     );

@@ -55,7 +55,7 @@ fn snapshot(buffer_id: u64, revision: u64, caret: usize, sequence: u64, focused:
 fn typed(
     editor_view: &EditorView,
     state: &mut flavite_editor::widget::EditorState,
-    text: &str,
+    _text: &str,
     input: &str,
 ) -> Vec<EditorAction> {
     let mut messages = Vec::new();
@@ -72,8 +72,9 @@ fn typed(
             preferred_x: Vec::new(),
             clipboard_acquired: false,
         };
+        let text = editor_view.text.materialize();
         let set = SelectionSet::normalize(
-            &editor_view.text,
+            &text,
             vec![RawSelection {
                 id: None,
                 anchor: state.selection().0,
@@ -95,7 +96,7 @@ fn typed(
         // The acknowledgment round trip: the after-set installs through the
         // public restore path (same buffer/revision, newer sequence).
         state.restore_interaction(
-            text,
+            &text,
             Snapshot {
                 selections: members
                     .iter()

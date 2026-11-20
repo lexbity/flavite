@@ -246,14 +246,14 @@ pub fn pump(app: &mut App) {
         }
         if app.replace.view_state(jump.owner).finder.as_ref() != Some(&jump.finder)
             || !flavite_api::replace::source_match_current(
-                &view.text, &jump.hash, jump.start, jump.end,
+                &view.text.materialize(), &jump.hash, jump.start, jump.end,
             )
         {
             app.status = "Search match is stale; refresh vault search".into();
             continue;
         }
-        if !flavite_buffer::selection::is_grapheme_boundary(&view.text, jump.start)
-            || !flavite_buffer::selection::is_grapheme_boundary(&view.text, jump.end)
+        if !flavite_buffer::selection::is_grapheme_boundary(&view.text.materialize(), jump.start)
+            || !flavite_buffer::selection::is_grapheme_boundary(&view.text.materialize(), jump.end)
         {
             app.status = "Match falls inside a grapheme; inspect it with note Find".into();
             continue;

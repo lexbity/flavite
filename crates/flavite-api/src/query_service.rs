@@ -633,7 +633,10 @@ fn execute(
             Some(flavite_buffer::Revision::new(*revision)),
         ) {
             Ok(snapshot) if anchor.len() <= 8192 => {
-                match flavite_syntax::read::resolve_anchor(&snapshot.text, anchor) {
+                // Query workers materialize on their own thread (RFC-0011
+                // D-11); the snapshot itself is an O(1) root.
+                let text = snapshot.text.materialize();
+                match flavite_syntax::read::resolve_anchor(&text, anchor) {
                     Ok(byte) => ContextQueryResult::Anchor {
                         buffer_id: *buffer_id,
                         revision: *revision,
@@ -728,7 +731,9 @@ fn execute_link_verdicts(
         Ok(source) => source,
         Err(_) => return ContextQueryResult::Updating,
     };
-    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(&source.text) else {
+    let Ok(parsed) =
+        flavite_syntax::pulldown_glue::parse_normalized(&source.text.materialize())
+    else {
         return ContextQueryResult::Failed {
             message: "Current note links are unavailable".into(),
         };
@@ -809,7 +814,7 @@ fn inspect_occurrence(
                 Some(flavite_buffer::Revision::new(*revision)),
             )
             .ok()
-            .map(|s| (s.text.to_string(), occurrence.start, occurrence.end)),
+            .map(|s| (s.text.materialize().to_string(), occurrence.start, occurrence.end)),
         crate::OccurrenceSource::Saved { content_hash } => session
             .read_saved_note(&session.root().join(&occurrence.source_path))
             .ok()
@@ -880,7 +885,7 @@ fn execute_preview(session: &Arc<Session>, path: &[String]) -> ContextQueryResul
     {
         return ContextQueryResult::BufferPreview {
             path: path.to_vec(),
-            text: snapshot.text.to_string(),
+            text: snapshot.text.materialize().to_string(),
             buffer_id: id.as_u64(),
             revision: revision.as_u64(),
             unsaved: snapshot.state != flavite_buffer::state::BufferState::Clean,
@@ -1017,7 +1022,7 @@ fn execute_backlinks(
                     Some(flavite_buffer::Revision::new(*revision)),
                 )
                 .ok()
-                .and_then(|s| exact_excerpt(&s.text, occurrence.start, occurrence.end)),
+                .and_then(|s| exact_excerpt(&s.text.materialize(), occurrence.start, occurrence.end)),
             crate::OccurrenceSource::Saved { content_hash } => session
                 .read_saved_note(&session.root().join(&occurrence.source_path))
                 .ok()
@@ -1062,8 +1067,9 @@ fn exact_excerpt(text: &str, start: usize, end: usize) -> Option<String> {
 }
 
 /// The first line of `text` containing a link occurrence whose target
-/// mentions `stem`, found by the one shared scanner (never a second,
-/// weaker parser). Excerpts are presentation-only; identity is the path.
+/// mentions `stem`, found through the pulldown bridge's parsed link spans
+/// (the same converter the segment cache uses — never a second, weaker
+/// parser). Excerpts are presentation-only; identity is the path.
 #[cfg(test)]
 fn link_excerpt(text: &str, stem: &str) -> Option<String> {
     let parsed = flavite_syntax::pulldown_glue::parse_normalized(text).ok()?;

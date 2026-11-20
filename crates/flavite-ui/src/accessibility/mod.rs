@@ -192,9 +192,10 @@ pub fn route_action(app: &App, request: ActionRequest) -> Option<Message> {
                     let Some(ActionData::SetTextSelection(selection)) = request.data else {
                         return None;
                     };
+                    let text = view.text.materialize();
                     (
-                        tree::position_byte(app, tab, &view.text, selection.anchor)?,
-                        tree::position_byte(app, tab, &view.text, selection.focus)?,
+                        tree::position_byte(app, tab, &text, selection.anchor)?,
+                        tree::position_byte(app, tab, &text, selection.focus)?,
                     )
                 }
                 _ => return None,

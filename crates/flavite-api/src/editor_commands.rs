@@ -227,7 +227,7 @@ pub(crate) fn handle_editor_delete(
             });
         }
     };
-    let text = snapshot.text;
+    let text = snapshot.text.materialize();
     let set = match normalize_set(&text, &args.selections) {
         Ok(set) => set,
         Err(error) => {
@@ -296,7 +296,8 @@ pub(crate) fn handle_keep_primary(
                 format!("StaleRevision: expected {expected}, current {actual}")
             }
         })?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let primary_id = set.primary_id().as_raw();
     let kept = set
         .members()
@@ -308,7 +309,7 @@ pub(crate) fn handle_keep_primary(
         })
         .filter(|member| member.id == Some(primary_id))
         .collect::<Vec<_>>();
-    let (kept, _) = SelectionSet::normalize(&snapshot.text, kept, Some(primary_id))
+    let (kept, _) = SelectionSet::normalize(&text, kept, Some(primary_id))
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &kept))
 }
@@ -333,7 +334,8 @@ pub(crate) fn handle_collapse(
                 format!("StaleRevision: expected {expected}, current {actual}")
             }
         })?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let carets = set
         .members()
         .iter()
@@ -344,7 +346,7 @@ pub(crate) fn handle_collapse(
         })
         .collect::<Vec<_>>();
     let (collapsed, _) =
-        SelectionSet::normalize(&snapshot.text, carets, None).map_err(|error| error.to_string())?;
+        SelectionSet::normalize(&text, carets, None).map_err(|error| error.to_string())?;
     Ok(selections_changed(
         args.buffer_id,
         args.revision,
@@ -372,14 +374,15 @@ pub(crate) fn handle_clear_selection(
                 format!("StaleRevision: expected {expected}, current {actual}")
             }
         })?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let head = set.primary().head();
     let caret = RawSelection {
         id: Some(set.primary_id().as_raw()),
         anchor: head,
         head,
     };
-    let (cleared, _) = SelectionSet::normalize(&snapshot.text, vec![caret], None)
+    let (cleared, _) = SelectionSet::normalize(&text, vec![caret], None)
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &cleared))
 }
@@ -575,7 +578,7 @@ fn handle_ticketed_edit(
             });
         }
     };
-    let text = snapshot.text;
+    let text = snapshot.text.materialize();
     let set = match normalize_set(&text, &selections) {
         Ok(set) => set,
         Err(error) => {
@@ -863,8 +866,9 @@ pub(crate) fn handle_editor_copy(
 ) -> Result<SessionResult, String> {
     let args: EditorSelectionOnlyArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
-    let fragments = flavite_buffer::commands::copy_fragments(&snapshot.text, &set)
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let fragments = flavite_buffer::commands::copy_fragments(&text, &set)
         .map_err(|error| error.to_string())?;
     Ok(SessionResult::Success(
         crate::session::CommandResult::TextCopied {
@@ -901,12 +905,13 @@ pub(crate) fn handle_select_word(
 ) -> Result<SessionResult, String> {
     let args: EditorSelectionOnlyArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let candidates: Vec<RawSelection> = set
         .members()
         .iter()
         .map(|member| {
-            let (anchor, head) = flavite_edit_context::word_bounds(&snapshot.text, member.head());
+            let (anchor, head) = flavite_edit_context::word_bounds(&text, member.head());
             RawSelection {
                 id: Some(member.id().as_raw()),
                 anchor,
@@ -915,7 +920,7 @@ pub(crate) fn handle_select_word(
         })
         .collect();
     let hint = set.primary_id().as_raw();
-    let (selected, _) = SelectionSet::normalize(&snapshot.text, candidates, Some(hint))
+    let (selected, _) = SelectionSet::normalize(&text, candidates, Some(hint))
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &selected))
 }
@@ -928,7 +933,8 @@ pub(crate) fn handle_select_line(
 ) -> Result<SessionResult, String> {
     let args: EditorSelectionOnlyArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let count = args.count.unwrap_or(1);
     let candidates: Vec<RawSelection> = set
         .members()
@@ -937,10 +943,10 @@ pub(crate) fn handle_select_line(
             // FEUX-0004 X06: select count lines starting from the member's containing line
             // Get the containing line
             let (line_anchor, line_start) =
-                flavite_buffer::selection::containing_line(&snapshot.text, member.head());
+                flavite_buffer::selection::containing_line(&text, member.head());
 
             // Find the end position after count lines (including the starting line)
-            let end_pos = count_lines_forward(&snapshot.text, line_start, count);
+            let end_pos = count_lines_forward(&text, line_start, count);
 
             RawSelection {
                 id: Some(member.id().as_raw()),
@@ -950,7 +956,7 @@ pub(crate) fn handle_select_line(
         })
         .collect();
     let hint = set.primary_id().as_raw();
-    let (selected, _) = SelectionSet::normalize(&snapshot.text, candidates, Some(hint))
+    let (selected, _) = SelectionSet::normalize(&text, candidates, Some(hint))
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &selected))
 }
@@ -988,8 +994,9 @@ fn insert_at(
 ) -> Result<SessionResult, String> {
     let args: EditorSelectionOnlyArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
-    let prepared = flavite_buffer::commands::plan(&snapshot.text, &set, &edit_operation)
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let prepared = flavite_buffer::commands::plan(&text, &set, &edit_operation)
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(
         args.buffer_id,
@@ -1071,8 +1078,9 @@ pub(crate) fn handle_toggle_caret(
 ) -> Result<SessionResult, String> {
     let args: EditorToggleCaretArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
-    let toggled = flavite_buffer::selection::toggle_caret(&snapshot.text, &set, args.position)
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let toggled = flavite_buffer::selection::toggle_caret(&text, &set, args.position)
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &toggled))
 }
@@ -1146,7 +1154,8 @@ pub(crate) fn handle_editor_move(
 ) -> Result<SessionResult, String> {
     let args: EditorMoveArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let motion: flavite_buffer::motion::Motion = args.motion.into();
     let positions = match (motion.is_visual(), &args.positions) {
         (true, Some(positions)) => Some(positions.as_slice()),
@@ -1162,7 +1171,7 @@ pub(crate) fn handle_editor_move(
     let moved = if let Some(n) = args.count {
         // Apply motion n times
         flavite_buffer::motion::apply_with_count(
-            &snapshot.text,
+            &text,
             &set,
             motion,
             args.extend,
@@ -1171,7 +1180,7 @@ pub(crate) fn handle_editor_move(
         )
     } else {
         // No count, apply once
-        flavite_buffer::motion::apply(&snapshot.text, &set, motion, args.extend, positions)
+        flavite_buffer::motion::apply(&text, &set, motion, args.extend, positions)
     }
     .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &moved))
@@ -1210,13 +1219,14 @@ pub(crate) fn handle_find_char(
         return Err("char must be exactly one character".into());
     };
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let count = args.count.unwrap_or(1);
     let found = if count == 1 {
-        flavite_buffer::selection::find_char(&snapshot.text, &set, forward, target, args.extend)
+        flavite_buffer::selection::find_char(&text, &set, forward, target, args.extend)
     } else {
         flavite_buffer::selection::find_char_with_count(
-            &snapshot.text,
+            &text,
             &set,
             forward,
             target,
@@ -1242,8 +1252,9 @@ pub struct EditorAddCaretsArgs {
 fn handle_add_carets(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let args: EditorAddCaretsArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
-    let merged = flavite_buffer::selection::add_carets(&snapshot.text, &set, &args.positions)
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let merged = flavite_buffer::selection::add_carets(&text, &set, &args.positions)
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &merged))
 }
@@ -1278,7 +1289,8 @@ pub(crate) fn handle_rotate_primary(
 ) -> Result<SessionResult, String> {
     let args: EditorRotateArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let forward = match args.direction.as_str() {
         "next" => true,
         "previous" => false,
@@ -1300,8 +1312,9 @@ macro_rules! selection_only_set_op {
         ) -> Result<SessionResult, String> {
             let args: EditorSelectionOnlyArgs = decode(invocation)?;
             let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-            let set = normalize_set(&snapshot.text, &args.selections)?;
-            let next = $method(&snapshot.text, &set).map_err(|error| error.to_string())?;
+            let text = snapshot.text.materialize();
+            let set = normalize_set(&text, &args.selections)?;
+            let next = $method(&text, &set).map_err(|error| error.to_string())?;
             Ok(selections_changed(args.buffer_id, args.revision, &next))
         }
     };
@@ -1424,7 +1437,8 @@ pub(crate) fn handle_keep_matching(
     let args: EditorKeepMatchingArgs = decode(invocation)?;
     let buffer_id = BufferId::from(args.buffer_id);
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let mode = decode_mode(args.query.regex);
 
     if !args.apply {
@@ -1462,7 +1476,7 @@ pub(crate) fn handle_keep_matching(
     };
 
     apply_keep_matching(
-        &snapshot.text,
+        &text,
         &set,
         &selection_indices,
         match_count,
@@ -1985,15 +1999,16 @@ pub(crate) fn handle_goto_line(
     }
     // Get the snapshot to check line count
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let line_count = snapshot.text.lines().count() as u64;
+    let text = snapshot.text.materialize();
+    let line_count = text.lines().count() as u64;
     if args.line > line_count {
         return Err(format!("Document has {line_count} lines"));
     }
     // GotoLine is a selection-only command - it moves each member's head to line N at column 0
     // We implement this by delegating to editor.move with the Line motion
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let set = normalize_set(&text, &args.selections)?;
     let motion = flavite_buffer::motion::Motion::Line(args.line);
-    let moved = flavite_buffer::motion::apply(&snapshot.text, &set, motion, false, None)
+    let moved = flavite_buffer::motion::apply(&text, &set, motion, false, None)
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &moved))
 }
@@ -2086,9 +2101,10 @@ pub(crate) fn handle_surround_delete(
     let pair = flavite_buffer::pairs::pair_for_char(char);
     // Validate that all selections have the enclosing pair
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let validation = flavite_buffer::pairs::validate_enclosing_pairs(
-        &snapshot.text,
+        &text,
         &set,
         &flavite_buffer::pairs::Pair::from_open(pair.open).unwrap_or(pair),
     );
@@ -2136,9 +2152,10 @@ pub(crate) fn handle_surround_change(
     let new_pair = flavite_buffer::pairs::pair_for_char(new_char);
     // Validate that all selections have the enclosing old pair
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let validation = flavite_buffer::pairs::validate_enclosing_pairs(
-        &snapshot.text,
+        &text,
         &set,
         &flavite_buffer::pairs::Pair::from_open(old_pair.open).unwrap_or(old_pair),
     );
@@ -2179,7 +2196,8 @@ fn handle_match_selection(
     // Both paths validate the committed set against the live snapshot; a
     // stale capture is refused before any collection or install.
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let mode = decode_mode(args.query.regex);
 
     // Build scope_spans from current selections if in_selections is true
@@ -2223,7 +2241,7 @@ fn handle_match_selection(
     };
     if select {
         apply_select_matches(
-            &snapshot.text,
+            &text,
             &spans,
             total_matches,
             zero_width_count,
@@ -2237,7 +2255,7 @@ fn handle_match_selection(
             .map(|member| (member.start(), member.end()))
             .collect();
         apply_split_selection(
-            &snapshot.text,
+            &text,
             &spans,
             total_matches,
             args.in_selections,

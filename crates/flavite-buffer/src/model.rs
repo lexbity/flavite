@@ -307,6 +307,23 @@ impl EditorModel {
             .as_str()
     }
 
+    /// A cheap, shareable text view over the current root (O(1); never
+    /// materializes). Consumers hold this across revision boundaries; full
+    /// text is obtained with [`DocumentText::materialize`] on their own
+    /// threads (RFC-0011 D-10/D-11).
+    #[must_use]
+    pub fn document_text(&self) -> crate::chunks::DocumentText {
+        crate::chunks::DocumentText::new(Arc::clone(&self.version.root))
+    }
+
+    /// The immutable current version (chunk-tree root + EOL side state +
+    /// save descriptor). Cloning the `Arc` is O(1); used to stage
+    /// recovery/autosave work off the interactive turn.
+    #[must_use]
+    pub fn version_state(&self) -> &Arc<VersionState> {
+        &self.version
+    }
+
     /// Get the text length in bytes.
     #[must_use]
     pub fn len(&self) -> usize {

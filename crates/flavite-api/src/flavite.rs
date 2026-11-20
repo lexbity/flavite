@@ -2617,28 +2617,25 @@ impl Flavite {
         }
         if let Some(buffer_id) = invocation.preconditions.buffer_id {
             let revision = invocation.preconditions.expected_revision;
-            match self.get_buffer_view(BufferId::from(buffer_id), revision.map(Revision::new)) {
+            // RFC-0011 T13: validate preconditions against the O(1) shared
+            // snapshot — never materialize the discarded `String` the
+            // serialized `BufferView` path would build.
+            match self
+                .session
+                .shared_buffer_snapshot(BufferId::from(buffer_id), revision.map(Revision::new))
+            {
                 Ok(_) => {}
-                Err(FlaviteError::BufferNotFound(_)) => {
+                Err(flavite_vault::session::BufferSnapshotError::NotFound(_)) => {
                     return ExecutionResult::Rejected(RejectedResult::with_request(
                         RejectionReason::BufferNotFound,
                         invocation.request_id,
                     ));
                 }
-                Err(FlaviteError::StaleBufferView { .. }) => {
+                Err(flavite_vault::session::BufferSnapshotError::Stale { .. }) => {
                     return ExecutionResult::Rejected(RejectedResult::with_request(
                         RejectionReason::StaleRevision,
                         invocation.request_id,
                     ));
-                }
-                Err(error) => {
-                    return ExecutionResult::Rejected(
-                        RejectedResult::with_request(
-                            RejectionReason::Unsupported,
-                            invocation.request_id,
-                        )
-                        .with_message(error.to_string()),
-                    );
                 }
             }
         }
@@ -3633,7 +3630,9 @@ impl Flavite {
         Ok(BufferView {
             buffer_id: snapshot.buffer_id.as_u64(),
             revision: snapshot.revision.as_u64(),
-            text: snapshot.text.to_string(),
+            // Serialized surface: materialize at serialization time
+            // (client-paced; RFC-0011 FR-9).
+            text: snapshot.text.materialize().to_string(),
             base_hash: snapshot
                 .base_hash
                 .map_or_else(Vec::new, |hash| hash.to_vec()),
@@ -3862,8 +3861,10 @@ pub struct SharedBufferView {
     pub buffer_id: u64,
     /// Buffer revision.
     pub revision: u64,
-    /// Shared normalized text.
-    pub text: Arc<str>,
+    /// Shared normalized text as an immutable chunk-tree root. Consumers
+    /// slice or materialize on their own side of the channel boundary —
+    /// never on the session's keystroke path (RFC-0011 D-10/D-11).
+    pub text: flavite_buffer::chunks::DocumentText,
     /// Base hash.
     pub base_hash: Vec<u8>,
     /// Typed canonical buffer state.

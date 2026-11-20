@@ -130,7 +130,7 @@ fn directory_pages_reach_past_500_and_invalidate_on_external_change() {
     run(&mut f.app, Browser::Open(None, "row-0602.md".into()));
     settle(&mut f.app, |app| {
         app.note_editor_view(app.workspace.focused_tab())
-            .is_some_and(|view| &*view.text == "page")
+            .is_some_and(|view| &*view.text.materialize() == "page")
     });
     run(&mut f.app, Browser::Refresh);
     settle(&mut f.app, |app| {

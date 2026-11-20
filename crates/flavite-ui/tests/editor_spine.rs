@@ -68,7 +68,7 @@ fn delete_through_the_kernel_installs_the_receipt_and_undo_restores_exactly() {
 
     // The delete applied through the ticketed kernel path.
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one \nsecond line\n"
     );
     let after_revision = f.app.note_editor_view(tab).unwrap().revision;
@@ -127,7 +127,7 @@ fn passive_view_maps_once_and_stateale_selection_version_refuses() {
 
     // The passive view mapped once to the after-text.
     assert_eq!(
-        &*f.app.note_editor_view(tab_b).unwrap().text,
+        &*f.app.note_editor_view(tab_b).unwrap().text.materialize(),
         "one \nsecond line\n"
     );
     let b_selection = f.app.editor_interaction_snapshot(tab_b).unwrap().selection;
@@ -187,7 +187,7 @@ fn kernel_delete_empty_line_creates_no_history_node() {
     let before_revision = f.app.note_editor_view(tab).unwrap().revision;
     run(&mut f.app, tab, Command::Toggle);
     run(&mut f.app, tab, Command::Delete);
-    assert_eq!(&*f.app.note_editor_view(tab).unwrap().text, "a\n\nb");
+    assert_eq!(&*f.app.note_editor_view(tab).unwrap().text.materialize(), "a\n\nb");
     assert_eq!(
         f.app.note_editor_view(tab).unwrap().revision,
         before_revision,

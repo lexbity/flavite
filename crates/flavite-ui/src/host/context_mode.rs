@@ -312,7 +312,8 @@ pub fn effect_caption(app: &App, tab: TabId) -> Option<String> {
     }
     let command = preview_command(app, tab)?;
     let view = app.note_editor_view(tab)?;
-    flavite_edit_context::effect::plan(&view.text, target.selection, command)
+    let text = view.text.materialize();
+    flavite_edit_context::effect::plan(&text, target.selection, command)
         .map(|effect| effect.description(command))
 }
 
@@ -392,7 +393,7 @@ pub(crate) fn focus(app: &mut App, tab: TabId) -> Task<Message> {
         let mut interaction = session.interaction().clone();
         interaction.focused = true;
         interaction.sequence = interaction.sequence.saturating_add(1);
-        let _ = app.acknowledge_editor_interaction(interaction, &view.text);
+        let _ = app.acknowledge_editor_interaction(interaction, &view.text.materialize());
     }
     iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus())
         .chain(iced::advanced::widget::operate(
@@ -978,7 +979,7 @@ fn install_pairs(app: &mut App, target: &EditorTarget, pairs: &[(usize, usize)])
         return false;
     };
     if app
-        .acknowledge_editor_interaction(interaction, &view.text)
+        .acknowledge_editor_interaction(interaction, &view.text.materialize())
         .is_err()
     {
         app.input_chains.remove(&target.tab);
@@ -1106,7 +1107,7 @@ pub(crate) fn replace_commit(
     let Some(view) = app.note_editor_view(tab) else {
         return Err("Source changed; replace was refused".into());
     };
-    let text = &view.text;
+    let text = view.text.materialize();
     // Admission validation of the worker-computed ops — primary here, the
     // worker guarantee is defense-in-depth (mirrors §5.4 layering).
     let mut cursor = 0usize;
@@ -1160,7 +1161,7 @@ pub(crate) fn replace_commit(
         )
         .collect();
     let hint = u32::try_from(target.primary).ok();
-    let (before, _) = flavite_buffer::selection::SelectionSet::normalize(text, candidates, hint)
+    let (before, _) = flavite_buffer::selection::SelectionSet::normalize(&text, candidates, hint)
         .map_err(|error| error.to_string())?;
     let edits: Vec<flavite_buffer::selection::SpanEdit> = ops
         .iter()
@@ -1281,6 +1282,7 @@ pub(crate) fn install_receipt(
         if !next_selections.is_empty() {
             interaction.selections = next_selections;
         } else if let Some(view) = app.note_editor_view(target.tab) {
+            let text = view.text.materialize();
             interaction.selections = if movement.truncated || !movement.valid_frames() {
                 interaction
                     .selections
@@ -1288,18 +1290,18 @@ pub(crate) fn install_receipt(
                     .map(|selection| {
                         flavite_workspace::CommittedSelection::new(
                             flavite_editor::viewport::clamp_grapheme_boundary(
-                                &view.text,
+                                &text,
                                 selection.anchor,
                             ),
                             flavite_editor::viewport::clamp_grapheme_boundary(
-                                &view.text,
+                                &text,
                                 selection.head,
                             ),
                         )
                     })
                     .collect()
             } else {
-                super::input::map_selections(&view.text, &interaction.selections, &movement)
+                super::input::map_selections(&text, &interaction.selections, &movement)
             };
         }
         if let Some(primary) = movement.primary
@@ -1319,7 +1321,7 @@ pub(crate) fn install_receipt(
             return;
         };
         if app
-            .acknowledge_editor_interaction(interaction, &view.text)
+            .acknowledge_editor_interaction(interaction, &view.text.materialize())
             .is_err()
         {
             app.input_chains.remove(&target.tab);
@@ -1519,7 +1521,7 @@ pub(crate) fn selections_only(
         interaction.sequence += 1;
         let view = app.note_editor_view(target.tab)?;
         if app
-            .acknowledge_editor_interaction(interaction, &view.text)
+            .acknowledge_editor_interaction(interaction, &view.text.materialize())
             .is_err()
         {
             app.input_chains.remove(&target.tab);
@@ -1576,8 +1578,9 @@ fn row_targets(app: &App, target: &EditorTarget, rows: i32) -> Result<Vec<usize>
         metrics: metrics.editor_type(),
     };
     let mut positions = Vec::with_capacity(target.selections.len());
+    let text = view.text.materialize();
     for &(_, head) in &target.selections {
-        let (at, _) = vertical_target(&view.text, head, motion, None);
+        let (at, _) = vertical_target(&text, head, motion, None);
         if at == head {
             return Err(if rows < 0 {
                 "No row above to add a caret on"
@@ -1656,8 +1659,9 @@ fn counted_vertical_targets(app: &App, target: &EditorTarget, rows: i32) -> Opti
         metrics: metrics.editor_type(),
     };
     let mut positions = Vec::with_capacity(target.selections.len());
+    let text = view.text.materialize();
     for &(_, head) in &target.selections {
-        let (at, _) = vertical_target(&view.text, head, motion, None);
+        let (at, _) = vertical_target(&text, head, motion, None);
         positions.push(at);
     }
     Some(positions)
@@ -2066,7 +2070,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     let Some(view) = app.note_editor_view(target.tab) else {
         return Task::none();
     };
-    let text = &view.text;
+    let text = view.text.materialize();
     // Select all replaces the set whole at every N (set-aware by shape).
     if command == SelectAll {
         select(app, target.clone(), 0, text.len());

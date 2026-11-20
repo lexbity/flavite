@@ -864,6 +864,16 @@ impl StructureText for DocumentText {
     }
 }
 
+/// Semantic equality: identical content, regardless of chunk layout (O(n)
+/// materialization; used by tests and user-paced comparisons, never on the
+/// keystroke path).
+impl PartialEq for DocumentText {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.root, &other.root) || self.materialize() == other.materialize()
+    }
+}
+impl Eq for DocumentText {}
+
 impl From<&str> for DocumentText {
     fn from(value: &str) -> Self {
         Self::from_text(value)

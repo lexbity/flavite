@@ -500,15 +500,17 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
                 .map(|[_, a, h]| CommittedSelection::new(a, h))
                 .collect()
         } else if movement.truncated {
+            let text = view.text.materialize();
             let clamp =
-                |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&view.text, at);
+                |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&text, at);
             interaction
                 .selections
                 .iter()
                 .map(|s| CommittedSelection::new(clamp(s.anchor), clamp(s.head)))
                 .collect()
         } else {
-            super::input::map_selections(&view.text, &interaction.selections, &movement)
+            let text = view.text.materialize();
+            super::input::map_selections(&text, &interaction.selections, &movement)
         };
         // The restored set's primary member is explicit in the movement
         // receipt (E-4/FR-4); a mapped/clamped set keeps this view's own
@@ -519,13 +521,14 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
             .unwrap_or_else(|| interaction.primary.min(interaction.selections.len() - 1));
         interaction.revision = view.revision;
         interaction.sequence += 1;
+        let text = view.text.materialize();
         interaction.viewport_anchor = super::input::map_history_point(
-            &view.text,
+            &text,
             interaction.viewport_anchor,
             &movement,
             flavite_buffer::Affinity::Left,
         );
-        let _ = app.acknowledge_editor_interaction(interaction, &view.text);
+        let _ = app.acknowledge_editor_interaction(interaction, &text);
     }
     app.workspace.invalidate_writing_target(source.buffer);
     app.linking.invalidate_if_source_changed(None);

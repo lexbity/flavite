@@ -520,7 +520,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
                 // capture counter monotonic after installing that receipt.
                 let captured_sequence = state.interaction_sequence;
                 state.interaction_sequence = interaction.sequence - 1;
-                state.restore_interaction(&self.view.text, interaction);
+                let text = state.materialized_text(&self.view);
+                state.restore_interaction(&text, interaction);
                 state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
             } else if self.on_input_intent.is_some()
                 && state.controlled_pending
@@ -529,23 +530,24 @@ impl<'a, Message> EditorWidget<'a, Message> {
                 let captured_sequence = state.interaction_sequence;
                 let incoming_sequence = interaction.sequence;
                 state.interaction_sequence = incoming_sequence.saturating_sub(1);
-                state.restore_interaction(&self.view.text, interaction);
+                let text = state.materialized_text(&self.view);
+                state.restore_interaction(&text, interaction);
                 state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
                 state.controlled_ack = incoming_sequence;
                 state.controlled_pending = incoming_sequence < captured_sequence;
-                if self
-                    .view
-                    .text
+                if text
                     .get(..state.selections.caret())
                     .is_some_and(|text| text.ends_with("[["))
                 {
                     state.open_autocomplete(state.selections.caret() - 2);
                 }
             } else {
-                state.restore_interaction(&self.view.text, interaction);
+                let text = state.materialized_text(&self.view);
+                state.restore_interaction(&text, interaction);
             }
         }
-        state.refresh_completion(&self.view.text);
+        let text = state.materialized_text(&self.view);
+        state.refresh_completion(&text);
     }
 
     /// The widget-owned autocomplete interception (the single captured-intent
@@ -582,6 +584,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
                 let matches = state.candidate_matches(&self.candidates);
                 if let Some(candidate) = matches.get(state.autocomplete_selected) {
                     let start = state.autocomplete_start.unwrap_or(state.selections.caret());
+                    let text = state.materialized_text(&self.view);
                     self.emit(
                         shell,
                         EditorAction::Complete {
@@ -589,7 +592,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
                             expected_revision: self.view.revision,
                             start,
                             end: state.selections.caret(),
-                            prefix: self.view.text[start..state.selections.caret()].to_owned(),
+                            prefix: text[start..state.selections.caret()].to_owned(),
                             candidate: (*candidate).clone(),
                         },
                     );
@@ -617,7 +620,8 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     );
                 }
                 state.close_autocomplete();
-                state.ensure_caret_visible(&self.view.text);
+                let text = state.materialized_text(&self.view);
+                state.ensure_caret_visible(&text);
                 true
             }
             _ => false,
@@ -773,6 +777,13 @@ pub struct EditorState {
     line_starts: Vec<usize>,
     line_text_addr: usize,
     line_text_len: usize,
+    /// RFC-0011 S3 transitional: one materialized copy for the current view
+    /// revision (one O(n) per revision on the UI thread, never under the
+    /// session's locks). S4 replaces the per-consumer sites with tree
+    /// queries (`line_starts_in`, `slice`, `line_index_of`). `RefCell` so
+    /// the read-only frame paths (`draw`) share the cache with the
+    /// mutations (`layout`, `update`).
+    materialized_text: std::cell::RefCell<Option<(u64, std::sync::Arc<str>)>>,
     resolutions_present: bool,
     resolution_snapshot: Option<Arc<HashMap<String, LinkResolution>>>,
     selections: EditorSelections,
@@ -1635,7 +1646,8 @@ impl EditorState {
                 }
                 let after = start + committed.len();
                 self.selections.replace_beyond_text(&[(after, after)], 0);
-                self.ensure_caret_visible(&view.text);
+                let text = self.materialized_text(view);
+                self.ensure_caret_visible(&text);
                 Some(EditorAction::replace(view, start, end, committed.clone()))
             }
             input_method::Event::Closed => {
@@ -1688,6 +1700,21 @@ impl EditorState {
         self.reconcile_view(view, link_resolutions, true);
     }
 
+    /// Materialized bytes for a view revision, cached per revision
+    /// (RFC-0011 S3 transitional): one O(n) materialization per revision on
+    /// the UI thread; the session's publication is O(1). Repeated calls for
+    /// the same revision clone the `Arc` (O(1)).
+    fn materialized_text(&self, view: &EditorView) -> std::sync::Arc<str> {
+        if let Some((revision, text)) = self.materialized_text.borrow().as_ref()
+            && *revision == view.revision
+        {
+            return text.clone();
+        }
+        let text = view.text.materialize();
+        *self.materialized_text.borrow_mut() = Some((view.revision, text.clone()));
+        text
+    }
+
     fn reconcile_view(
         &mut self,
         view: &EditorView,
@@ -1704,16 +1731,20 @@ impl EditorState {
         if self.revision != Some(view.revision) {
             // RFC-0008 S1 (FR-10): the structure-parse phase (`render.scan`
             // covers the incremental structure engine's sync, S8).
+            // RFC-0011 S3: materialize ONCE per revision on the UI thread
+            // (the session's publication is an O(1) root); S4 replaces the
+            // consumers below with tree queries.
+            let text = self.materialized_text(view);
             let _scan_span =
                 tracing::info_span!("render.scan", doc_len = view.text.len()).entered();
             self.line_starts.clear();
             self.line_starts.push(0);
             self.line_starts
-                .extend(view.text.match_indices('\n').map(|(byte, _)| byte + 1));
-            self.line_text_addr = view.text.as_ptr() as usize;
-            self.line_text_len = view.text.len();
+                .extend(text.match_indices('\n').map(|(byte, _)| byte + 1));
+            self.line_text_addr = text.as_ptr() as usize;
+            self.line_text_len = text.len();
             let (link_spans, decorations) = structure_spans(
-                &view.text,
+                &text,
                 view.last_edit,
                 &self.line_starts,
                 &mut self.structure,
@@ -1740,17 +1771,18 @@ impl EditorState {
             }
         }
         self.resolutions_present = !link_resolutions.is_empty();
-        self.selections.clamp(&view.text);
+        let text = self.materialized_text(view);
+        self.selections.clamp(&text);
         self.viewport.line_height = self.type_metrics.line_height;
         self.viewport.first_line = self
             .viewport
             .first_line
-            .min(self.source_line_count(&view.text).saturating_sub(1));
+            .min(self.source_line_count(&text).saturating_sub(1));
         // Only re-anchor the viewport when the caret moved. Running this
         // every frame would snap the view back to the caret and cancel any
         // wheel or scrollbar scroll away from it.
         if self.selections.caret() != self.last_ensured_caret {
-            self.ensure_caret_visible(&view.text);
+            self.ensure_caret_visible(&text);
             self.last_ensured_caret = self.selections.caret();
         }
     }
@@ -2236,8 +2268,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let state = tree.state.downcast_mut::<EditorState>();
         state.viewport.set_height(size.height - PAD_Y * 2.0);
         state.text_width = self.text_wrap_width(size.width);
+        let text = state.materialized_text(&self.view);
         state.sync_shaped(
-            &self.view.text,
+            &text,
             self.view.revision,
             state.viewport,
             self.text_wrap_width(size.width),
@@ -2269,6 +2302,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             .intersection(viewport)
             .unwrap_or(Rectangle::with_size(Size::ZERO));
         let text_width = self.text_wrap_width(bounds.width);
+        // RFC-0011 S3: one materialized copy per revision, shared with
+        // layout/update via the per-revision cache.
+        let text = state.materialized_text(&self.view);
         // The persistent band covers the viewport plus its margin. When the
         // cache misses at draw time (the viewport moved between layout and
         // draw, or a width/type/revision change bypassed layout), shape
@@ -2277,7 +2313,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let local_visible;
         let local_starts;
         let shaped_view: ShapedView<'_> = if let Some(view) = state.cached_shaped_view(
-            &self.view.text,
+            &text,
             self.view.revision,
             state.viewport,
             text_width,
@@ -2285,8 +2321,8 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             view
         } else {
             let (band_start, band_lines) =
-                band_window(state.viewport, state.source_line_count(&self.view.text));
-            let (visible, start) = state.slice_lines(&self.view.text, band_start, band_lines);
+                band_window(state.viewport, state.source_line_count(&text));
+            let (visible, start) = state.slice_lines(&text, band_start, band_lines);
             local_starts = shape_line_starts(&visible);
             local_buffer = shape_text(&visible, text_width, self.type_metrics);
             local_visible = visible;
@@ -2384,7 +2420,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             // The implicit-effect outline generalizes to every member before
             // a destructive invocation (FEUX-0002 X04, E-6).
             for range in flavite_edit_context::effect::implicit_ranges(
-                &self.view.text,
+                &text,
                 visible_members,
                 command,
             ) {
@@ -2459,7 +2495,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     .get(run.line_i)
                     .copied()
                     .unwrap_or(visible_text.len());
-            let line_end = line_bounds(&self.view.text, line_start).1;
+            let line_end = line_bounds(&text, line_start).1;
             // Scanner spans are source-ordered and non-overlapping. Jump
             // directly to this paragraph instead of scanning every link in
             // the note and allocating two vectors for each painted row.
@@ -2545,7 +2581,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         }
         // Scrollbar: only when the document overflows the viewport. The
         // wheel and gutter-drag share this geometry.
-        let total_lines = state.source_line_count(&self.view.text);
+        let total_lines = state.source_line_count(&text);
         if total_lines > state.viewport.visible_lines.max(1) {
             let (track_y, track_height, thumb_y, thumb_height, _max_first) = scrollbar_geometry(
                 bounds.height,
@@ -2651,7 +2687,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let has_create = !state.autocomplete_query.trim().is_empty();
             if !matches.is_empty() || has_create {
                 let row_count = matches.len() + usize::from(has_create);
-                let line = self.view.text[..state.selections.caret().min(self.view.text.len())]
+                let line = text[..state.selections.caret().min(text.len())]
                     .matches('\n')
                     .count();
                 let popup = Rectangle::new(
@@ -2801,7 +2837,8 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         if keyboard_input_blocked(self.input_enabled, self.keyboard_enabled, event) {
             return;
         }
-        let before_interaction = state.interaction_snapshot(Some(&self.view.text));
+        let text = state.materialized_text(&self.view);
+        let before_interaction = state.interaction_snapshot(Some(&text));
         if let iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event
             && self.input_enabled
             && self.keyboard_enabled
@@ -2810,7 +2847,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             && let Some(position) = cursor.position_in(layout.bounds())
         {
             let byte = state.hit_test_cached(
-                &self.view.text,
+                &text,
                 self.view.revision,
                 state.viewport,
                 position.x - PAD_X,
@@ -2828,7 +2865,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let selection = if inside {
                 state.selections.pairs()
             } else {
-                let (a, b) = flavite_edit_context::word_bounds(&self.view.text, byte);
+                let (a, b) = flavite_edit_context::word_bounds(&text, byte);
                 vec![(a, b)]
             };
             self.emit_context(
@@ -3005,7 +3042,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
                     let bounds = layout.bounds();
-                    let total_lines = state.source_line_count(&self.view.text);
+                    let total_lines = state.source_line_count(&text);
                     let visible_lines = state.viewport.visible_lines.max(1);
                     if total_lines > visible_lines && position.x >= bounds.width - SCROLLBAR_GUTTER
                     {
@@ -3039,7 +3076,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     } else {
                         let width = self.text_wrap_width(layout.bounds().width);
                         let byte = state.hit_test_cached(
-                            &self.view.text,
+                            &text,
                             self.view.revision,
                             state.viewport,
                             position.x - PAD_X,
@@ -3064,7 +3101,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                             mouse::Click::new(position, mouse::Button::Left, state.last_click);
                         state.last_click = Some(click);
                         state.select_click(
-                            &self.view.text,
+                            &text,
                             byte,
                             click.kind(),
                             state.modifiers.shift(),
@@ -3085,7 +3122,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     (cursor.position_in(layout.bounds()), state.scroll_drag)
                 {
                     let bounds = layout.bounds();
-                    let total_lines = state.source_line_count(&self.view.text);
+                    let total_lines = state.source_line_count(&text);
                     let visible_lines = state.viewport.visible_lines.max(1);
                     if total_lines > visible_lines {
                         let (track_y, track_height, _thumb_y, thumb_height, max_first) =
@@ -3109,14 +3146,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.selecting => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
                     let byte = state.hit_test_cached(
-                        &self.view.text,
+                        &text,
                         self.view.revision,
                         state.viewport,
                         position.x - PAD_X,
                         position.y - PAD_Y,
                         self.text_wrap_width(layout.bounds().width),
                     );
-                    state.extend_pointer_selection(&self.view.text, byte);
+                    state.extend_pointer_selection(&text, byte);
                     shell.capture_event();
                     // The selection highlight must be visible on the next
                     // frame, not only after the host acknowledgement round
@@ -3142,7 +3179,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     mouse::ScrollDelta::Lines { y, .. } => *y,
                     mouse::ScrollDelta::Pixels { y, .. } => *y / self.type_metrics.line_height,
                 };
-                let total_lines = state.source_line_count(&self.view.text);
+                let total_lines = state.source_line_count(&text);
                 let visible_lines = state.viewport.visible_lines.max(1);
                 // The viewport stays full: the last page bounds the scroll,
                 // matching the scrollbar thumb's travel. Wheel-up arrives as
@@ -3188,7 +3225,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     && !modifiers.control()
                     && !modifiers.alt()
                     && !modifiers.logo()
-                    && state.selections.escape_collapse(&self.view.text);
+                    && state.selections.escape_collapse(&text);
                 if (completion_control && self.autocomplete_key(state, key, shell))
                     || escape_collapse
                 {
@@ -3208,7 +3245,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let viewport = state.viewport;
             let (x, y) = {
                 let shaped =
-                    state.sync_shaped(&self.view.text, self.view.revision, viewport, width);
+                    state.sync_shaped(&text, self.view.revision, viewport, width);
                 let runs = shaped.buffer.layout_runs().collect::<Vec<_>>();
                 let paint_offset = shaped.paint_offset(viewport);
                 let caret = caret_byte
@@ -3252,11 +3289,11 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 .is_none_or(|instant| instant.elapsed() >= INTERACTION_PUBLISH_INTERVAL);
         if let Some(on_interaction) = &self.on_interaction
             && (explicit_interaction
-                || state.interaction_snapshot(Some(&self.view.text)) != before_interaction)
+                || state.interaction_snapshot(Some(&text)) != before_interaction)
             && publish_due
             && let Some(snapshot) = {
                 self.advance_capture(state);
-                state.interaction_snapshot(Some(&self.view.text))
+                state.interaction_snapshot(Some(&text))
             }
         {
             state.last_publish = Some(Instant::now());
@@ -3935,9 +3972,10 @@ mod tests {
         let view = long_view(40);
         let mut state = EditorState::default();
         state.reconcile(&view, &HashMap::new());
-        let caret = view.text.find("line 8").unwrap();
+        let text = view.text.materialize();
+        let caret = text.find("line 8").unwrap();
         state.restore_interaction(
-            &view.text,
+            &text,
             EditorInteractionSnapshot {
                 sequence: 1,
                 buffer_id: view.buffer_id,
@@ -3966,7 +4004,7 @@ mod tests {
         EditorView {
             buffer_id: 1,
             revision: 1,
-            text: text.into(),
+            text: flavite_buffer::chunks::DocumentText::from(text.as_str()),
             path: std::path::PathBuf::from("long.md"),
             state: BufferState::Clean,
             last_edit: None,
@@ -3988,7 +4026,8 @@ mod tests {
 
         // Moving the caret re-anchors around the caret again.
         let far = "line 150\n".len() * 150;
-        state.selections.replace_with(&view.text, &[(far, far)], 0);
+        let text = view.text.materialize();
+        state.selections.replace_with(&text, &[(far, far)], 0);
         state.reconcile(&view, &HashMap::new());
         assert!(state.viewport.first_line >= 140);
         assert_eq!(state.last_ensured_caret, state.selections.caret());
@@ -4003,11 +4042,12 @@ mod tests {
         {
             let mut view = long_view(0);
             view.revision = revision as u64;
-            view.text = text.into();
+            view.text = flavite_buffer::chunks::DocumentText::from(text);
             state.reconcile(&view, &HashMap::new());
+            let text = view.text.materialize();
             assert_eq!(
-                state.source_line_count(&view.text),
-                logical_line_count(text)
+                state.source_line_count(&text),
+                logical_line_count(&text)
             );
             for first_line in [0, 1, 3, 999] {
                 for lines in [0, 1, 3] {
@@ -4017,12 +4057,12 @@ mod tests {
                         ..Viewport::default()
                     };
                     assert_eq!(
-                        state.slice_lines(&view.text, first_line, lines),
-                        slice_lines(text, first_line, lines),
+                        state.slice_lines(&text, first_line, lines),
+                        slice_lines(&text, first_line, lines),
                         "{first_line}+{lines} of {text:?}"
                     );
                     // The band always covers the clamped viewport start.
-                    let count = state.source_line_count(&view.text);
+                    let count = state.source_line_count(&text);
                     let (band_start, band_lines) = band_window(viewport, count);
                     let first = viewport.first_line.min(count.saturating_sub(1));
                     assert!(band_start <= first && first < band_start + band_lines);
@@ -4633,7 +4673,7 @@ mod tests {
             text.replace_range(at..at + 1, &replacement.to_string());
             let view = EditorView {
                 revision: 2 + frame,
-                text: Arc::from(text.as_str()),
+                text: flavite_buffer::chunks::DocumentText::from(text.as_str()),
                 ..base_view.clone()
             };
             state.reconcile(&view, &HashMap::new());
@@ -4865,9 +4905,10 @@ mod tests {
             CompletionCandidate::new("Ideas", "Ideas"),
         ]));
         let mut state = EditorState::default();
+        let text = view.text.clone();
         state
             .selections
-            .replace_with(&view.text, &[(view.text.len(), view.text.len())], 0);
+            .replace_with(&text, &[(text.len(), text.len())], 0);
         state.open_autocomplete(0);
         state.autocomplete_query = "In".into();
         let mut messages = Vec::new();
@@ -4893,9 +4934,10 @@ mod tests {
         let widget = EditorWidget::new(&view, |action| action)
             .with_candidates(Arc::from([CompletionCandidate::new("Ideas", "Ideas")]));
         let mut state = EditorState::default();
+        let text = view.text.clone();
         state
             .selections
-            .replace_with(&view.text, &[(view.text.len(), view.text.len())], 0);
+            .replace_with(&text, &[(text.len(), text.len())], 0);
         state.open_autocomplete(0);
         state.autocomplete_query = "New note".into();
         state.autocomplete_selected = 0; // no matching notes, so the create row is selected
@@ -5071,7 +5113,8 @@ mod tests {
             let mut state = EditorState::default();
             let view = EditorView::from(&test_view("one\ntwo\nthree\n", 77));
             state.reconcile(&view, &HashMap::new());
-            let shaped = state.sync_shaped(&view.text, view.revision, Viewport::default(), 300.0);
+            let text = view.text.materialize();
+            let shaped = state.sync_shaped(&text, view.revision, Viewport::default(), 300.0);
             let _ = shaped.visible; // the shaped view stays alive for the span
         });
         let names = recorded.lock().expect("recorder lock").clone();

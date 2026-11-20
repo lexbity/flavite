@@ -4,7 +4,6 @@ use flavite_buffer::{BufferId, EditOp, Revision};
 pub use flavite_syntax::properties::ScalarValue;
 use flavite_syntax::{Span, TextByte};
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 #[derive(Debug, Clone)]
@@ -17,7 +16,10 @@ pub(crate) struct StructureJob {
     pub request: u64,
     pub buffer: BufferId,
     pub revision: Revision,
-    text: Arc<str>,
+    /// The source as an immutable chunk-tree root (RFC-0011 D-10): the
+    /// session turn publishes O(1); the worker materializes on its own
+    /// thread (the job channel is the materialization boundary).
+    text: flavite_buffer::chunks::DocumentText,
     edit: StructureEdit,
 }
 #[derive(Debug)]
@@ -44,13 +46,16 @@ impl StructureWorker {
                 .name(format!("vault-structure-{index}"))
                 .spawn(move || {
                     while let Ok(job) = jobs.recv() {
+                        // Materialize on the worker thread, off the session
+                        // turn and its locks (RFC-0011 D-11).
+                        let text = job.text.materialize();
                         let patch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             match job.edit {
                                 StructureEdit::Property { key, value } => {
-                                    flavite_syntax::properties::patch(&job.text, &key, &value)
+                                    flavite_syntax::properties::patch(&text, &key, &value)
                                 }
                                 StructureEdit::Task { start, checked } => {
-                                    flavite_syntax::read::task_patch(&job.text, start, checked)
+                                    flavite_syntax::read::task_patch(&text, start, checked)
                                 }
                             }
                         }))

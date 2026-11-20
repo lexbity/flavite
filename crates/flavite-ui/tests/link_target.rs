@@ -121,7 +121,7 @@ fn no_editor_or_invalid_target_refuses_without_a_fallback_caret() {
     });
     assert!(app.linking.pending_target_path().is_none());
     assert_eq!(
-        app.note_editor_view(tab).unwrap().text.as_ref(),
+        app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
         "Hello world.\n",
         "zero mutation"
     );
@@ -186,7 +186,7 @@ fn moving_the_caret_while_prepare_is_pending_never_commits_at_the_old_position()
         !matches!(app.linking.state(), GestureState::Preparing { .. })
     });
     assert_eq!(
-        app.note_editor_view(tab).unwrap().text.as_ref(),
+        app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
         "Hello world.\n"
     );
 }
@@ -212,7 +212,7 @@ fn picker_insert_places_one_link_at_the_acknowledged_caret() {
         matches!(app.linking.state(), GestureState::Inserted { .. })
     });
     assert_eq!(
-        app.note_editor_view(tab).unwrap().text.as_ref(),
+        app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
         "Hello [[beta]]world.\n",
         "exactly one link at the acknowledged caret"
     );

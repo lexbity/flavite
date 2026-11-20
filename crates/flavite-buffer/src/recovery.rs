@@ -21,6 +21,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use flavite_encoding::{EncodeLimits, SourceFormat, encode as codec_encode};
+
 use crate::eol::EolTable;
 use crate::model::EditorModel;
 use crate::revision::{BaseHash, BufferId, Revision};
@@ -178,6 +180,36 @@ struct FormatRecord {
     hint_generation: Option<u64>,
 }
 
+/// An O(1) snapshot of everything a recovery file needs, captured under the
+/// buffer-manager lock so the full materialization runs on the worker thread
+/// (RFC-0011 S3/T14: the recovery serialization leaves the lock).
+#[derive(Debug, Clone)]
+pub struct StagedRecovery {
+    /// Buffer identity at capture time.
+    pub buffer_id: BufferId,
+    /// Revision at capture time.
+    pub revision: Revision,
+    /// Base hash at capture time.
+    pub base_hash: Option<BaseHash>,
+    /// The immutable version (chunk-tree root + EOL side state + save
+    /// descriptor). Cloning the `Arc` is O(1); the text is materialized
+    /// later by [`RecoveryFile::from_staged`] on the worker.
+    pub version: std::sync::Arc<crate::undo::VersionState>,
+}
+
+impl StagedRecovery {
+    /// Capture a buffer's recovery inputs without materializing text (O(1)).
+    #[must_use]
+    pub fn from_buffer(buffer: &Buffer) -> Self {
+        Self {
+            buffer_id: buffer.buffer_id(),
+            revision: buffer.revision(),
+            base_hash: buffer.base_hash(),
+            version: std::sync::Arc::clone(buffer.model().version_state()),
+        }
+    }
+}
+
 /// Recovery file metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecoveryFile {
@@ -267,6 +299,51 @@ impl RecoveryFile {
             source_format: model.source_format(),
             codec_version: model.format_stamp().codec_version,
             hint_generation: model.format_stamp().hint_generation,
+            encoded,
+        }
+    }
+
+    /// Create a new recovery file from a staged capture (RFC-0011 S3): the
+    /// capture is O(1) under the buffer-manager lock; the full
+    /// materialization runs here, on the worker thread, off the lock.
+    #[must_use]
+    pub fn from_staged(staged: StagedRecovery, checkpoint_seq: u64, is_checkpoint: bool) -> Self {
+        let header = RecoveryHeader::new(
+            staged.buffer_id,
+            staged.revision,
+            checkpoint_seq,
+            is_checkpoint,
+        );
+        let text = staged.version.materialize();
+        let eol_table = staged.version.eol_table();
+        let decoded = eol_serialize(&eol_table, &text);
+        let source_len = decoded.len();
+        let decoded_hash = hash_bytes(&decoded);
+        let format: SourceFormat = staged.version.format;
+        let stamp = &staged.version.stamp;
+        let decoded_str = std::str::from_utf8(&decoded).expect("decoded layer is UTF-8");
+        let (content_hash, encoded) = match codec_encode(
+            decoded_str,
+            format,
+            &EncodeLimits::default(),
+            &flavite_encoding::NOT_CANCELLED,
+        ) {
+            Ok(bytes) => {
+                let hash = hash_bytes(&bytes);
+                (hash, Some((bytes.len() as u64, hash)))
+            }
+            Err(_) => (decoded_hash, None),
+        };
+        Self {
+            header,
+            eol_table,
+            text,
+            source_len,
+            content_hash,
+            base_hash: staged.base_hash,
+            source_format: format,
+            codec_version: stamp.codec_version,
+            hint_generation: stamp.hint_generation,
             encoded,
         }
     }

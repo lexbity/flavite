@@ -266,7 +266,8 @@ fn edit_publishes_to_graph_and_loop_keeps_identity_camera_scope_preview() {
     {
         let incarnation = app.notes.incarnation(b_tab).expect("incarnation");
         let view = app.note_editor_view(b_tab).expect("editor view");
-        let at = view.text.find("title: Bee").expect("frontmatter title");
+        let text = view.text.materialize();
+        let at = text.find("title: Bee").expect("frontmatter title");
         let _ = app.update(Message::EditorAction {
             tab: b_tab,
             incarnation,
@@ -529,12 +530,12 @@ fn pair_activates_while_newer_frame_pending_and_insert_refuses() {
         .map(|(tab, _)| *tab)
         .expect("b tab");
     assert_eq!(
-        &*app.note_editor_view(b_tab).expect("b view").text,
+        &*app.note_editor_view(b_tab).expect("b view").text.materialize(),
         "# B\n\nb body\n",
         "the double-click inserted nothing into the activated note"
     );
     assert_eq!(
-        &*app.note_editor_view(a_tab).expect("a view").text,
+        &*app.note_editor_view(a_tab).expect("a view").text.materialize(),
         expected_a,
         "the writing note kept exactly its own edits"
     );

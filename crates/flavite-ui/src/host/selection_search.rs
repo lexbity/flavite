@@ -375,7 +375,7 @@ pub fn apply_enabled(app: &App, tab: TabId) -> bool {
 /// The current editor text for a tab (for caption-side gap derivation).
 fn view_text(app: &App, tab: TabId) -> String {
     app.note_editor_view(tab)
-        .map(|view| view.text.to_string())
+        .map(|view| view.text.materialize().to_string())
         .unwrap_or_default()
 }
 
@@ -742,10 +742,11 @@ fn install_collection(app: &mut App, tab: TabId, key: &PreviewKey, data: &serde_
         let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
             return;
         };
+        let text = view.text.materialize();
         if start > end
-            || end > view.text.len()
-            || !view.text.is_char_boundary(start)
-            || !view.text.is_char_boundary(end)
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
         {
             return;
         }

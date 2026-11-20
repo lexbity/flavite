@@ -18,8 +18,11 @@ pub struct EditorView {
     pub buffer_id: u64,
     /// Revision represented by this snapshot.
     pub revision: u64,
-    /// Normalized text.
-    pub text: std::sync::Arc<str>,
+    /// Normalized text as an immutable chunk-tree root (RFC-0011 D-10).
+    /// Widgets slice bands and query line geometry via the tree; full
+    /// materialization is user-paced, never on the session's keystroke
+    /// path.
+    pub text: flavite_buffer::chunks::DocumentText,
     /// Vault-relative path.
     pub path: PathBuf,
     /// State-machine label.
@@ -44,7 +47,9 @@ impl From<&BufferView> for EditorView {
         Self {
             buffer_id: view.buffer_id,
             revision: view.revision,
-            text: view.text.clone().into(),
+            // Serialized surface: build a tree from the delivered String
+            // (client-paced; RFC-0011 FR-9).
+            text: flavite_buffer::chunks::DocumentText::from_text(&view.text),
             path: view.path.clone(),
             state: view.state,
             // The serialized BufferView surface carries no session-computed
@@ -59,6 +64,7 @@ impl From<&SharedBufferView> for EditorView {
         Self {
             buffer_id: view.buffer_id,
             revision: view.revision,
+            // O(1) root clone; materialization is the widget's choice.
             text: view.text.clone(),
             path: view.path.clone(),
             state: view.state,
@@ -328,7 +334,7 @@ mod tests {
         SharedBufferView {
             buffer_id: 7,
             revision: 42,
-            text: "one\ntwo".into(),
+            text: flavite_buffer::chunks::DocumentText::from("one\ntwo"),
             base_hash: Vec::new(),
             state: BufferState::Dirty,
             path: PathBuf::from("note.md"),

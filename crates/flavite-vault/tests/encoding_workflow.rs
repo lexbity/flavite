@@ -174,7 +174,7 @@ fn open_note(session: &Session, path: &Path) -> (BufferId, Revision, String, Sou
     (
         buffer_id,
         revision,
-        snapshot.text.to_string(),
+        snapshot.text.materialize().to_string(),
         snapshot.source_format,
     )
 }
@@ -299,7 +299,7 @@ fn reopen_encoding_binds_hint_and_preserves_text() {
         .shared_buffer_snapshot(buffer_id, None)
         .expect("snapshot after reopen");
     assert_eq!(
-        snapshot.text.to_string(),
+        snapshot.text.materialize().to_string(),
         "bom note body\n",
         "text unchanged"
     );
@@ -366,7 +366,7 @@ fn reopen_encoding_refuses_dirty_buffer() {
         .session
         .shared_buffer_snapshot(buffer_id, None)
         .expect("snapshot");
-    assert_eq!(snapshot.text.to_string(), "draft saved base\n");
+    assert_eq!(snapshot.text.materialize().to_string(), "draft saved base\n");
     let view = h.session.encoding_hints();
     assert!(
         !view
@@ -430,7 +430,7 @@ fn convert_encoding_then_save_writes_utf16be_bom() {
         .shared_buffer_snapshot(buffer_id, None)
         .expect("snapshot after convert");
     assert_eq!(
-        snapshot.text.to_string(),
+        snapshot.text.materialize().to_string(),
         text,
         "text unchanged by conversion"
     );

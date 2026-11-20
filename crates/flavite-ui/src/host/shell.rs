@@ -266,20 +266,21 @@ impl App {
         let Some(logical) = self.workspace.tab(&tab).map(|v| v.interaction()) else {
             return;
         };
+        let text = view.text.materialize();
         if self.notes.incarnation(tab) != Some(incarnation)
             || logical.incarnation != incarnation
             || view.revision != revision
-            || !view.text.is_char_boundary(anchor)
-            || !view.text.is_char_boundary(head)
+            || !text.is_char_boundary(anchor)
+            || !text.is_char_boundary(head)
         {
             return;
         }
         let boundary = |at| {
             at == 0
                 || flavite_editor::viewport::next_grapheme_boundary(
-                    &view.text,
+                    &text,
                     flavite_editor::viewport::prev_grapheme_boundary(
-                        &view.text,
+                        &text,
                         flavite_syntax::TextByte(at),
                     ),
                 )

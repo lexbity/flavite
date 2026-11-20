@@ -20,8 +20,9 @@ use crate::types::{
     Epoch, Generation, ReconcileMode, ReconcileScope, ReconcileSummary, RenameStrategy,
     VaultConfig, VaultIdentity,
 };
+use flavite_buffer::chunks::DocumentText;
 use flavite_buffer::manager::{BufferManager, BufferStateChanged};
-use flavite_buffer::recovery::{RecoveryConfig, RecoveryWriter};
+use flavite_buffer::recovery::{RecoveryConfig, RecoveryWriter, StagedRecovery};
 use flavite_buffer::revision::{BaseHash, BufferId, Revision};
 use flavite_buffer::undo::EditOp;
 use flavite_encoding::DecodePolicy;
@@ -288,7 +289,10 @@ impl BufferWatch {
 pub struct SharedBufferSnapshot {
     pub buffer_id: BufferId,
     pub revision: Revision,
-    pub text: std::sync::Arc<str>,
+    /// The document bytes, held as an immutable chunk-tree root. Text is
+    /// never materialized in the session's interactive path: consumers
+    /// slice or materialize on their own threads (RFC-0011 D-10/D-11).
+    pub text: DocumentText,
     pub base_hash: Option<[u8; 32]>,
     pub state: flavite_buffer::state::BufferState,
     pub path: PathBuf,
@@ -316,6 +320,36 @@ fn last_edit_hint(ops: &[flavite_buffer::undo::EditOp]) -> Option<flavite_syntax
     })
 }
 
+/// Publish an O(1) immutable text root for a buffer transition (RFC-0011
+/// D-11/FR-8): typing, undo, redo, restore, merge, recovery, external
+/// reload, journal patch, and structure-neutral ops all land here. The
+/// slot is revision-keyed; readers clone the `DocumentText` (an `Arc`
+/// clone) without materializing, so the keystroke critical section never
+/// copies the document.
+///
+/// Caller MUST hold the buffer-manager lock for `buffer` (the normal
+/// transition shape); the snapshot-cache mutex is taken here only.
+impl Session {
+    fn publish_shared_text(
+        &self,
+        buffer: &flavite_buffer::state::Buffer,
+        hint: Option<flavite_syntax::EditRange>,
+    ) {
+        let revision = buffer.revision();
+        let text = buffer.model().document_text();
+        let mut cache = self.shared_snapshots.lock_recovering();
+        cache.insert(buffer.buffer_id(), (revision, text, hint));
+    }
+
+    /// Publish using the model's own transition-ops hint (undo/redo/
+    /// restore populate `last_transition_ops`; other transitions yield
+    /// `None` there, which is their documented hint).
+    fn publish_shared_text_from_model(&self, buffer: &flavite_buffer::state::Buffer) {
+        let hint = last_edit_hint(buffer.model().last_transition_ops());
+        self.publish_shared_text(buffer, hint);
+    }
+}
+
 /// Failure while acquiring an immutable buffer snapshot.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum BufferSnapshotError {
@@ -326,12 +360,16 @@ pub enum BufferSnapshotError {
 }
 
 /// Revision-keyed shared snapshot cache: per open buffer, the latest
-/// (revision, text, last-edit hint) triple (RFC-0008 D1/S7).
+/// (revision, text root, last-edit hint) triple (RFC-0008 D1/S7,
+/// RFC-0011 D-11). The text is held as an immutable chunk-tree root;
+/// publication is an O(1) `Arc` clone on every transition, and readers
+/// slice or materialize on their own threads — never under the manager
+/// or driving-turn locks.
 type SharedSnapshotCache = HashMap<
     BufferId,
     (
         Revision,
-        std::sync::Arc<str>,
+        flavite_buffer::chunks::DocumentText,
         Option<flavite_syntax::EditRange>,
     ),
 >;
@@ -1679,14 +1717,17 @@ impl Session {
                                 (
                                     native_note_key(path, &root),
                                     buffer.base_bytes().to_vec(),
-                                    flavite_buffer::recovery::RecoveryFile::from_buffer(
-                                        buffer, 0, false,
-                                    ),
+                                    // O(1) staged capture under the lock;
+                                    // full serialization happens below, off
+                                    // the lock (RFC-0011 S3/T14).
+                                    StagedRecovery::from_buffer(buffer),
                                 )
                             })
                             .collect::<Vec<_>>();
                         drop(buffer_manager);
-                        for (key, base, snapshot) in dirty {
+                        for (key, base, staged) in dirty {
+                            let snapshot =
+                                flavite_buffer::recovery::RecoveryFile::from_staged(staged, 0, false);
                             let due = writer.lock_recovering().should_write_snapshot(&snapshot);
                             if due && actor.pin_merge_base(key.clone(), base).is_ok() {
                                 writer.lock_recovering().write_snapshot(&key, snapshot);
@@ -2647,6 +2688,12 @@ impl Session {
                             note: Some(flavite_buffer::manager::NoteRef::new(path.clone())),
                         });
                     }
+                    // RFC-0011 D-11: an external transition publishes the new
+                    // root (hint `None` — the source was not this session's
+                    // edit).
+                    if let Some(buffer) = manager.get_buffer(&path) {
+                        self.publish_shared_text(buffer, None);
+                    }
                     self.note_buffer_transition();
                     if manager.get_buffer(&path).is_some_and(|buffer| {
                         buffer.state() == flavite_buffer::state::BufferState::Conflicted
@@ -2813,8 +2860,12 @@ impl Session {
                 },
             );
             buffer.set_base_snapshot(request.new_base_bytes.clone());
-            let recovery = flavite_buffer::recovery::RecoveryFile::from_buffer(buffer, 0, false);
+            // O(1) root publication (RFC-0011 D-11); the recovery file is
+            // materialized off the manager lock from the staged capture.
+            let staged = StagedRecovery::from_buffer(buffer);
+            self.publish_shared_text(buffer, None);
             drop(manager);
+            let recovery = flavite_buffer::recovery::RecoveryFile::from_staged(staged, 0, false);
             self.persist_journal_recovery_snapshot(request, recovery)?;
             return Ok(revision.as_u64());
         }
@@ -2838,8 +2889,10 @@ impl Session {
             return Err("journal patch failed validation".into());
         }
         buffer.set_base_snapshot(request.new_base_bytes.clone());
-        let recovery = flavite_buffer::recovery::RecoveryFile::from_buffer(buffer, 0, false);
+        let staged = StagedRecovery::from_buffer(buffer);
+        self.publish_shared_text(buffer, None);
         drop(manager);
+        let recovery = flavite_buffer::recovery::RecoveryFile::from_staged(staged, 0, false);
         self.persist_journal_recovery_snapshot(request, recovery)?;
         Ok(revision.as_u64())
     }
@@ -4084,6 +4137,9 @@ impl Session {
             buffer
                 .model_mut()
                 .set_format_stamp_generation(stamp.hint_generation);
+            // RFC-0011 D-11: first open also publishes the root (hint
+            // `None` — the source is the disk file, not a session edit).
+            self.publish_shared_text(buffer, None);
             (buffer.buffer_id(), buffer.revision())
         };
 
@@ -4222,7 +4278,7 @@ impl Session {
         }
         let buffer_id = request.buffer_id;
         let text = match self.snapshot_for_revision(buffer_id, request.revision) {
-            Ok(text) => text,
+            Ok(text) => text.materialize(),
             Err(result) => return result,
         };
         if self.text_queue_full() {
@@ -4261,7 +4317,7 @@ impl Session {
         }
         let buffer_id = request.buffer_id;
         let text = match self.snapshot_for_revision(buffer_id, request.revision) {
-            Ok(text) => text,
+            Ok(text) => text.materialize(),
             Err(result) => return result,
         };
         if self.text_queue_full() {
@@ -4304,7 +4360,7 @@ impl Session {
         }
         let buffer_id = request.buffer_id;
         let text = match self.snapshot_for_revision(buffer_id, request.revision) {
-            Ok(text) => text,
+            Ok(text) => text.materialize(),
             Err(result) => return result,
         };
         if self.text_queue_full() {
@@ -4349,7 +4405,7 @@ impl Session {
             };
         }
         let text = match self.snapshot_for_revision(request.buffer_id, request.revision) {
-            Ok(text) => text,
+            Ok(text) => text.materialize(),
             Err(result) => return result,
         };
         if self.text_queue_full() {
@@ -4394,7 +4450,7 @@ impl Session {
             };
         }
         let text = match self.snapshot_for_revision(request.buffer_id, request.revision) {
-            Ok(text) => text,
+            Ok(text) => text.materialize(),
             Err(result) => return result,
         };
         if self.text_queue_full() {
@@ -4463,13 +4519,16 @@ impl Session {
     }
 
     /// Fetch (or populate) the shared immutable snapshot for a revision,
-    /// with the buffer/revision guards both text admissions require.
+    /// with the buffer/revision guards both text admissions require. The
+    /// text is returned as an immutable root (O(1)); callers materialize
+    /// on their own worker/thread side of the channel boundary (RFC-0011
+    /// D-11) — never under the manager or cache locks.
     #[allow(clippy::result_large_err)] // SessionResult is the existing typed facade outcome.
     fn snapshot_for_revision(
         &self,
         buffer_id: BufferId,
         revision: Revision,
-    ) -> Result<std::sync::Arc<str>, SessionResult> {
+    ) -> Result<flavite_buffer::chunks::DocumentText, SessionResult> {
         let manager = self.buffer_manager.lock_recovering();
         let Some(buffer) = manager.get_buffer_by_id(buffer_id) else {
             return Err(SessionResult::Error {
@@ -4487,7 +4546,7 @@ impl Session {
         Ok(match cache.get(&buffer_id) {
             Some((cached, text, _)) if *cached == revision => text.clone(),
             _ => {
-                let text: std::sync::Arc<str> = buffer.text().to_owned().into();
+                let text = buffer.model().document_text();
                 let hint = last_edit_hint(buffer.model().last_transition_ops());
                 cache.insert(buffer_id, (revision, text.clone(), hint));
                 text
@@ -4569,13 +4628,18 @@ impl Session {
             match buffer
                 .apply_local_edits_with_policy(&ops, flavite_buffer::undo::UndoPolicy::Isolated)
             {
-                Ok((new_revision, _)) => SessionResult::Success(CommandResult::EditsApplied {
-                    buffer_id,
-                    new_revision,
-                    movement: None,
-                    after_selections: None,
-                    unit: None,
-                }),
+                Ok((new_revision, _)) => {
+                    // RFC-0011 D-11: replace applies are transitions; the
+                    // plan is a multi-op batch (hint `None`).
+                    self.publish_shared_text(buffer, None);
+                    SessionResult::Success(CommandResult::EditsApplied {
+                        buffer_id,
+                        new_revision,
+                        movement: None,
+                        after_selections: None,
+                        unit: None,
+                    })
+                }
                 Err(flavite_buffer::model::BatchError::LimitExceeded { needed, budget }) => {
                     SessionResult::HistoryLimitExceeded {
                         buffer_id,
@@ -6422,16 +6486,25 @@ impl Session {
             };
         }
         buffer.model_mut().seal_undo_group();
+        let hint = Some(flavite_syntax::EditRange {
+            start: op.range.start.0,
+            old_end: op.range.end.0,
+            new_end: op.range.start.0 + op.replacement.len(),
+        });
         let result = buffer.apply_local_edits(&[op]);
         buffer.model_mut().seal_undo_group();
         match result {
-            Some((new_revision, _)) => SessionResult::Success(CommandResult::EditsApplied {
-                buffer_id,
-                new_revision,
-                movement: None,
-                after_selections: None,
-                unit: None,
-            }),
+            Some((new_revision, _)) => {
+                // RFC-0011 D-11: a structure edit is a single-op transition.
+                self.publish_shared_text(buffer, hint);
+                SessionResult::Success(CommandResult::EditsApplied {
+                    buffer_id,
+                    new_revision,
+                    movement: None,
+                    after_selections: None,
+                    unit: None,
+                })
+            }
             None => SessionResult::Error {
                 message: "Invalid structure edit".into(),
             },
@@ -6613,13 +6686,9 @@ impl Session {
         // new revision. The model's `last_transition_ops` is only populated
         // by undo/redo transitions, so forward applies derive the hint from
         // the applied ops here (exactly one op → hint; multi-op batches →
-        // `None`). The cache serves every later view of this revision.
+        // `None`). Publication is an O(1) root clone (RFC-0011 D-11).
         let hint = last_edit_hint(&ops);
-        {
-            let mut cache = self.shared_snapshots.lock_recovering();
-            let text: std::sync::Arc<str> = buffer.text().to_owned().into();
-            cache.insert(buffer_id, (new_revision, text, hint));
-        }
+        self.publish_shared_text(buffer, hint);
 
         SessionResult::Success(CommandResult::EditsApplied {
             buffer_id,
@@ -6691,11 +6760,11 @@ impl Session {
                     };
                 }
             };
-            // The FEFF/NUL probes are computed under the lock from the
-            // borrowed text: an owned copy of a 32 MiB note is not needed
-            // for two boolean answers.
+            // The FEFF/NUL probes are computed under the lock from bounded
+            // slices: no owned copy of a 32 MiB note, no full-document scan
+            // (the NUL probe is windowed, RFC-0011 S3).
             let leading_signature = buffer.text().starts_with('\u{FEFF}');
-            let nul_content = buffer.text().contains('\0');
+            let nul_content = crate::encoding::contains_nul_in_probe_windows(buffer.text());
             (
                 bytes,
                 buffer.revision(),
@@ -7062,15 +7131,19 @@ impl Session {
             };
         }
         match buffer.restore_editing_state(target) {
-            Ok(revision) => SessionResult::Success(CommandResult::EditingStateRestored {
-                buffer_id,
-                revision,
-                movement: buffer
-                    .model()
-                    .history_movement()
-                    .expect("successful restore has a receipt")
-                    .clone(),
-            }),
+            Ok(revision) => {
+                // RFC-0011 D-11: restore is a transition; publish the root.
+                self.publish_shared_text_from_model(buffer);
+                SessionResult::Success(CommandResult::EditingStateRestored {
+                    buffer_id,
+                    revision,
+                    movement: buffer
+                        .model()
+                        .history_movement()
+                        .expect("successful restore has a receipt")
+                        .clone(),
+                })
+            }
             Err(error) => SessionResult::Error {
                 message: error.to_string(),
             },
@@ -7111,6 +7184,8 @@ impl Session {
                     }
                     self.memo_cancel(buffer_id, (tag.txn_id, tag.item_id));
                 }
+                // RFC-0011 D-11: every transition publishes an O(1) root.
+                self.publish_shared_text_from_model(buffer);
                 SessionResult::Success(CommandResult::UndoPerformed {
                     buffer_id,
                     new_revision,
@@ -7169,6 +7244,8 @@ impl Session {
                 };
             }
             if let Some(new_revision) = buffer.redo() {
+                // RFC-0011 D-11: every transition publishes an O(1) root.
+                self.publish_shared_text_from_model(buffer);
                 SessionResult::Success(CommandResult::RedoPerformed {
                     buffer_id,
                     new_revision,
@@ -7229,7 +7306,13 @@ impl Session {
                 .resolve_keep_local(&theirs, DecodePolicy::Auto)
                 .map(|_| ())
         }) {
-            Some(()) => SessionResult::Success(CommandResult::ConflictResolved),
+            Some(()) => {
+                // RFC-0011 D-11: conflict resolution is a transition.
+                if let Some(buffer) = manager.get_buffer_by_id(buffer_id) {
+                    self.publish_shared_text(buffer, None);
+                }
+                SessionResult::Success(CommandResult::ConflictResolved)
+            }
             None => self.encoding_choice_required(
                 &path,
                 &ChoiceReason::InvalidInput {
@@ -7277,7 +7360,13 @@ impl Session {
             .get_buffer_by_id_mut(buffer_id)
             .and_then(|buffer| buffer.reload_from_disk(&theirs, DecodePolicy::Auto))
         {
-            Some(_) => SessionResult::Success(CommandResult::ConflictResolved),
+            Some(_) => {
+                // RFC-0011 D-11: reload is a transition.
+                if let Some(buffer) = manager.get_buffer_by_id(buffer_id) {
+                    self.publish_shared_text(buffer, None);
+                }
+                SessionResult::Success(CommandResult::ConflictResolved)
+            }
             None => self.encoding_choice_required(
                 &path,
                 &ChoiceReason::InvalidInput {
@@ -7438,13 +7527,17 @@ impl Session {
             };
         }
         match buffer.apply_resolved_merge(&merged_bytes, &theirs, DecodePolicy::Auto) {
-            Some(new_revision) => SessionResult::Success(CommandResult::EditsApplied {
-                buffer_id,
-                new_revision,
-                movement: None,
-                after_selections: None,
-                unit: None,
-            }),
+            Some(new_revision) => {
+                // RFC-0011 D-11: merge is a transition (external source).
+                self.publish_shared_text(buffer, None);
+                SessionResult::Success(CommandResult::EditsApplied {
+                    buffer_id,
+                    new_revision,
+                    movement: None,
+                    after_selections: None,
+                    unit: None,
+                })
+            }
             None => SessionResult::Error {
                 message: "merge output is invalid UTF-8 or exceeds the note size limit".into(),
             },
@@ -7569,6 +7662,15 @@ impl Session {
             }
         };
         self.note_buffer_transition();
+        // RFC-0011 D-11: reopen reinterprets the shared buffer — publish the
+        // new root (hint `None`; external source).
+        if let Some(buffer) = self
+            .buffer_manager
+            .lock_recovering()
+            .get_buffer_by_id(buffer_id)
+        {
+            self.publish_shared_text(buffer, None);
+        }
         self.bind_save_hint(&path, format, observed, &bytes);
         let _ = self.pulse.send(crate::channels::Pulse::Invalidate {
             note: flavite_buffer::manager::NoteRef::new(path),
@@ -7608,10 +7710,15 @@ impl Session {
             };
         }
         match buffer.model_mut().try_convert_source_format(target) {
-            Ok(new_revision) => SessionResult::Success(CommandResult::EncodingConverted {
-                buffer_id,
-                new_revision,
-            }),
+            Ok(new_revision) => {
+                // RFC-0011 D-11: format conversion is a transition (same
+                // bytes, new descriptor/version).
+                self.publish_shared_text(buffer, None);
+                SessionResult::Success(CommandResult::EncodingConverted {
+                    buffer_id,
+                    new_revision,
+                })
+            }
             Err(error) => {
                 let code = if matches!(error, flavite_encoding::CodecError::Unencodable { .. }) {
                     crate::encoding::UNENCODABLE_CODE
@@ -7738,6 +7845,14 @@ impl Session {
                 message: "recovery snapshot could not be applied".into(),
             };
         }
+        // RFC-0011 D-11: recovery restore is a transition (external source).
+        if let Some(buffer) = self
+            .buffer_manager
+            .lock_recovering()
+            .get_buffer_by_id(buffer_id)
+        {
+            self.publish_shared_text(buffer, None);
+        }
         if recovery.base_hash.is_some_and(|base| {
             base != flavite_buffer::revision::BaseHash::from_bytes(*blake3::hash(&disk).as_bytes())
         }) {
@@ -7855,7 +7970,7 @@ impl Session {
         // surrounding typing. The range is normalized-text (TextByte)
         // coordinates; the replacement is normalized UTF-8.
         buffer.model_mut().seal_undo_group();
-        let end = buffer.model().text().len();
+        let end = buffer.model().len();
         let inserted = text.len();
         let mut op = EditOp::new(
             flavite_syntax::text::Span::new(
@@ -7868,21 +7983,26 @@ impl Session {
         let result = buffer.apply_local_edits(&[op]);
         buffer.model_mut().seal_undo_group();
         match result {
-            Some((new_revision, _)) => SessionResult::Success(CommandResult::HistoryRestored {
-                buffer_id,
-                new_revision,
-                movement: flavite_buffer::history::HistoryMovement {
-                    spans: vec![flavite_buffer::history::MovementSpan {
-                        start: 0,
-                        end,
-                        replacement_len: inserted,
-                    }],
-                    step_ends: vec![1],
-                    truncated: false,
-                    selections: None,
-                    primary: None,
-                },
-            }),
+            Some((new_revision, _)) => {
+                // RFC-0011 D-11: history restore is a transition (one
+                // boundary op → hint `None`).
+                self.publish_shared_text(buffer, None);
+                SessionResult::Success(CommandResult::HistoryRestored {
+                    buffer_id,
+                    new_revision,
+                    movement: flavite_buffer::history::HistoryMovement {
+                        spans: vec![flavite_buffer::history::MovementSpan {
+                            start: 0,
+                            end,
+                            replacement_len: inserted,
+                        }],
+                        step_ends: vec![1],
+                        truncated: false,
+                        selections: None,
+                        primary: None,
+                    },
+                })
+            }
             None => SessionResult::Error {
                 message: "history snapshot could not be applied".into(),
             },
@@ -7899,7 +8019,7 @@ impl Session {
         Ok(BufferSnapshot {
             buffer_id: snapshot.buffer_id,
             revision: snapshot.revision,
-            text: snapshot.text.to_string(),
+            text: snapshot.text.materialize().to_string(),
             base_hash: snapshot.base_hash,
             state: snapshot.state,
             path: snapshot.path,
@@ -7970,12 +8090,17 @@ impl Session {
     }
 
     /// Get a cached immutable snapshot shared by all views of this revision.
+    ///
+    /// Readers never take `driving_turn` (RFC-0011 D-11/FR-13): the
+    /// buffer-manager lock already serializes every mutation and its
+    /// O(1) root publication, so this read sees a consistent point; all
+    /// materialization happens after the locks are released, on the
+    /// caller's thread.
     pub fn shared_buffer_snapshot(
         &self,
         buffer_id: BufferId,
         revision: Option<Revision>,
     ) -> Result<SharedBufferSnapshot, BufferSnapshotError> {
-        let _turn = self.driving_turn.lock_recovering();
         self.shared_buffer_snapshot_inner(buffer_id, revision)
     }
     pub(crate) fn shared_buffer_snapshot_inner(
@@ -8007,7 +8132,9 @@ impl Session {
                     (text.clone(), *hint)
                 }
                 _ => {
-                    let text: std::sync::Arc<str> = buffer.text().to_owned().into();
+                    // O(1) root publication: never materialize the document
+                    // under the manager/cache locks (RFC-0011 D-11).
+                    let text = buffer.model().document_text();
                     let hint = last_edit_hint(buffer.model().last_transition_ops());
                     cache.insert(buffer_id, (current_revision, text.clone(), hint));
                     (text, hint)
@@ -8049,13 +8176,16 @@ impl Session {
                 (
                     native_note_key(path, &self.identity.root),
                     buffer.base_bytes().to_vec(),
-                    flavite_buffer::recovery::RecoveryFile::from_buffer(buffer, 0, false),
+                    // O(1) staged capture under the lock; serialization
+                    // happens below, off the lock (RFC-0011 S3/T14).
+                    StagedRecovery::from_buffer(buffer),
                 )
             })
             .collect::<Vec<_>>();
         drop(manager);
         let mut written = Vec::new();
-        for (key, base, snapshot) in dirty {
+        for (key, base, staged) in dirty {
+            let snapshot = flavite_buffer::recovery::RecoveryFile::from_staged(staged, 0, false);
             let due = writer.lock_recovering().should_write_snapshot(&snapshot);
             if due
                 && self.actor.pin_merge_base(key.clone(), base).is_ok()
@@ -8080,7 +8210,9 @@ impl Session {
                     (
                         native_note_key(path, &self.identity.root),
                         buffer.base_bytes().to_vec(),
-                        flavite_buffer::recovery::RecoveryFile::from_buffer(buffer, 0, false),
+                        // O(1) staged capture under the lock; serialization
+                        // happens below, off the lock (RFC-0011 S3/T14).
+                        StagedRecovery::from_buffer(buffer),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -8092,7 +8224,8 @@ impl Session {
             return Err("local recovery storage is unavailable".into());
         };
         let mut written = Vec::with_capacity(snapshots.len());
-        for (key, base, snapshot) in snapshots {
+        for (key, base, staged) in snapshots {
+            let snapshot = flavite_buffer::recovery::RecoveryFile::from_staged(staged, 0, false);
             self.actor
                 .pin_merge_base(key.clone(), base)
                 .map_err(|error| format!("could not persist recovery merge base: {error}"))?;
@@ -8359,6 +8492,7 @@ mod tests {
     use flavite_index::IndexActor;
     use flavite_syntax::text::{Span, TextByte};
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     fn test_session() -> (Session, MemFs, tempfile::TempDir) {
         let fs = MemFs::new();
@@ -9077,7 +9211,7 @@ mod tests {
         assert!(session.is_open(&path));
         assert_eq!(session.get_buffer_id(&path), Some(buffer_id));
         let shared = session.shared_buffer_snapshot(buffer_id, None).unwrap();
-        assert_eq!(shared.text.as_ref(), "hello");
+        assert_eq!(shared.text.materialize().as_ref(), "hello");
         assert!(
             session
                 .shared_snapshots
@@ -11155,5 +11289,209 @@ mod tests {
             None,
             "multi-op batches must not produce a hint"
         );
+    }
+
+    /// The hint the model's own last-transition ops imply (the rule the
+    /// cache fill uses for undo/redo/restore transitions).
+    fn model_transition_hint(session: &Session, buffer_id: BufferId) -> Option<flavite_syntax::EditRange> {
+        let manager_arc = session.buffer_manager();
+        let manager = manager_arc.lock().unwrap();
+        let ops = manager
+            .get_buffer_by_id(buffer_id)
+            .unwrap()
+            .model()
+            .last_transition_ops()
+            .to_vec();
+        drop(manager);
+        last_edit_hint(&ops)
+    }
+
+    /// RFC-0011 S3-T1 (D-11/FR-8): every state transition publishes an
+    /// O(1) immutable root into the shared snapshot slot. For each kind
+    /// (open, external reload, typing, undo, redo, structure patch, editing-
+    /// state restore) the slot holds the buffer's current revision, the
+    /// model's own chunk-tree root (pointer identity), the materialized
+    /// text, and the frozen hint.
+    #[test]
+    fn every_transition_publishes_the_model_root() {
+        let (session, fs, _temp) = test_session();
+        let path = PathBuf::from("/test/vault/note.md");
+        let (buffer_id, revision) = match open_to_terminal(&session, path.clone()) {
+            SessionResult::Success(CommandResult::NoteOpened {
+                buffer_id,
+                revision,
+            }) => (buffer_id, revision),
+            result => panic!("open failed: {result:?}"),
+        };
+
+        /// The published slot must equal the buffer's live revision, text,
+        /// root pointer, and expected hint.
+        fn assert_published(
+            session: &Session,
+            buffer_id: BufferId,
+            expected_text: &str,
+            expected_hint: Option<flavite_syntax::EditRange>,
+        ) {
+            let (revision, model_root) = {
+                let manager_arc = session.buffer_manager();
+                let manager = manager_arc.lock().unwrap();
+                let buffer = manager.get_buffer_by_id(buffer_id).unwrap();
+                (
+                    buffer.revision(),
+                    Arc::clone(&buffer.model().version_state().root),
+                )
+            };
+            let snapshot = session.shared_buffer_snapshot(buffer_id, None).unwrap();
+            assert_eq!(snapshot.revision, revision, "slot revision is current");
+            assert!(
+                Arc::ptr_eq(snapshot.text.root(), &model_root),
+                "slot must hold the model's own immutable root"
+            );
+            assert_eq!(
+                snapshot.text.materialize().as_ref(),
+                expected_text,
+                "slot text matches the buffer"
+            );
+            assert_eq!(snapshot.last_edit, expected_hint, "frozen hint");
+        }
+
+        // First open: published, no hint.
+        assert_published(&session, buffer_id, "hello", None);
+
+        // External reload: the file changes behind the vault; the reconcile
+        // scan emits the ExternalChange actor event, the pump applies it and
+        // publishes hint-less (the source is not a session edit).
+        let staged = path.with_extension("md.next");
+        fs.write_new(&staged, b"external").unwrap();
+        fs.rename_replace(&staged, &path).unwrap();
+        let reconciled = session.execute(SessionCommand::Reconcile {
+            scope: ReconcileScope::Single(path.clone()),
+            mode: ReconcileMode::VerifyContent,
+        });
+        match reconciled {
+            SessionResult::Pending { request_id } => {
+                session.wait_for_operation(request_id);
+            }
+            SessionResult::Success(_) => {}
+            result => panic!("reconcile failed: {result:?}"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            session.pump();
+            let text = session
+                .shared_buffer_snapshot(buffer_id, None)
+                .unwrap()
+                .text
+                .materialize();
+            if text.as_ref() == "external" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "external change never applied");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_published(&session, buffer_id, "external", None);
+
+        // Typing (forward apply): hint derived from the applied op.
+        let op = EditOp::new(Span::new(TextByte(8), TextByte(8)), "!".into());
+        let hint = Some(flavite_syntax::EditRange {
+            start: 8,
+            old_end: 8,
+            new_end: 9,
+        });
+        let edited = apply_edits_turn(&session, buffer_id, revision.next(), vec![op]);
+        assert!(edited > revision);
+        assert_published(&session, buffer_id, "external!", hint);
+
+        // Undo → publish the reverted root.
+        let undone = match session.execute(SessionCommand::Undo {
+            buffer_id,
+            revision: edited,
+            operation: session
+                .issue_editor_operation(buffer_id, edited, None)
+                .expect("fixture activation"),
+        }) {
+            SessionResult::Success(CommandResult::UndoPerformed { new_revision, .. }) => {
+                new_revision
+            }
+            result => panic!("undo failed: {result:?}"),
+        };
+        let hint = model_transition_hint(&session, buffer_id);
+        assert!(hint.is_some(), "undo of a single op must publish a hint");
+        assert_published(&session, buffer_id, "external", hint);
+
+        // Redo → publish the reapplied root.
+        let redone = match session.execute(SessionCommand::Redo {
+            buffer_id,
+            revision: undone,
+            operation: session
+                .issue_editor_operation(buffer_id, undone, None)
+                .expect("fixture activation"),
+        }) {
+            SessionResult::Success(CommandResult::RedoPerformed { new_revision, .. }) => {
+                new_revision
+            }
+            result => panic!("redo failed: {result:?}"),
+        };
+        let hint = model_transition_hint(&session, buffer_id);
+        assert!(hint.is_some(), "redo of a single op must publish a hint");
+        assert_published(&session, buffer_id, "external!", hint);
+
+        // Structure patch (single-op structure-neutral transition).
+        let patch = EditOp::new(Span::new(TextByte(0), TextByte(8)), "X".into());
+        let patched = match session.apply_structure_patch(buffer_id, redone, patch) {
+            SessionResult::Success(CommandResult::EditsApplied { new_revision, .. }) => {
+                new_revision
+            }
+            result => panic!("structure patch failed: {result:?}"),
+        };
+        assert_published(
+            &session,
+            buffer_id,
+            "X!",
+            Some(flavite_syntax::EditRange {
+                start: 0,
+                old_end: 8,
+                new_end: 1,
+            }),
+        );
+
+        // Editing-state restore: undo the structure patch, then restore the
+        // redo target through the history page — the restore path publishes.
+        let undone2 = match session.execute(SessionCommand::Undo {
+            buffer_id,
+            revision: patched,
+            operation: session
+                .issue_editor_operation(buffer_id, patched, None)
+                .expect("fixture activation"),
+        }) {
+            SessionResult::Success(CommandResult::UndoPerformed { new_revision, .. }) => {
+                new_revision
+            }
+            result => panic!("undo failed: {result:?}"),
+        };
+        let page = match session.execute(SessionCommand::EditingHistory {
+            buffer_id,
+            revision: undone2,
+            cursor: None,
+            limit: 10,
+        }) {
+            SessionResult::Success(CommandResult::EditingHistory { page, .. }) => page,
+            result => panic!("history page failed: {result:?}"),
+        };
+        let redo_target = page.redo.expect("redo entry available").target;
+        let restored = match session.execute(SessionCommand::RestoreEditingState {
+            buffer_id,
+            revision: undone2,
+            target: redo_target,
+            operation: session
+                .issue_editor_operation(buffer_id, undone2, None)
+                .expect("fixture activation"),
+        }) {
+            SessionResult::Success(CommandResult::EditingStateRestored { revision, .. }) => revision,
+            result => panic!("restore failed: {result:?}"),
+        };
+        let hint = model_transition_hint(&session, buffer_id);
+        assert_published(&session, buffer_id, "X!", hint);
+        assert!(restored > undone2);
     }
 }

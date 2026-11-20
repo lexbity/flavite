@@ -48,10 +48,11 @@ fn same_tab_read_mode_current_dirty_text_guarded_task_undo_and_independent_dupli
     let (mut app, fs, root, _cache) = fixture();
     let tab = open(&mut app);
     let original = app.note_editor_view(tab).unwrap();
+    let original_text = original.text.materialize();
     let _ = app.workspace.set_content_anchor(
         tab,
-        original.text.find("Paragraph").unwrap(),
-        &original.text,
+        original_text.find("Paragraph").unwrap(),
+        &original_text,
     );
     let _ = app.update(Message::ToggleNoteMode(tab));
     wait(&mut app, |app| reading::document(app, tab).is_some());
@@ -67,7 +68,7 @@ fn same_tab_read_mode_current_dirty_text_guarded_task_undo_and_independent_dupli
             .unwrap()
             .interaction()
             .viewport_anchor,
-        original.text.find("Paragraph").unwrap()
+        original_text.find("Paragraph").unwrap()
     );
     // Build the actual widget tree, not only the DTO.
     let _ = flavite_ui::workspace_shell::view(&app);
@@ -77,7 +78,7 @@ fn same_tab_read_mode_current_dirty_text_guarded_task_undo_and_independent_dupli
     assert!(app.note_state_text(tab).unwrap().contains("[x] task"));
     assert_eq!(
         fs.read_if_exists(&root.join("a.md")).unwrap().unwrap(),
-        original.text.as_bytes()
+        original_text.as_bytes()
     );
     wait(&mut app, |app| {
         reading::document(app, tab).is_some_and(|d| d.unsaved)
@@ -342,7 +343,7 @@ fn rapid_captured_input_is_interpreted_in_order_without_replaying_after_another_
     }
     assert_eq!(
         app.note_state_text(tab).unwrap(),
-        format!("{}雪", view.text)
+        format!("{}雪", view.text.materialize())
     );
     assert!(app.valid_writing_target().is_some());
     let api = app.flavite.as_ref().unwrap();

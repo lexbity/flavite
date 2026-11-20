@@ -12,7 +12,7 @@ fn view_of(text: &str) -> EditorView {
     EditorView {
         buffer_id: 7,
         revision: 3,
-        text: text.to_owned().into(),
+        text: flavite_buffer::chunks::DocumentText::from(text),
         path: "note.md".into(),
         state: flavite_buffer::state::BufferState::Clean,
         last_edit: None,

@@ -189,7 +189,7 @@ pub fn pump(app: &mut App) {
                 && &view.base_hash == content_hash
         }
     };
-    if !valid || view.text.get(detail.start..detail.end) != Some(detail.exact_source.as_str()) {
+    if !valid || view.text.materialize().get(detail.start..detail.end) != Some(detail.exact_source.as_str()) {
         fail(app, "The source changed; refresh the occurrence chooser");
         return;
     }

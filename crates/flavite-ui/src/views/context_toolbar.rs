@@ -194,7 +194,7 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
     // set grows (FEUX-0002 X04/D-18; non-color redundancy).
     let member_count = target.selections.len();
     let count = app.note_editor_view(target.tab).map_or(0, |view| {
-        flavite_edit_context::selected_characters(&view.text, target.selection)
+        flavite_edit_context::selected_characters(&view.text.materialize(), target.selection)
     });
     let message = app
         .context_mode

@@ -266,7 +266,7 @@ fn stale_draft_is_rejected_by_key_when_the_selection_changes() {
     );
     // The committed set is untouched byte-identically.
     assert_eq!(committed_members(&f.app, tab), vec![(5, 6)]);
-    assert_eq!(f.app.note_editor_view(tab).unwrap().text.as_ref(), BODY);
+    assert_eq!(f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(), BODY);
 }
 
 #[test]
@@ -281,7 +281,7 @@ fn close_discards_the_overlay_byte_identically() {
     assert!(!f.app.selection_search.tabs.contains_key(&tab));
     assert_eq!(committed_members(&f.app, tab), vec![(0, 0)]);
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.as_ref(),
+        f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
         BODY,
         "Esc/Close leaves the committed set byte-identical"
     );
@@ -397,7 +397,7 @@ fn a_superseded_draft_cancels_the_old_request_and_the_newest_wins() {
     // The committed set stays untouched until the apply.
     assert_eq!(committed_members(&f.app, tab), vec![(0, 0)]);
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.as_ref(),
+        f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
         BODY,
         "cancellation and supersede never mutate the text"
     );
@@ -449,7 +449,7 @@ fn in_selections_select_scopes_the_search_to_the_live_members() {
             > version_before
     );
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.as_ref(),
+        f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
         BODY,
         "selection-only: bytes unchanged"
     );
@@ -471,7 +471,7 @@ fn keep_draft_overlays_survivors_and_apply_filters_the_set() {
     // Member 0 (0..8 = "TODO one") contains "TODO"; member 1 (14..17 =
     // "two") does not.
     publish_members(&mut f.app, tab, &[(0, 8), (14, 17)]);
-    let text_before = f.app.note_editor_view(tab).unwrap().text.to_string();
+    let text_before = f.app.note_editor_view(tab).unwrap().text.materialize().to_string();
 
     run(&mut f.app, tab, Command::KeepMatching { keep: true });
     draft_query(&mut f.app, tab, "TODO");
@@ -497,7 +497,7 @@ fn keep_draft_overlays_survivors_and_apply_filters_the_set() {
         "apply bumps the committed selection version"
     );
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.as_ref(),
+        f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
         text_before.as_str(),
         "keep is selection-only: bytes unchanged"
     );

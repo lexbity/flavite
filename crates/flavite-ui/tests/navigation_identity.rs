@@ -76,7 +76,7 @@ fn same_titled_notes_stay_distinct_by_native_path() {
     assert_ne!(first, second);
     let text = |app: &App, tab: TabId| {
         app.note_editor_view(tab)
-            .map(|view| view.text.to_string())
+            .map(|view| view.text.materialize().to_string())
             .unwrap_or_default()
     };
     assert!(text(&app, first).contains("2024"));

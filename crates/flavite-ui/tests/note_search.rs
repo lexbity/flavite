@@ -322,7 +322,7 @@ fn replace_all_prepares_through_the_core_and_updates_both_views() {
     assert!(replace.last_error.is_none());
     // The duplicate view shares the buffer: it sees the new revision.
     let second_view = app.note_editor_view(second).unwrap();
-    assert_eq!(second_view.text.as_ref(), "zz bbb zz\n");
+    assert_eq!(second_view.text.materialize().as_ref(), "zz bbb zz\n");
     assert_ne!(second_view.revision, before, "revision advanced");
     wait(&mut app, |a| {
         crate_replace_visible(a, first) && crate_replace_visible(a, second)
@@ -332,7 +332,7 @@ fn replace_all_prepares_through_the_core_and_updates_both_views() {
 fn crate_replace_visible(app: &App, tab: TabId) -> bool {
     app.note_editor_view(tab).is_some_and(|view| {
         app.note_buffer_state(tab) == Some(flavite_buffer::state::BufferState::Dirty)
-            || view.text.contains("zz")
+            || view.text.materialize().contains("zz")
     })
 }
 

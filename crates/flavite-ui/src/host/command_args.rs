@@ -648,10 +648,11 @@ fn install_preview(app: &mut App, tab: TabId, data: &serde_json::Value) {
         let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
             return;
         };
+        let text = view.text.materialize();
         if start > end
-            || end > view.text.len()
-            || !view.text.is_char_boundary(start)
-            || !view.text.is_char_boundary(end)
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
         {
             return;
         }

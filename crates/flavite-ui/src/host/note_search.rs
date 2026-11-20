@@ -257,7 +257,7 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
                 input.revision = view.revision;
                 input.sequence = input.sequence.saturating_add(1);
                 input.focused = false;
-                let _ = app.acknowledge_editor_interaction(input, &view.text);
+                let _ = app.acknowledge_editor_interaction(input, &view.text.materialize());
             }
             let captured_scope = app.note_editor_view(tab).and_then(|view| {
                 app.workspace
@@ -337,7 +337,7 @@ pub fn handle(app: &mut App, message: NoteSearchMessage) -> iced::Task<crate::ap
                 input.revision = view.revision;
                 input.sequence = input.sequence.saturating_add(1);
                 input.focused = false;
-                let _ = app.acknowledge_editor_interaction(input, &view.text);
+                let _ = app.acknowledge_editor_interaction(input, &view.text.materialize());
             }
             // The replace row rides on the find row and inherits its query,
             // so both rows always act on the same visible query.
@@ -710,10 +710,11 @@ fn install_find_result(
         let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
             return;
         };
+        let text = view.text.materialize();
         if start > end
-            || end > view.text.len()
-            || !view.text.is_char_boundary(start)
-            || !view.text.is_char_boundary(end)
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
             || spans
                 .last()
                 .is_some_and(|(_, previous_end)| *previous_end > start)
@@ -869,7 +870,7 @@ fn navigate(app: &mut App, tab: TabId) {
     };
     let _ = app
         .workspace
-        .set_display_selection(tab, at, end, view.revision, &view.text);
+        .set_display_selection(tab, at, end, view.revision, &view.text.materialize());
     app.reading.pending_anchor.insert(tab, at);
 }
 

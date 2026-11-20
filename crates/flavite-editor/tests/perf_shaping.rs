@@ -77,7 +77,6 @@ fn keystroke_splice_cost_stays_sub_half_millisecond() {
     use flavite_editor::{EditorView, viewport::Viewport};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     // A 240-line band: viewport centred on line 80 with 80 visible lines
     // (band_window: first − 80 → 0, first + 160 → 240). Lines match the
@@ -94,7 +93,7 @@ fn keystroke_splice_cost_stays_sub_half_millisecond() {
     let base_view = EditorView {
         buffer_id: 1,
         revision: 1,
-        text: Arc::from(text.as_str()),
+        text: flavite_buffer::chunks::DocumentText::from(text.as_str()),
         path: PathBuf::from("note.md"),
         state: BufferState::Clean,
         last_edit: None,
@@ -106,7 +105,7 @@ fn keystroke_splice_cost_stays_sub_half_millisecond() {
     edited.replace_range(at..at + 1, "A");
     let edited_view = EditorView {
         revision: 2,
-        text: Arc::from(edited.as_str()),
+        text: flavite_buffer::chunks::DocumentText::from(edited.as_str()),
         last_edit: Some(flavite_syntax::EditRange {
             start: at,
             old_end: at + 1,
@@ -121,10 +120,12 @@ fn keystroke_splice_cost_stays_sub_half_millisecond() {
         // The real frame order: revision change → reconcile (line index +
         // scan) → layout sync. Only the sync (shaping) phase is measured.
         state.reconcile(&base_view, &HashMap::new());
-        state.sync_shaped_for_perf(&base_view.text, 1, viewport, width);
+        let base_text = base_view.text.materialize();
+        let edited_text = edited_view.text.materialize();
+        state.sync_shaped_for_perf(&base_text, 1, viewport, width);
         state.reconcile(&edited_view, &HashMap::new());
         let start = Instant::now();
-        state.sync_shaped_for_perf(&edited_view.text, 2, viewport, width);
+        state.sync_shaped_for_perf(&edited_text, 2, viewport, width);
         samples.push(start.elapsed());
     }
     let p50 = percentile(&mut samples, 50);
@@ -158,7 +159,6 @@ fn paint_collection_cost_stays_sub_millisecond() {
     use flavite_editor::{EditorView, viewport::Viewport};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     let text = (0..240u32)
         .map(|index| format!("line {index:03} alpha beta gamma delta epsilon zeta eta theta\n"))
@@ -173,7 +173,7 @@ fn paint_collection_cost_stays_sub_millisecond() {
     let base_view = EditorView {
         buffer_id: 1,
         revision: 1,
-        text: Arc::from(text.as_str()),
+        text: flavite_buffer::chunks::DocumentText::from(text.as_str()),
         path: PathBuf::from("note.md"),
         state: BufferState::Clean,
         last_edit: None,
@@ -184,7 +184,7 @@ fn paint_collection_cost_stays_sub_millisecond() {
     edited.replace_range(at..at + 1, "A");
     let edited_view = EditorView {
         revision: 2,
-        text: Arc::from(edited.as_str()),
+        text: flavite_buffer::chunks::DocumentText::from(edited.as_str()),
         last_edit: Some(flavite_syntax::EditRange {
             start: at,
             old_end: at + 1,
@@ -197,11 +197,13 @@ fn paint_collection_cost_stays_sub_millisecond() {
     for _ in 0..300 {
         let mut state = EditorState::default();
         state.reconcile(&base_view, &HashMap::new());
-        state.sync_shaped_for_perf(&base_view.text, 1, viewport, width);
+        let base_text = base_view.text.materialize();
+        let edited_text = edited_view.text.materialize();
+        state.sync_shaped_for_perf(&base_text, 1, viewport, width);
         state.reconcile(&edited_view, &HashMap::new());
         let start = Instant::now();
         let painted =
-            state.painted_line_count_for_perf(&edited_view.text, 2, viewport, width, paint_height);
+            state.painted_line_count_for_perf(&edited_text, 2, viewport, width, paint_height);
         samples.push(start.elapsed());
         assert!(painted > 0, "paint collection paints lines");
     }

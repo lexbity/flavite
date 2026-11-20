@@ -1795,6 +1795,7 @@ impl App {
                 .get_shared_buffer_view(flavite_buffer::BufferId::from(buffer), None)
                 .ok()?
                 .text
+                .materialize()
                 .to_string(),
         )
     }
@@ -2018,7 +2019,7 @@ impl App {
                             *tab,
                             view.buffer_id,
                             view.revision,
-                            &view.text,
+                            &view.text.materialize(),
                         )
                     {
                         self.status = error.into();
@@ -2142,7 +2143,7 @@ impl App {
                 let Some(view) = self.note_editor_view(tab) else {
                     return;
                 };
-                if !valid || view.text.get(start..end) != Some(prefix.as_str()) {
+                if !valid || view.text.materialize().get(start..end) != Some(prefix.as_str()) {
                     self.status =
                         "Completion source changed; place the caret and choose again".into();
                     return;
@@ -2239,7 +2240,8 @@ impl App {
                     }
                     self.workspace.release_editor_focus(Some(tab));
                 }
-                if let Err(error) = self.acknowledge_editor_interaction(interaction, &current.text)
+                if let Err(error) =
+                    self.acknowledge_editor_interaction(interaction, &current.text.materialize())
                 {
                     self.status = format!("Editor state was not accepted: {error}");
                 } else {
@@ -4410,7 +4412,7 @@ impl App {
                                 vec![flavite_workspace::CommittedSelection::caret(caret)];
                             interaction.primary = 0;
                             interaction.focused = true;
-                            self.acknowledge_editor_interaction(interaction, &view.text)
+                            self.acknowledge_editor_interaction(interaction, &view.text.materialize())
                                 .is_ok()
                         });
                     if !acknowledged {
