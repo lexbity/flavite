@@ -415,7 +415,12 @@ fn accounted_bytes_match_an_independent_oracle_under_random_ops() {
                     let snap_len = node
                         .snapshot
                         .as_ref()
-                        .map_or(0, |s| s.text().len()) as u64;
+                        .map_or(0, |text| match text {
+                            flavite_buffer::undo::NodeText::Materialized(snapshot) => {
+                                snapshot.text().len()
+                            }
+                            flavite_buffer::undo::NodeText::Delta { after_len } => *after_len,
+                        }) as u64;
                     let repl_len = node
                         .edit
                         .as_ref()

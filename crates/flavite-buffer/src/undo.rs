@@ -34,11 +34,35 @@ fn shift_usize(position: usize, delta: isize) -> usize {
     }
 }
 
+/// The retained text representation of an undo node (RFC-0008 D5): either a
+/// full snapshot (root, sealed boundaries, every-64 floor) or a delta holding
+/// only the post-edit byte length (text = parent's text with `edit`
+/// applied).
+#[derive(Debug, Clone)]
+pub enum NodeText {
+    /// Full snapshot.
+    Materialized(TextSnapshot),
+    /// Delta node: `after_len` is the byte length of this node's post-edit
+    /// text (for accounting without materializing).
+    Delta { after_len: usize },
+}
+
+impl NodeText {
+    /// The byte length of the text this node represents, without
+    /// materializing a delta.
+    fn len(&self) -> usize {
+        match self {
+            NodeText::Materialized(snapshot) => snapshot.text().len(),
+            NodeText::Delta { after_len } => *after_len,
+        }
+    }
+}
+
 /// The accounted bytes of one retained node (budget.rs `account_node` over
 /// the node's own state; shared by `reaccount` and the reservation
 /// feasibility plan).
 fn node_accounted_bytes(node: &UndoNode) -> u64 {
-    let snapshot_len = node.snapshot.as_ref().map_or(0, |s| s.text().len());
+    let snapshot_len = node.snapshot.as_ref().map_or(0, NodeText::len);
     let replacement_len = node.edit.as_ref().map_or(0, |e| e.replacement.len());
     let (before, after) = match &node.editor {
         Some(record) => (&record.before[..], &record.after[..]),
@@ -351,6 +375,91 @@ pub fn merge_mapped(prev: &EditOp, next: &EditOp) -> Option<EditOp> {
     merge_mapped_with_source(prev, next, None)
 }
 
+/// Compose a chain of edits O₁..Oₙ (Oᵢ₊₁ in post-Oᵢ coordinates) into one
+/// edit in O₁'s pre-coordinates (RFC-0008 §5.3.3). `source` is the original
+/// text the chain is applied to (needed for gap bytes). Returns `None` when
+/// any pair fails the composition preconditions — the caller falls back to
+/// sequential application.
+#[must_use]
+pub(crate) fn compose_chain(ops: &[EditOp], source: &str) -> Option<EditOp> {
+    let mut iter = ops.iter();
+    let mut acc = iter.next()?.clone();
+    // Boundary/journal flags are coalescing/install guards; they do not
+    // affect the geometry and would otherwise reject the composition.
+    acc.boundary = false;
+    acc.journal = None;
+    for op in iter {
+        let mut op = op.clone();
+        op.boundary = false;
+        op.journal = None;
+        acc = merge_mapped_with_source(&acc, &op, Some(source))?;
+    }
+    Some(acc)
+}
+
+/// Replay one edit's EOL effect on a text/table pair — the same windowed
+/// splice the interactive text path uses (`EditorModel::apply_text_edit`),
+/// so materialized snapshots agree with what interactive editing produced.
+fn replay_eol_splice(table: &mut crate::eol::EolTable, text: &str, op: &EditOp) {
+    let range = op.range.start.0..op.range.end.0;
+    let changes_lines = text[range.clone()].contains('\n') || op.replacement.contains('\n');
+    let ended_with_lf = text.ends_with('\n');
+    if changes_lines {
+        let (window_first, window_start, tail_end) = crate::model::eol_splice_window(
+            text,
+            range.start,
+            range.end,
+            &op.replacement,
+            table.line_count(),
+        );
+        let window_new = format!(
+            "{}{}{}",
+            &text[window_start..range.start],
+            op.replacement,
+            &text[range.end..tail_end],
+        );
+        *table = crate::model::spliced_eol_table_in_window(
+            table,
+            text,
+            window_start,
+            tail_end,
+            &window_new,
+            window_first,
+        );
+    } else if ended_with_lf && !text.ends_with('\n') {
+        table.line_endings.push(crate::eol::LineEnding::None);
+        table.has_trailing_newline = false;
+    } else if !ended_with_lf && text.ends_with('\n') {
+        table.line_endings.pop();
+        table.has_trailing_newline = true;
+    }
+}
+
+/// The shared snapshot pipeline: decoded layer -> codec encode -> strict
+/// snapshot, with the pending-descriptor fallback (§6.10).
+fn build_snapshot_from_text_and_table(
+    after_text: &str,
+    table: &crate::eol::EolTable,
+    format: Option<flavite_encoding::SourceFormat>,
+) -> TextSnapshot {
+    let format = format.unwrap_or_else(flavite_encoding::SourceFormat::utf8);
+    let decoded = crate::model::decoded_layer(after_text, table);
+    match flavite_encoding::encode(
+        &decoded,
+        format,
+        &flavite_encoding::EncodeLimits::default(),
+        &flavite_encoding::NOT_CANCELLED,
+    ) {
+        Ok(source) => {
+            TextSnapshot::with_policy(&source, flavite_encoding::DecodePolicy::Explicit(format))
+                .unwrap_or_else(|_| {
+                    TextSnapshot::from_normalized_with_descriptor(after_text, format)
+                })
+        }
+        Err(_) => TextSnapshot::from_normalized_with_descriptor(after_text, format),
+    }
+}
+
 /// A node in the undo tree.
 ///
 /// Each node represents a state of the buffer and can have:
@@ -380,8 +489,9 @@ pub struct UndoNode {
     pub revision: Revision,
     /// The edit that led to this state (None for the root).
     pub edit: Option<EditOp>,
-    /// The text snapshot at this node (for leaf nodes, can be reconstructed).
-    pub snapshot: Option<TextSnapshot>,
+    /// The text representation at this node (RFC-0008 D5): full snapshot or
+    /// delta; `None` once evicted.
+    pub snapshot: Option<NodeText>,
     /// The time when this edit was applied.
     pub timestamp: Instant,
     /// Parent node ID.
@@ -390,7 +500,7 @@ pub struct UndoNode {
     pub children: Vec<u64>,
 }
 impl UndoNode {
-    /// Create a new root node.
+    /// Create a new root node (always materialized).
     #[must_use]
     pub fn root(revision: Revision, snapshot: TextSnapshot) -> Self {
         Self {
@@ -405,21 +515,15 @@ impl UndoNode {
             evicted: false,
             revision,
             edit: None,
-            snapshot: Some(snapshot),
+            snapshot: Some(NodeText::Materialized(snapshot)),
             timestamp: Instant::now(),
             parent_id: None,
             children: Vec::new(),
         }
     }
-    /// Create a new node from an edit with a snapshot.
+    /// Create a new node from an edit with its text representation.
     #[must_use]
-    pub fn new(
-        id: u64,
-        revision: Revision,
-        edit: EditOp,
-        parent_id: u64,
-        snapshot: TextSnapshot,
-    ) -> Self {
+    pub fn new(id: u64, revision: Revision, edit: EditOp, parent_id: u64, text: NodeText) -> Self {
         Self {
             changed_at_unix_ms: wall_clock_ms(),
             segment: edit.journal.as_ref().map(|_| id),
@@ -436,7 +540,7 @@ impl UndoNode {
             evicted: false,
             revision,
             edit: Some(edit),
-            snapshot: Some(snapshot),
+            snapshot: Some(text),
             timestamp: Instant::now(),
             parent_id: Some(parent_id),
             children: Vec::new(),
@@ -684,20 +788,26 @@ impl UndoTree {
         (spans, step_ends, false)
     }
 
-    /// Apply an edit and advance the tree.
-    ///
-    /// If the edit can be coalesced with the current node's edit, it is merged.
-    /// Otherwise, a new node is created.
-    ///
-    /// Returns the new revision.
+    /// Apply an edit and advance the tree (eager snapshot representation —
+    /// legacy facade, recovery, and tests; not the keystroke path).
     pub fn apply(&mut self, edit: EditOp, snapshot: TextSnapshot) -> Revision {
         if self.context_origin.is_some() || self.position().is_some_and(|n| n.editor.is_some()) {
             self.seal_current();
         }
-        self.apply_with_coalescing(edit, snapshot, true, false)
+        self.apply_with_coalescing(edit, NodeText::Materialized(snapshot), true, false)
     }
 
-    /// One explicit typing run, independent of the ordinary idle timer.
+    /// Apply an edit on the interactive typing path with a delta
+    /// representation (RFC-0008 D5): no snapshot is built.
+    pub(crate) fn apply_delta(&mut self, edit: EditOp, after_len: usize) -> Revision {
+        if self.context_origin.is_some() || self.position().is_some_and(|n| n.editor.is_some()) {
+            self.seal_current();
+        }
+        self.apply_with_coalescing(edit, NodeText::Delta { after_len }, true, false)
+    }
+
+    /// One explicit typing run, independent of the ordinary idle timer
+    /// (eager snapshot representation; tests/legacy).
     pub fn apply_context(
         &mut self,
         edit: EditOp,
@@ -709,20 +819,15 @@ impl UndoTree {
         if self.position().is_some_and(|node| node.editor.is_some()) {
             self.seal_current();
         }
-        self.apply_context_inner(edit, snapshot, origin)
+        self.apply_context_inner(edit, NodeText::Materialized(snapshot), origin)
     }
 
-    fn apply_context_inner(
-        &mut self,
-        edit: EditOp,
-        snapshot: TextSnapshot,
-        origin: u128,
-    ) -> Revision {
+    fn apply_context_inner(&mut self, edit: EditOp, text: NodeText, origin: u128) -> Revision {
         if self.context_origin != Some(origin) {
             self.seal_current();
         }
         self.context_origin = Some(origin);
-        self.apply_with_coalescing(edit, snapshot, true, true)
+        self.apply_with_coalescing(edit, text, true, true)
     }
 
     /// Apply a distinct operation that must start a new undo-tree node.
@@ -731,13 +836,13 @@ impl UndoTree {
     pub fn apply_boundary(&mut self, mut edit: EditOp, snapshot: TextSnapshot) -> Revision {
         edit.boundary = true;
         self.context_origin = None;
-        self.apply_with_coalescing(edit, snapshot, false, false)
+        self.apply_with_coalescing(edit, NodeText::Materialized(snapshot), false, false)
     }
 
     fn apply_with_coalescing(
         &mut self,
         edit: EditOp,
-        snapshot: TextSnapshot,
+        text: NodeText,
         allow_coalescing: bool,
         continuous: bool,
     ) -> Revision {
@@ -769,24 +874,19 @@ impl UndoTree {
             // RFC-0008 S4 (D4): merge by coordinate mapping — no snapshot diff.
             // The pure table handles adjacent/contained compositions; a
             // gap-spanning continuous merge borrows only the gap slice from
-            // the parent snapshot (O(gap), never an O(document) scan).
-            let coalesced = self
-                .nodes
-                .get(position_id as usize)
-                .and_then(|node| node.edit.as_ref())
-                .and_then(|current| {
-                    if let Some(op) = merge_mapped(current, &edit) {
-                        return Some(op);
-                    }
-                    let parent_text = self
-                        .get(position_id)
-                        .and_then(|node| node.parent_id)
-                        .and_then(|id| self.get(id))
-                        .and_then(|node| node.snapshot.as_ref())
-                        .map(TextSnapshot::text);
-                    parent_text
-                        .and_then(|text| merge_mapped_with_source(current, &edit, Some(text)))
-                });
+            // the parent text (O(gap), never an O(document) scan).
+            let coalesced = {
+                let current = self.nodes[position_id as usize].edit.clone();
+                let Some(current) = current else {
+                    return self.nodes[position_id as usize].revision;
+                };
+                if let Some(op) = merge_mapped(&current, &edit) {
+                    Some(op)
+                } else {
+                    self.materialize_parent_text(position_id)
+                        .and_then(|text| merge_mapped_with_source(&current, &edit, Some(&text)))
+                }
+            };
             if let Some(coalesced) = coalesced {
                 {
                     let node = self
@@ -806,9 +906,10 @@ impl UndoTree {
                         }
                     }
                     node.edit = Some(coalesced);
-                    node.snapshot = Some(snapshot);
+                    node.snapshot = Some(text);
                     node.timestamp = Instant::now();
                 }
+                self.enforce_retention_floor(position_id);
                 self.reaccount();
                 self.auto_evict_if_over_budget(wall_clock_ms());
                 return self.nodes[position_id as usize].revision;
@@ -822,7 +923,7 @@ impl UndoTree {
         let new_id = self.next_id;
         self.next_id += 1;
         let new_revision = current_node.revision.next();
-        let mut new_node = UndoNode::new(new_id, new_revision, edit, parent_id, snapshot);
+        let mut new_node = UndoNode::new(new_id, new_revision, edit, parent_id, text);
         if new_node.segment.is_none() {
             new_node.segment = current_node.segment;
         }
@@ -834,10 +935,98 @@ impl UndoTree {
         self.nodes.push(new_node);
         self.preferred_tip = new_id;
         self.position_id = new_id;
+        self.enforce_retention_floor(new_id);
         self.reaccount();
         self.auto_evict_if_over_budget(wall_clock_ms());
         new_revision
     }
+    /// Materialize `id`'s text on demand (RFC-0008 D5): walk to the nearest
+    /// `Materialized` ancestor (bounded by the retention floor), compose the
+    /// chain into one edit in ancestor coordinates, run the serialization
+    /// pipeline once, and memoize the resulting snapshot in place.
+    pub(crate) fn materialize_at(&mut self, id: u64) -> Option<&TextSnapshot> {
+        if matches!(
+            self.nodes[id as usize].snapshot.as_ref()?,
+            NodeText::Materialized(_)
+        ) {
+            return self.nodes[id as usize]
+                .snapshot
+                .as_ref()
+                .and_then(|t| match t {
+                    NodeText::Materialized(snapshot) => Some(snapshot),
+                    NodeText::Delta { .. } => None,
+                });
+        }
+        let mut ops: Vec<EditOp> = Vec::new();
+        let mut cursor = id;
+        let ancestor = loop {
+            let node = self.get(cursor)?;
+            match node.snapshot.as_ref() {
+                Some(NodeText::Materialized(_)) => break cursor,
+                Some(NodeText::Delta { .. }) => {
+                    ops.push(node.edit.clone()?);
+                    cursor = node.parent_id?;
+                }
+                // Evicted/collapsed links have no snapshot (and no edits):
+                // skip to the nearest survivor, same semantics as undo/redo
+                // navigation.
+                None => {
+                    cursor = self.nearest_surviving_ancestor(cursor)?;
+                }
+            }
+        };
+        ops.reverse(); // ancestor -> descendant application order
+        let depth = ops.len();
+        let _materialize_span = tracing::debug_span!("undo.materialize", depth).entered();
+        debug_assert!(
+            depth <= 64,
+            "retention-floor walk exceeded 64 steps (got {depth})"
+        );
+        let parent_snapshot = self.nodes[ancestor as usize].snapshot.as_ref()?.clone();
+        let NodeText::Materialized(parent_snapshot) = parent_snapshot else {
+            unreachable!("ancestor is materialized");
+        };
+        // Replay the chain through the interactive path's exact EOL splice,
+        // one serialization pipeline at the end (RFC-0008 D5).
+        let mut text = parent_snapshot.text().to_string();
+        let mut table = crate::eol::EolTable::from_snapshot(&parent_snapshot);
+        for op in &ops {
+            replay_eol_splice(&mut table, &text, op);
+            text = op.apply(&text);
+        }
+        // Consistency check: the composed single edit (when it exists) must
+        // produce the same text as sequential application.
+        if let Some(composed) = compose_chain(&ops, parent_snapshot.text()) {
+            debug_assert_eq!(composed.apply(parent_snapshot.text()), text);
+        }
+        let snapshot = build_snapshot_from_text_and_table(&text, &table, parent_snapshot.format());
+        self.nodes[id as usize].snapshot = Some(NodeText::Materialized(snapshot));
+        self.nodes[id as usize]
+            .snapshot
+            .as_ref()
+            .and_then(|t| match t {
+                NodeText::Materialized(snapshot) => Some(snapshot),
+                NodeText::Delta { .. } => None,
+            })
+    }
+
+    /// Materialize the parent text of `id` (gap-bridging for continuous
+    /// merges), or `None` when the parent is unavailable/evicted.
+    fn materialize_parent_text(&mut self, id: u64) -> Option<String> {
+        let parent_id = self.get(id)?.parent_id?;
+        let parent = self.materialize_at(parent_id)?;
+        Some(parent.text().to_string())
+    }
+
+    /// The every-64 retention floor (RFC-0008 D5/FR-5): nodes whose id is a
+    /// multiple of 64 are materialized at install time, bounding subsequent
+    /// materialization walks to 64 steps regardless of burst length.
+    fn enforce_retention_floor(&mut self, id: u64) {
+        if id.is_multiple_of(64) {
+            let _ = self.materialize_at(id);
+        }
+    }
+
     /// Preserve a save/semantic boundary without adding a document edit.
     pub fn seal_current(&mut self) {
         self.context_origin = None;
@@ -859,10 +1048,8 @@ impl UndoTree {
         let current = self.position()?;
         current.parent_id?;
         let parent_id = self.nearest_surviving_ancestor(current.id)?;
-        let (parent_revision, snapshot) = {
-            let parent = self.survivor(parent_id)?;
-            (parent.revision, parent.snapshot.clone()?)
-        };
+        let snapshot = self.materialize_at(parent_id)?.clone();
+        let parent_revision = self.survivor(parent_id)?.revision;
         self.position_id = parent_id;
         self.generation += 1;
         Some((parent_revision, Some(snapshot)))
@@ -876,11 +1063,13 @@ impl UndoTree {
     /// The caller (model) is responsible for advancing the revision (§4.5.2).
     pub fn redo(&mut self) -> Option<(Revision, Option<TextSnapshot>)> {
         self.seal_current();
-        let child = self.get(self.redo_target()?)?;
-        let result = (child.revision, Some(child.snapshot.clone()?));
-        self.position_id = child.id;
+        let child_id = self.redo_target()?;
+        let child = self.get(child_id)?;
+        let revision = child.revision;
+        let snapshot = self.materialize_at(child_id)?.clone();
+        self.position_id = child_id;
         self.generation += 1;
-        Some(result)
+        Some((revision, Some(snapshot)))
     }
     /// Move to a specific node.
     fn goto(&mut self, id: u64) -> bool {
@@ -916,10 +1105,10 @@ impl UndoTree {
     /// `spans` is the original batch geometry (E-13); it rides only a fresh
     /// node — a coalesced install recomputed its edit from the before/after
     /// diff, which is already exact.
-    pub fn apply_recorded(
+    pub(crate) fn apply_recorded(
         &mut self,
         edit: EditOp,
-        snapshot: TextSnapshot,
+        text: NodeText,
         policy: UndoPolicy,
         record: EditorEdit,
         spans: &[SpanEdit],
@@ -932,13 +1121,20 @@ impl UndoTree {
             self.seal_current();
         }
         let revision = match policy {
-            UndoPolicy::Isolated => self.apply_boundary(edit, snapshot),
-            UndoPolicy::Context { origin } => self.apply_context_inner(edit, snapshot, origin),
+            UndoPolicy::Isolated => {
+                // Isolated installs are materialized boundaries (FR-5); the
+                // model supplies the snapshot.
+                let NodeText::Materialized(snapshot) = text else {
+                    unreachable!("isolated installs carry a materialized snapshot");
+                };
+                self.apply_boundary(edit, snapshot)
+            }
+            UndoPolicy::Context { origin } => self.apply_context_inner(edit, text, origin),
             UndoPolicy::Typing => {
                 if self.context_origin.is_some() {
                     self.seal_current();
                 }
-                self.apply_with_coalescing(edit, snapshot, true, false)
+                self.apply_with_coalescing(edit, text, true, false)
             }
         };
         self.install_batch_geometry(spans);
@@ -957,28 +1153,33 @@ impl UndoTree {
 
     /// Install one prepared batch under `policy`, retaining the original
     /// per-op geometry for each step, including coalesced steps (E-13).
-    pub fn apply_batch(
+    pub(crate) fn apply_batch(
         &mut self,
         edit: EditOp,
-        snapshot: TextSnapshot,
+        text: NodeText,
         policy: UndoPolicy,
         spans: &[SpanEdit],
     ) -> Revision {
         let revision = match policy {
-            UndoPolicy::Isolated => self.apply_boundary(edit, snapshot),
+            UndoPolicy::Isolated => {
+                let NodeText::Materialized(snapshot) = text else {
+                    unreachable!("isolated installs carry a materialized snapshot");
+                };
+                self.apply_boundary(edit, snapshot)
+            }
             UndoPolicy::Context { origin } => {
                 // Unannotated batches cannot extend a recorded editor
                 // operation (same guard as `apply_context`).
                 if self.position().is_some_and(|node| node.editor.is_some()) {
                     self.seal_current();
                 }
-                self.apply_context_inner(edit, snapshot, origin)
+                self.apply_context_inner(edit, text, origin)
             }
             UndoPolicy::Typing => {
                 if self.context_origin.is_some() {
                     self.seal_current();
                 }
-                self.apply_with_coalescing(edit, snapshot, true, false)
+                self.apply_with_coalescing(edit, text, true, false)
             }
         };
         self.install_batch_geometry(spans);
@@ -1110,7 +1311,10 @@ impl UndoTree {
 
     /// Prepare before changing the head. Tagged filesystem obligations may
     /// only be crossed by the Session's existing single-step Undo/Redo path.
-    pub fn restore_snapshot(&self, target: HistoryTarget) -> Result<TextSnapshot, HistoryError> {
+    pub fn restore_snapshot(
+        &mut self,
+        target: HistoryTarget,
+    ) -> Result<TextSnapshot, HistoryError> {
         let node = self.survivor(target.node).ok_or(HistoryError::Expired)?;
         if node.version != target.version {
             return Err(HistoryError::Expired);
@@ -1118,7 +1322,9 @@ impl UndoTree {
         if self.segment(target.node) != self.segment(self.position_id) {
             return Err(HistoryError::JournalBoundary);
         }
-        node.snapshot.clone().ok_or(HistoryError::Expired)
+        self.materialize_at(target.node)
+            .cloned()
+            .ok_or(HistoryError::Expired)
     }
 
     pub(crate) fn restore_position(&mut self, id: u64) {
@@ -1649,9 +1855,10 @@ mod tests {
                 origin = Some(view);
                 text = next;
                 proptest::prop_assert_eq!(tree.depth(), states.len() - 1);
-                let current = tree.current().unwrap();
-                let parent = tree.get(current.parent_id.unwrap()).unwrap().snapshot.as_ref().unwrap().text();
-                proptest::prop_assert_eq!(current.edit.as_ref().unwrap().apply(parent), text.clone());
+                let current_edit = tree.current().unwrap().edit.clone().unwrap();
+                let parent_id = tree.current().unwrap().parent_id.unwrap();
+                let parent_text = tree.materialize_at(parent_id).unwrap().text().to_string();
+                proptest::prop_assert_eq!(current_edit.apply(&parent_text), text.clone());
             }
             for expected in states[..states.len()-1].iter().rev() {
                 let snapshot = tree.undo().unwrap().1.unwrap();
@@ -1778,6 +1985,67 @@ mod tests {
             .expect("distant insert merges with source");
         assert_eq!(merged.apply(parent), "aXbcY");
         assert_eq!(merged.replacement, "XbcY");
+    }
+
+    #[test]
+    fn compose_chain_matches_sequential_application_and_rejects_overlap() {
+        // S5-T2: compose_chain over chains ≤64 equals sequential application;
+        // invalid geometry returns None (fallback path).
+        // Deterministic mixed chain.
+        let base = "abcdef";
+        let ops = vec![
+            EditOp::new(Span::new(TextByte(2), TextByte(2)), "XY".into()),
+            EditOp::new(Span::new(TextByte(4), TextByte(4)), "Z".into()),
+            EditOp::new(Span::new(TextByte(5), TextByte(6)), "".into()),
+        ];
+        let mut sequential = base.to_string();
+        for op in &ops {
+            sequential = op.apply(&sequential);
+        }
+        let composed = compose_chain(&ops, base).expect("chain composes");
+        assert_eq!(composed.apply(base), sequential);
+        // Overlap / invalid geometry: reversed range yields None.
+        let bad = EditOp::new(Span::new(TextByte(7), TextByte(3)), "x".into());
+        assert_eq!(compose_chain(&[ops[0].clone(), bad], base), None);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64, ..proptest::test_runner::Config::default()
+        })]
+
+        /// S5-T2 (randomized): `compose_chain` equals sequential application
+        /// on chains ≤64.
+        #[test]
+        fn randomized_chains_compose_like_sequential_application(
+            base in "[a-zA-Z]{0,16}",
+            steps in proptest::collection::vec(
+                (0usize..40, 0usize..40, ".{0,6}"),
+                1..32,
+            ),
+        ) {
+            let mut text = base.clone();
+            let mut ops: Vec<EditOp> = Vec::new();
+            for (x, y, repl) in steps {
+                let len = text.len();
+                let mut a = x % (len + 1);
+                while !text.is_char_boundary(a) {
+                    a -= 1;
+                }
+                let mut b = (a + y % (len + 1 - a)).min(len);
+                while b < len && !text.is_char_boundary(b) {
+                    b += 1;
+                }
+                let op = EditOp::new(Span::new(TextByte(a), TextByte(b)), repl);
+                ops.push(op.clone());
+                text = op.apply(&text);
+            }
+            if let Some(composed) = compose_chain(&ops, &base) {
+                proptest::prop_assert_eq!(composed.apply(&base), text);
+            }
+            // No chain may exceed the retention-floor walk length.
+            proptest::prop_assert!(ops.len() <= 64);
+        }
     }
 
     #[test]

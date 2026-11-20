@@ -80,6 +80,13 @@ fn model_keystroke_cost_tracks_the_reference_table() {
     println!("doc_bytes,keystroke_ms_p50,keystroke_ms_p90,undo_burst_ms,boundary_ms");
     for size in [2 * 1024, 100 * 1024, 1024 * 1024, 5 * 1024 * 1024] {
         let mut model = model_of(size);
+        // A generous budget isolates the keystroke/undo measurements from
+        // eviction churn (eviction semantics are covered by the budget and
+        // ceiling benches separately).
+        model.set_history_budget(flavite_buffer::budget::Budget {
+            max_bytes: 8 * 1024 * 1024 * 1024,
+            max_nodes: 2_000,
+        });
         for _ in 0..10 {
             type_char(&mut model);
         } // warm-up: lazy statics + callsite interest
@@ -121,13 +128,35 @@ fn model_keystroke_cost_tracks_the_reference_table() {
                 "keystroke p50 {:.4} ms > 5× baseline {baseline} ms at {size} bytes",
                 ms(p50)
             );
-            // §3.2: undo of a coalesced burst 0.55–3.2 ms @1–5 MB.
-            let undo_baseline = if size >= 1024 * 1024 { 3.2 } else { 0.55 };
+            // RFC-0008 NFR-2 (post-S5): the interactive model path builds no
+            // snapshot/serialization artifacts, so keystroke model cost is
+            // ≤0.6 ms @1 MB and ≤1.2 ms @5 MB (hard gates on the reference
+            // machine).
+            if size >= 1024 * 1024 {
+                let budget = if size >= 5 * 1024 * 1024 { 1.2 } else { 0.6 };
+                assert!(
+                    ms(p50) <= budget,
+                    "keystroke model p50 {:.4} ms > NFR-2 {budget} ms at {size} bytes",
+                    ms(p50)
+                );
+            }
+            // §3.2: undo of a coalesced burst 0.55–3.2 ms @1–5 MB (pre-S5);
+            // RFC-0008 NFR-4 post-S5: ≤5 ms @1 MB including one
+            // materialization (hard gate, generous wall on the reference
+            // machine).
+            let undo_baseline = if size >= 1024 * 1024 { 6.0 } else { 0.55 };
             assert!(
                 ms(undo_burst) <= undo_baseline * 5.0,
                 "undo burst {:.4} ms > 5× baseline {undo_baseline} ms at {size} bytes",
                 ms(undo_burst)
             );
+            if size >= 1024 * 1024 {
+                assert!(
+                    ms(undo_burst) <= 6.0,
+                    "undo burst {:.4} ms > NFR-4 wall 6 ms at {size} bytes (target 5)",
+                    ms(undo_burst)
+                );
+            }
             // §3.2: boundary install 3.3–6.4 ms @1 MB; smaller docs scale down.
             let boundary_baseline = match size {
                 s if s <= 2 * 1024 => 0.05,
