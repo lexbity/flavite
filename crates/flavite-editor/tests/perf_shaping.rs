@@ -97,6 +97,7 @@ fn keystroke_splice_cost_stays_sub_half_millisecond() {
         text: Arc::from(text.as_str()),
         path: PathBuf::from("note.md"),
         state: BufferState::Clean,
+        last_edit: None,
     };
     // One mid-line character edit at line 120: the keystroke splice case.
     let mut edited = text.clone();
@@ -106,6 +107,11 @@ fn keystroke_splice_cost_stays_sub_half_millisecond() {
     let edited_view = EditorView {
         revision: 2,
         text: Arc::from(edited.as_str()),
+        last_edit: Some(flavite_syntax::EditRange {
+            start: at,
+            old_end: at + 1,
+            new_end: at + 1,
+        }),
         ..base_view.clone()
     };
 
@@ -170,6 +176,7 @@ fn paint_collection_cost_stays_sub_millisecond() {
         text: Arc::from(text.as_str()),
         path: PathBuf::from("note.md"),
         state: BufferState::Clean,
+        last_edit: None,
     };
     let mut edited = text.clone();
     let target = "line 120 alpha";
@@ -178,6 +185,11 @@ fn paint_collection_cost_stays_sub_millisecond() {
     let edited_view = EditorView {
         revision: 2,
         text: Arc::from(edited.as_str()),
+        last_edit: Some(flavite_syntax::EditRange {
+            start: at,
+            old_end: at + 1,
+            new_end: at + 1,
+        }),
         ..base_view.clone()
     };
 

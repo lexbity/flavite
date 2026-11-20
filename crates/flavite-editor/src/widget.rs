@@ -631,17 +631,23 @@ impl<'a, Message> EditorWidget<'a, Message> {
 pub(crate) const HUGE_TEXT_THRESHOLD: usize = 64 * 1024 * 1024;
 
 /// Documents above this size use the pulldown bridge (`spans_from_pulldown`)
-/// instead of the incremental structure engine. Measured 2026-11-19:
-/// tree-sitter-md's incremental reparses scale at ≈0.6–0.7× a full parse
-/// (they do not localize to the damaged region on this grammar), so the
-/// engine is the right path for typical notes and the bridge preserves
-/// known-good latency for large documents. The paged-buffer RFC replaces
-/// both with segmented incremental parsing.
+/// instead of the incremental structure engine **when the engine is
+/// enabled**. Measured 2026-11-19 (release, RFC-0008 Appendix C):
+/// tree-sitter-md's incremental reparses are not local — they scale at
+/// ≈0.6–0.7× a full parse and trip the D10 coherence guard near grammar
+/// boundaries (p99 ≈166 ms at 64 KiB vs ≈1.4 ms for prose edits), so the
+/// engine is not budget-meeting. The bridge is the default route for all
+/// documents; the engine remains selectable behind `FLAVITE_TS_STRUCTURE=1`.
+/// The paged-buffer RFC replaces both with segmented incremental parsing.
 pub(crate) const STRUCTURE_ENGINE_MAX_BYTES: usize = 64 * 1024;
 
-/// Whether the tree-sitter structure path is enabled (RFC-0008 FR-8).
-/// Default ON after the stage-C flip; `FLAVITE_TS_STRUCTURE=0` is the
-/// documented rollback escape hatch (structure spans are dropped entirely).
+/// Whether the tree-sitter structure engine is enabled (RFC-0008 FR-8).
+/// **Default OFF** (RFC-0008 Appendix C): the engine is correct — AC-5
+/// parity is proven — but does not meet NFR-5 with the current grammars,
+/// so the pulldown bridge (pre-RFC-equivalent spans and latency) is the
+/// shipping structure source. `FLAVITE_TS_STRUCTURE=1` enables the
+/// engineered incremental path for typical notes (≤
+/// [`STRUCTURE_ENGINE_MAX_BYTES`]); `=0` or unset routes the bridge.
 /// Read per revision change — a getenv lookup, O(1), no allocation when
 /// unset; deliberately not cached in a `OnceLock` so tests can flip the
 /// escape hatch deterministically between calls.
@@ -649,8 +655,37 @@ fn ts_structure_enabled() -> bool {
     // Explicit match: clippy prefers `is_none_or`, which is stable only on
     // 1.91 and the workspace MSRV is 1.90.
     match std::env::var_os("FLAVITE_TS_STRUCTURE") {
-        None => true,
-        Some(value) => value != "0",
+        None => false,
+        Some(value) => value == "1",
+    }
+}
+
+/// The pulldown bridge: the shipped default structure source (RFC-0008
+/// Appendix C). Same parser and converter that the pre-RFC `scan_note` path
+/// used — parity-proven against the tree-sitter path (AC-5) — so default
+/// routing preserves known-good spans and latency at every document size
+/// under the plain-mode gate.
+fn bridge_structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
+    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
+        return (Vec::new(), Vec::new());
+    };
+    crate::links::spans_from_pulldown(parsed)
+}
+
+/// The incremental structure engine path (RFC-0008 D7-C) — full parse on
+/// first sync/reload, `InputEdit`-driven incremental reparses otherwise,
+/// with the D10 coherence guard and plain-mode degradation.
+fn engine_structure_spans(
+    text: &str,
+    hint: Option<flavite_syntax::EditRange>,
+    lines: &[usize],
+    engine: &mut flavite_syntax::StructureEngine,
+) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
+    // D10: render never blocks on structure — a degraded or failed sync
+    // falls back to the bridge, never an error path.
+    match engine.sync(text, lines, hint) {
+        Ok(spans) => crate::links::spans_from_structure(spans),
+        Err(_) => bridge_structure_spans(text),
     }
 }
 
@@ -659,36 +694,64 @@ fn ts_structure_enabled() -> bool {
 /// * **Plain mode** (FR-9): documents ≥ [`HUGE_TEXT_THRESHOLD`] skip all
 ///   markdown parsing — no pulldown, no tree-sitter, no spans. Editing,
 ///   undo, find, and save are unaffected.
-/// * **Escape hatch** (`FLAVITE_TS_STRUCTURE=0`): structure spans are
-///   dropped entirely (safe rollback).
-/// * **Default, typical notes** (≤ [`STRUCTURE_ENGINE_MAX_BYTES`]): the
-///   incremental structure engine (D7-C) — full parse on first sync/reload,
-///   `InputEdit`-driven incremental reparses otherwise, with the D10
-///   coherence guard and plain-mode degradation.
-/// * **Default, large documents**: the pulldown bridge (same converter the
-///   S7 flag-on path used) preserves known-good latency until the paged
-///   buffer RFC replaces both paths.
+/// * **Default**: the pulldown bridge ([`bridge_structure_spans`]) — the
+///   pre-RFC-equivalent structure source, at every size under the plain
+///   gate.
+/// * **Engine enabled** (`FLAVITE_TS_STRUCTURE=1`): typical notes (≤
+///   [`STRUCTURE_ENGINE_MAX_BYTES`]) use the incremental structure engine
+///   (D7-C) with the D10 coherence guard; larger documents use the bridge.
 fn structure_spans(
     text: &str,
     hint: Option<flavite_syntax::EditRange>,
     lines: &[usize],
     engine: &mut flavite_syntax::StructureEngine,
 ) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
-    if text.len() >= HUGE_TEXT_THRESHOLD || !ts_structure_enabled() {
+    if text.len() >= HUGE_TEXT_THRESHOLD {
         (Vec::new(), Vec::new())
-    } else if text.len() > STRUCTURE_ENGINE_MAX_BYTES {
-        let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
-            return (Vec::new(), Vec::new());
-        };
-        crate::links::spans_from_pulldown(parsed)
+    } else if ts_structure_enabled() && text.len() <= STRUCTURE_ENGINE_MAX_BYTES {
+        engine_structure_spans(text, hint, lines, engine)
     } else {
-        // D10: render never blocks on structure — a degraded or failed sync
-        // yields empty spans, never an error path.
-        match engine.sync(text, lines, hint) {
-            Ok(spans) => crate::links::spans_from_structure(spans),
-            Err(_) => (Vec::new(), Vec::new()),
-        }
+        bridge_structure_spans(text)
     }
+}
+
+/// Test seam for the end-to-end keystroke bench (S8-T5): runs the exact
+/// same dispatch the widget uses on a revision change — plain-mode gate,
+/// escape hatch, pulldown bridge for large documents, incremental engine
+/// otherwise. Public only so `tests/` integration benches can measure the
+/// shipped configuration; not part of the editor's public API surface.
+#[doc(hidden)]
+#[must_use]
+pub fn structure_spans_for_perf(
+    text: &str,
+    hint: Option<flavite_syntax::EditRange>,
+    lines: &[usize],
+    engine: &mut flavite_syntax::StructureEngine,
+) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
+    structure_spans(text, hint, lines, engine)
+}
+
+/// Test seam for the S8-T5 bench: the engine path, measured directly and
+/// deterministically (independent of the env flag).
+#[doc(hidden)]
+#[must_use]
+pub fn engine_structure_spans_for_perf(
+    text: &str,
+    hint: Option<flavite_syntax::EditRange>,
+    lines: &[usize],
+    engine: &mut flavite_syntax::StructureEngine,
+) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
+    engine_structure_spans(text, hint, lines, engine)
+}
+
+/// Test seam for the S8-T5 bench: the bridge path, measured directly and
+/// deterministically.
+#[doc(hidden)]
+#[must_use]
+pub fn bridge_structure_spans_for_perf(
+    text: &str,
+) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
+    bridge_structure_spans(text)
 }
 
 /// Widget-local interaction state. Text and mutations remain Session-owned.
@@ -702,6 +765,10 @@ pub struct EditorState {
     /// Structure source (RFC-0008 D7-B): owned here, defined in
     /// flavite-syntax — the widget never links tree-sitter directly.
     structure: flavite_syntax::StructureEngine,
+    /// Whether the D10 degradation warning has been emitted for this widget
+    /// instance (RFC-0008 S8): the engine logs once at `warn` when it
+    /// degrades to plain mode after repeated forced rebuilds.
+    structure_plain_warned: bool,
     /// Source line lookup shared by caret mapping and viewport extraction.
     line_starts: Vec<usize>,
     line_text_addr: usize,
@@ -1651,6 +1718,17 @@ impl EditorState {
                 &self.line_starts,
                 &mut self.structure,
             );
+            // D10: warn once when the structure engine degrades to plain
+            // mode (spans dropped for the session). Rendering never blocks
+            // on structure — this is observability, not an error path.
+            if self.structure.is_plain() && !self.structure_plain_warned {
+                tracing::warn!(
+                    buffer_id = view.buffer_id,
+                    revision = view.revision,
+                    "structure engine degraded to plain mode after repeated rebuilds (RFC-0008 D10); spans dropped for the session"
+                );
+                self.structure_plain_warned = true;
+            }
             self.link_spans = link_spans;
             self.decorations = decorations;
             self.revision = Some(view.revision);
@@ -5195,38 +5273,41 @@ mod tests {
         assert_eq!(state.viewport.first_line, 0);
     }
 
-    /// S8-T4 (default-on integration): the structure engine's spans equal
-    /// the pulldown path on representative docs with the flag at its default
-    /// (on); the `FLAVITE_TS_STRUCTURE=0` escape hatch drops spans entirely.
+    /// S8-T4 (structure paths at the widget layer): the engine path's spans
+    /// equal the bridge path's spans equal the pulldown path's spans on
+    /// representative docs — the AC-5 parity through the exact dispatch
+    /// functions the widget uses, independent of the env flag (the engine
+    /// is enabled/disabled by env; both branches are tested directly).
     #[test]
-    fn structure_spans_default_on_matches_pulldown_and_hatch_drops() {
-        // Default on (no env override).
-        if std::env::var_os("FLAVITE_TS_STRUCTURE").is_none() {
-            assert!(ts_structure_enabled());
-        }
-
+    fn structure_spans_engine_and_bridge_paths_match_pulldown() {
         let docs = [
             "# H [[link]] #tag ^block\n\nBody with ![[embed.png]] and `[[code]]`.\n",
             "- item [[a]]\n- [x] task #t\n\n| [[c]] | d |\n|---|---|\n| e | [[f]] |\n",
             "> quote [[q]]\n\n```\n[[fenced]]\n```\n",
         ];
         for doc in docs {
-            let lines = shape_line_starts(doc);
-            let mut engine = flavite_syntax::StructureEngine::new();
-            let on = structure_spans(doc, None, &lines, &mut engine);
+            // The bridge path (the shipped default routing).
+            let bridge = bridge_structure_spans(doc);
+            assert!(!bridge.0.is_empty(), "bridge must yield links: {doc}");
             let parsed = flavite_syntax::pulldown_glue::parse_normalized(doc).unwrap();
             let pulldown = crate::links::spans_from_pulldown(parsed);
+            assert_eq!(bridge, pulldown, "bridge must equal pulldown: {doc}");
+
+            // The engine path (flag-enabled routing, first sync is full).
+            let lines = shape_line_starts(doc);
+            let mut engine = flavite_syntax::StructureEngine::new();
+            let engine_spans = engine_structure_spans(doc, None, &lines, &mut engine);
             assert_eq!(
-                on, pulldown,
-                "default-on structure spans must equal pulldown: {doc}"
+                engine_spans, pulldown,
+                "engine spans must equal pulldown: {doc}"
             );
-            assert!(!on.0.is_empty(), "doc must yield links: {doc}");
         }
     }
 
     /// S7-T4 (plain mode): ≥ 64 MiB documents yield zero spans even when the
     /// text is full of links; the same content below the threshold yields
     /// spans, proving the gate — not the parser — is what emptied the result.
+    /// The gate is flag-independent and precedes either structure source.
     #[test]
     fn structure_spans_plain_mode_gates_huge_documents() {
         let mut huge = String::with_capacity(HUGE_TEXT_THRESHOLD + 1024);
@@ -5244,11 +5325,10 @@ mod tests {
         );
 
         // Same content below the threshold does produce spans — the gate is
-        // length, not content.
+        // length, not content. Uses the bridge path directly so the proof
+        // does not depend on the engine flag.
         let small = &huge[..HUGE_TEXT_THRESHOLD - 1_000_000];
-        let small_lines = shape_line_starts(small);
-        let mut engine = flavite_syntax::StructureEngine::new();
-        let spans = structure_spans(small, None, &small_lines, &mut engine);
+        let spans = bridge_structure_spans(small);
         assert!(!spans.0.is_empty() && !spans.1.is_empty());
     }
 }
