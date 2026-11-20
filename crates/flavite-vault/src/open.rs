@@ -177,7 +177,15 @@ impl Vault {
                 "recovery",
             );
             Some(flavite_buffer::recovery::RecoveryWriter::new(
-                flavite_buffer::recovery::RecoveryConfig::new(identity.uuid.to_string(), dir, 2),
+                flavite_buffer::recovery::RecoveryConfig::new(
+                    identity.uuid.to_string(),
+                    dir,
+                    // RFC-0007 D-13: the vault document's
+                    // `vault.recovery_interval_secs` reaches the recovery
+                    // machinery here (clamped to ≥1s; 2 was the fixed
+                    // historical value).
+                    config.recovery_interval_secs.max(1),
+                ),
             ))
         };
         let executor = crate::journal::JournalExecutor::new(&*fs, &root);

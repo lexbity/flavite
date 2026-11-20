@@ -326,7 +326,7 @@ impl SettingsStore {
                             {
                                 if let Some(obj) = value.as_object() {
                                     // Map v1 device preferences to v2 settings
-                                    self.overlay_v1_device_preferences(
+                                    self.overlay_v1_legacy_preferences(
                                         registry,
                                         &mut doc,
                                         &mut warnings,
@@ -422,8 +422,9 @@ impl SettingsStore {
         }
     }
 
-    /// Overlay v1 device preferences (from device-preferences.json) onto the v2 document.
-    fn overlay_v1_device_preferences(
+    /// Overlay v1 legacy device preferences (from device-preferences.json)
+    /// onto the v2 document.
+    fn overlay_v1_legacy_preferences(
         &self,
         registry: &SettingRegistry,
         doc: &mut flavite_settings::document::SettingsDoc,
@@ -726,6 +727,54 @@ pub struct ResolvedSettings {
     pub warnings: Vec<String>,
 }
 
+/// Apply the resolved `[vault]` settings onto a caller-supplied
+/// [`VaultConfig`] (RFC-0007 D-13). Called before the vault actor is built
+/// so the OnRestart vault settings take effect at open.
+///
+/// Mapped fields: `verification_interval_mins` → `verification_interval`,
+/// `rename_behavior` → `rename_strategy`, `ignore_globs` →
+/// `ignore_globs`, `recovery_interval_secs` → `recovery_interval_secs`,
+/// `change_log_budget_mib` → `change_log_budget_mib`. Resolved values are
+/// registry-validated (invalid fields parse to defaults), so the only
+/// additional work here is bounding the glob list.
+pub(crate) fn apply_vault_settings(
+    config: &mut flavite_vault::types::VaultConfig,
+    resolved: &flavite_settings::resolve::Resolved,
+) {
+    config.verification_interval = std::time::Duration::from_secs(
+        resolved.int("vault.verification_interval_mins").max(1) as u64 * 60,
+    );
+    config.rename_strategy = match resolved.str("vault.rename_behavior").as_str() {
+        "alias" => flavite_vault::types::RenameStrategy::Alias,
+        "none" => flavite_vault::types::RenameStrategy::None,
+        _ => flavite_vault::types::RenameStrategy::Rewrite,
+    };
+    config.ignore_globs = sanitize_globs(resolved.list("vault.ignore_globs"));
+    config.recovery_interval_secs = resolved.int("vault.recovery_interval_secs").max(1) as u64;
+    config.change_log_budget_mib = resolved.int("vault.change_log_budget_mib").max(1) as u64;
+}
+
+/// Bounds `vault.ignore_globs` per D-12 (≤128 patterns, each ≤256 bytes,
+/// non-empty). Non-conforming patterns are dropped with a warning — never
+/// silently applied.
+fn sanitize_globs(globs: Vec<String>) -> Vec<String> {
+    const MAX_GLOBS: usize = 128;
+    const MAX_GLOB_BYTES: usize = 256;
+    let mut out = Vec::new();
+    for glob in globs {
+        if glob.is_empty() || glob.len() > MAX_GLOB_BYTES {
+            tracing::warn!(glob_len = glob.len(), "dropping out-of-bounds ignore glob");
+            continue;
+        }
+        if out.len() >= MAX_GLOBS {
+            tracing::warn!("dropping ignore globs beyond the {}-entry bound", MAX_GLOBS);
+            break;
+        }
+        out.push(glob);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,5 +907,92 @@ mod tests {
                 .join(".flavite")
                 .join("settings.toml")
         );
+    }
+
+    #[test]
+    fn apply_vault_settings_defaults_equal_config_defaults() {
+        let registry = SettingRegistry::with_builtins();
+        let doc = defaults_document(&registry);
+        let resolved = registry.resolve(&doc);
+        let mut config = flavite_vault::types::VaultConfig::default();
+        apply_vault_settings(&mut config, &resolved);
+        assert_eq!(config, flavite_vault::types::VaultConfig::default());
+    }
+
+    #[test]
+    fn apply_vault_settings_maps_every_onrestart_field() {
+        let registry = SettingRegistry::with_builtins();
+        let mut doc = defaults_document(&registry);
+        doc.set(
+            "vault.verification_interval_mins",
+            SettingValue::Int(25),
+            &registry,
+        )
+        .expect("set");
+        doc.set(
+            "vault.rename_behavior",
+            SettingValue::Str("alias".into()),
+            &registry,
+        )
+        .expect("set");
+        doc.set(
+            "vault.ignore_globs",
+            SettingValue::List(vec!["scratch/**".into(), "*.tmp".into()]),
+            &registry,
+        )
+        .expect("set");
+        doc.set(
+            "vault.recovery_interval_secs",
+            SettingValue::Int(7),
+            &registry,
+        )
+        .expect("set");
+        doc.set(
+            "vault.change_log_budget_mib",
+            SettingValue::Int(128),
+            &registry,
+        )
+        .expect("set");
+        let resolved = registry.resolve(&doc);
+        let mut config = flavite_vault::types::VaultConfig::default();
+        apply_vault_settings(&mut config, &resolved);
+        assert_eq!(
+            config.verification_interval,
+            std::time::Duration::from_secs(25 * 60)
+        );
+        assert_eq!(
+            config.rename_strategy,
+            flavite_vault::types::RenameStrategy::Alias
+        );
+        assert_eq!(config.ignore_globs, vec!["scratch/**", "*.tmp"]);
+        assert_eq!(config.recovery_interval_secs, 7);
+        assert_eq!(config.change_log_budget_mib, 128);
+    }
+
+    #[test]
+    fn sanitize_globs_drops_nonconforming_patterns() {
+        let clean = sanitize_globs(vec![
+            "scratch/**".into(),
+            String::new(),
+            "x".repeat(257),
+            "*.tmp".into(),
+        ]);
+        assert_eq!(clean, vec!["scratch/**", "*.tmp"]);
+
+        // Bounded at 128 entries.
+        let many = (0..200).map(|i| format!("pat-{i}")).collect::<Vec<_>>();
+        let bounded = sanitize_globs(many);
+        assert_eq!(bounded.len(), 128);
+    }
+
+    #[test]
+    fn settings_read_works_when_flavite_dir_missing() {
+        // Pre-open config mapping reads the doc before `.flavite/` exists
+        // (fresh vault); it must resolve to None, never error.
+        let dir = tempfile::tempdir().expect("vault dir");
+        let fs: Box<dyn Fs + Send + Sync> = Box::new(MemFs::new());
+        let vault_store = VaultUserStateStore::new(fs, dir.path());
+        let store = SettingsStore::new(Arc::new(vault_store), true);
+        assert!(store.read().expect("read").is_none());
     }
 }

@@ -145,6 +145,12 @@ enum Commands {
         action: ThemeAction,
     },
 
+    /// Show and change vault settings (RFC-0007 S9 / AC-9).
+    Settings {
+        #[command(subcommand)]
+        action: SettingsAction,
+    },
+
     /// Durable vault replacement operations (RFC-0006 S08): apply a sealed
     /// preview, report job status, cancel, or resume.
     Replace {
@@ -366,11 +372,10 @@ impl CliRenameStrategy {
     }
 }
 
-/// CLI driver that uses flavite-api for all operations.
 /// Theme package actions (xpi themes). `Convert` is an offline tool that
-/// needs no vault; the other actions manage the vault's theme store
-/// (`<vault>/.flavite/themes/`) through the facade's typed `theme.*`
-/// commands.
+/// converts a theme package without a vault; the other actions manage the
+/// vault's theme store (`<vault>/.flavite/themes/`) through the facade's
+/// typed `theme.*` commands.
 #[derive(Subcommand, Debug)]
 enum ThemeAction {
     /// Convert a standard browser theme package into a `.flavite.xpi`.
@@ -398,6 +403,33 @@ enum ThemeAction {
     /// Remove an installed theme.
     Uninstall {
         /// The theme id.
+        id: String,
+    },
+}
+
+/// Settings actions (RFC-0007 S9 / AC-9). All actions require an opened
+/// vault; they drive the facade's `settings.*` commands.
+#[derive(Subcommand, Debug)]
+enum SettingsAction {
+    /// Show every setting (or one setting, when `id` is given).
+    Show {
+        /// Optional setting id (e.g. `editor.font_size`).
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+    },
+    /// Set a setting from a JSON value (bare words fall back to strings).
+    Set {
+        /// Setting id (e.g. `editor.font_size`).
+        #[arg(value_name = "ID")]
+        id: String,
+        /// JSON value (e.g. `16`, `"dark"`, `["*.tmp"]`).
+        #[arg(value_name = "VALUE")]
+        value: String,
+    },
+    /// Reset a setting to its descriptor default.
+    Reset {
+        /// Setting id (e.g. `editor.font_size`).
+        #[arg(value_name = "ID")]
         id: String,
     },
 }
@@ -902,6 +934,130 @@ impl CliDriver {
         let _ = flavite.settings_set("appearance.theme_package", value)?;
         println!("Theme selection saved: {}", id);
         Ok(())
+    }
+
+    /// Run one `settings.*` command on the facade and return its success
+    /// data (`(command_id, data)`). Failures — capability denials, CAS
+    /// conflicts, unknown ids, read-only vaults — surface as typed errors.
+    fn run_settings_command(
+        &self,
+        id: &'static str,
+        args: serde_json::Value,
+    ) -> Result<(String, serde_json::Value)> {
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("settings commands require an opened vault")?;
+        let request_id = flavite.command_registry().next_request_id();
+        let result = flavite.execute(Invocation::new(request_id, id, args, Origin::Cli));
+        let result = match result {
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            result => result,
+        };
+        match result {
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                Ok((id.to_owned(), success.data))
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                anyhow::bail!("{id} failed: {} ({})", error.message, error.code)
+            }
+            ExecutionResult::Rejected(rejected) => {
+                let message = rejected
+                    .message
+                    .unwrap_or_else(|| format!("{:?}", rejected.reason));
+                anyhow::bail!("{id} rejected: {message}");
+            }
+            other => anyhow::bail!("{id} did not complete: {other:?}"),
+        }
+    }
+
+    /// `flavite settings show/set/reset` (RFC-0007 AC-9).
+    fn run_settings(&self, action: SettingsAction) -> Result<()> {
+        match action {
+            SettingsAction::Show { id } => {
+                if let Some(id) = id {
+                    let (_, data) = self.run_settings_command(
+                        "settings.get",
+                        serde_json::json!({ "id": id }),
+                    )?;
+                    if self.json {
+                        println!("{}", serde_json::to_string(&data)?);
+                    } else {
+                        let value = data
+                            .get("value")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        println!("{id} = {}", serde_json::to_string(&value)?);
+                    }
+                } else {
+                    let (_, data) =
+                        self.run_settings_command("settings.list", serde_json::json!({}))?;
+                    if self.json {
+                        println!("{}", serde_json::to_string(&data)?);
+                    } else {
+                        match data.get("settings").and_then(serde_json::Value::as_array) {
+                            Some(entries) if entries.is_empty() => println!("No settings."),
+                            Some(entries) => {
+                                for entry in entries {
+                                    let entry_id = entry
+                                        .get("id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("?");
+                                    let value = entry
+                                        .get("value")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    let modified = entry
+                                        .get("modified")
+                                        .and_then(serde_json::Value::as_bool)
+                                        .unwrap_or(false);
+                                    let marker = if modified { "  (modified)" } else { "" };
+                                    println!(
+                                        "{entry_id} = {}{marker}",
+                                        serde_json::to_string(&value)?
+                                    );
+                                }
+                            }
+                            None => println!("{}", serde_json::to_string(&data)?),
+                        }
+                    }
+                }
+                Ok(())
+            }
+            SettingsAction::Set { id, value } => {
+                // Try JSON first; a bare word falls back to a JSON string.
+                let value = serde_json::from_str::<serde_json::Value>(&value)
+                    .unwrap_or(serde_json::Value::String(value));
+                let (_, data) = self.run_settings_command(
+                    "settings.set",
+                    serde_json::json!({ "id": id, "value": value }),
+                )?;
+                if self.json {
+                    println!("{}", serde_json::to_string(&data)?);
+                } else {
+                    let generation = data
+                        .get("generation")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    println!("{id} set (generation {generation})");
+                }
+                Ok(())
+            }
+            SettingsAction::Reset { id } => {
+                let (_, data) = self
+                    .run_settings_command("settings.reset", serde_json::json!({ "id": id }))?;
+                if self.json {
+                    println!("{}", serde_json::to_string(&data)?);
+                } else {
+                    let generation = data
+                        .get("generation")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    println!("{id} reset (generation {generation})");
+                }
+                Ok(())
+            }
+        }
     }
 
     fn run_encoding(&self, note: PathBuf, action: EncodingAction) -> Result<()> {
@@ -1632,6 +1788,11 @@ fn main() -> Result<()> {
                 driver.run_theme_command("theme.uninstall", serde_json::json!({ "id": id }))?;
             }
         },
+        Commands::Settings { action } => {
+            let vault_path = get_vault_path(None, cli.vault);
+            driver.open_vault(vault_path, cli.no_watch)?;
+            driver.run_settings(action)?;
+        }
         Commands::Info { path } => {
             let vault_path = get_vault_path(path, cli.vault);
             driver.open_vault(vault_path.clone(), cli.no_watch)?;

@@ -110,7 +110,7 @@ fn preference_edits_persist_and_reload_through_the_vault_document() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read stored settings")
         .expect("settings were written");
     assert_eq!(
@@ -181,7 +181,7 @@ fn unreadable_or_future_documents_disable_edits_instead_of_overwriting() {
         .expect("future schema written");
     let flavite = app.flavite.as_ref().unwrap();
     let stored = flavite
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read stored settings")
         .expect("settings present");
     assert!(stored.is_read_only(), "a future schema is read-only");
@@ -400,7 +400,7 @@ fn sidebar_presentation_persists_and_survives_a_fresh_host() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read stored settings")
         .expect("settings were written");
     assert_eq!(

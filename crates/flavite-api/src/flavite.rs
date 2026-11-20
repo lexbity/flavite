@@ -1078,6 +1078,11 @@ impl Flavite {
     ) -> Result<Self, FlaviteError> {
         let (generation_signal, generation_watch) = flavite_index::GenerationSignal::new();
         let data_dir_clone = data_dir.clone();
+        // RFC-0007 D-13: fold the vault document's resolved `[vault]`
+        // settings into the caller-supplied config BEFORE the vault actor
+        // is built (OnRestart fields take effect at open). A missing,
+        // unreadable, or schema-newer document leaves the config untouched.
+        let config = Self::vault_config_with_settings(&root, data_dir.as_deref(), config);
         let vault = Vault::open_with_data_dir_and_generation_signal(
             root,
             Box::new(flavite_fs::OsFs::new()),
@@ -1095,6 +1100,42 @@ impl Flavite {
         )?;
         flavite.owned_vault = Some(vault);
         Ok(flavite)
+    }
+
+    /// RFC-0007 D-13: map the vault document's resolved `[vault]` settings
+    /// onto a caller-supplied [`VaultConfig`] before the vault actor is
+    /// built.
+    ///
+    /// Only the OnRestart vault settings are folded in (see
+    /// [`crate::settings_store::apply_vault_settings`]). A missing document
+    /// (fresh vault), an unreadable one, or a schema-newer document
+    /// (read-only) leaves the config untouched — defaults equal
+    /// `VaultConfig::default()` by construction, so the identity case is
+    /// the common one.
+    fn vault_config_with_settings(
+        root: &Path,
+        data_dir: Option<&Path>,
+        mut config: VaultConfig,
+    ) -> VaultConfig {
+        let _ = data_dir; // migration runs in attach_services after open (idempotent)
+        let store = crate::settings_store::SettingsStore::new(
+            Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
+                Box::new(flavite_fs::OsFs::new()),
+                root,
+            )),
+            true,
+        );
+        let Ok(Some(stored)) = store.read() else {
+            return config;
+        };
+        if stored.read_only {
+            // Schema newer than this build: never interpret unknown shapes.
+            return config;
+        }
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+        let resolved = flavite_settings::resolve::RegistryResolve::resolve(&registry, &stored.doc);
+        crate::settings_store::apply_vault_settings(&mut config, &resolved);
+        config
     }
 
     /// Register built-in commands.
@@ -2132,7 +2173,7 @@ impl Flavite {
     ///
     /// Returns `None` if no settings document exists. Use `settings_read` for
     /// a resolved view with defaults.
-    pub fn read_settings_raw(
+    pub fn read_stored_settings(
         &self,
     ) -> Result<Option<crate::settings_store::StoredSettings>, FlaviteError> {
         self.settings_store.read().map_err(FlaviteError::from)

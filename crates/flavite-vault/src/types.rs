@@ -269,7 +269,7 @@ impl ReconcileSummary {
 }
 
 /// Configuration for the vault.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultConfig {
     /// Whether to enable watcher events.
     pub watcher_enabled: bool,
@@ -287,6 +287,19 @@ pub struct VaultConfig {
     pub pulse_channel_capacity: usize,
     /// Default strategy for note and attachment rename link handling.
     pub rename_strategy: RenameStrategy,
+    /// User glob patterns that exclude files from vault scans (RFC-0007
+    /// D-12). Applied at scan time in addition to the hardcoded
+    /// `.flavite` exclusion, which no user glob can override. Empty by
+    /// default; validated and bounded by the settings layer (≤128
+    /// patterns, each ≤256 bytes).
+    pub ignore_globs: Vec<String>,
+    /// Recovery-writer autosave interval in seconds (RFC-0007 D-13).
+    /// Owned by the recovery machinery, not the actor; default 2 (the
+    /// historical fixed value).
+    pub recovery_interval_secs: u64,
+    /// Change-log (durable history store) budget in MiB (RFC-0007 D-13).
+    /// Default 64, the registry default for `vault.change_log_budget_mib`.
+    pub change_log_budget_mib: u64,
 }
 
 /// Durable link handling selected for rename operations.
@@ -312,6 +325,9 @@ impl Default for VaultConfig {
             bulk_threshold: 500,
             pulse_channel_capacity: 1024,
             rename_strategy: RenameStrategy::Rewrite,
+            ignore_globs: Vec::new(),
+            recovery_interval_secs: 2,
+            change_log_budget_mib: 64,
         }
     }
 }

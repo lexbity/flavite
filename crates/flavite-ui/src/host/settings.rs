@@ -354,7 +354,7 @@ impl SettingsHost {
     /// or parse failure is an honest report with defaults rendered; the
     /// document is never overwritten by that fallback (D-11).
     pub fn load(&mut self, flavite: &Flavite) {
-        match flavite.read_settings_raw() {
+        match flavite.read_stored_settings() {
             Ok(Some(stored)) => {
                 let registry = SettingRegistry::with_builtins();
                 let read_only = stored.is_read_only() || flavite.is_read_only();
@@ -1034,7 +1034,7 @@ fn adopt_on_focus(app: &mut App) -> iced::Task<Message> {
     let changed = app
         .flavite
         .as_ref()
-        .is_some_and(|flavite| match flavite.read_settings_raw() {
+        .is_some_and(|flavite| match flavite.read_stored_settings() {
             Ok(Some(stored)) => stored.generation != app.settings.generation,
             Ok(None) => false,
             Err(_) => app.settings.load_error.is_none(),

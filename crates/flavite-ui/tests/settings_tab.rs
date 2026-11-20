@@ -306,7 +306,7 @@ fn scalar_edits_persist_apply_and_survive_reopen() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("written");
     assert_eq!(
@@ -430,7 +430,7 @@ fn unparseable_document_shows_restore_affordance_and_round_trips() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("restored");
     assert_eq!(
@@ -452,7 +452,7 @@ fn read_only_facade_refuses_edits_and_keeps_the_document() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("doc");
     app.flavite.as_mut().unwrap().set_read_only(true);
@@ -472,7 +472,7 @@ fn read_only_facade_refuses_edits_and_keeps_the_document() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("doc");
     assert_eq!(before.generation, after.generation, "document unchanged");
@@ -768,7 +768,7 @@ fn theme_package_management_flows_through_the_tab() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("doc");
     assert_ne!(

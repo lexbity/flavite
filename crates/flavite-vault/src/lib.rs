@@ -12,6 +12,7 @@ pub mod channels;
 pub mod coalesce;
 pub mod editor_receipts;
 pub mod encoding;
+pub mod glob;
 pub mod history;
 pub mod identity;
 pub mod instance;

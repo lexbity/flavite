@@ -1068,6 +1068,12 @@ pub struct VaultActor {
     watcher_connected: bool,
     initial_scan_complete: bool,
     verification_interval: std::time::Duration,
+    /// User glob patterns excluding paths from scans (RFC-0007 D-12);
+    /// applied to every reconcile job, enumeration and nominations alike.
+    ignore_globs: Vec<String>,
+    /// Durable history store budget in bytes (RFC-0007 D-13); set from
+    /// `VaultConfig::change_log_budget_mib` at build.
+    history_cap_bytes: u64,
     recent_watcher_rename_pairs:
         std::collections::HashSet<(std::path::PathBuf, std::path::PathBuf)>,
     reconcile_jobs: Option<Sender<Option<crate::reconcile_worker::ReconcileJob>>>,
@@ -1196,6 +1202,8 @@ impl VaultActor {
             watcher_connected: false,
             initial_scan_complete: false,
             verification_interval: std::time::Duration::from_secs(600),
+            ignore_globs: Vec::new(),
+            history_cap_bytes: crate::history::DEFAULT_HISTORY_CAP,
             recent_watcher_rename_pairs: std::collections::HashSet::new(),
             reconcile_jobs: None,
             reconcile_queue: None,
@@ -1317,6 +1325,7 @@ impl VaultActor {
                         id: job.id,
                         scope: &job.scope,
                         nominated: &job.nominated,
+                        ignore_globs: &job.ignore_globs,
                     };
                     let result = crate::reconcile_worker::scan(
                         &*worker_fs,
@@ -2119,8 +2128,10 @@ impl VaultActor {
         let result: Result<SaveReceipt, SaveFailure> = (|| {
             if self.history.is_none() {
                 let root = self.identity.root.join(".flavite").join("history");
-                self.history =
-                    Some(HistoryStore::open(self.fs.clone(), root).map_err(SaveFailure::from)?);
+                self.history = Some(
+                    HistoryStore::open_with_cap(self.fs.clone(), root, self.history_cap_bytes)
+                        .map_err(SaveFailure::from)?,
+                );
             }
             let history = self.history.as_mut().expect("history initialized");
             let old_base_hash = blake3::hash(&request.merge_base).to_hex().to_string();
@@ -2371,8 +2382,10 @@ impl VaultActor {
     fn history_store(&mut self) -> Result<&mut HistoryStore, String> {
         if self.history.is_none() {
             let root = self.identity.root.join(".flavite").join("history");
-            self.history =
-                Some(HistoryStore::open(self.fs.clone(), root).map_err(|error| error.to_string())?);
+            self.history = Some(
+                HistoryStore::open_with_cap(self.fs.clone(), root, self.history_cap_bytes)
+                    .map_err(|error| error.to_string())?,
+            );
         }
         Ok(self.history.as_mut().expect("history initialized"))
     }
@@ -2409,6 +2422,7 @@ impl VaultActor {
             mode,
             watermark: self.save_seq,
             nominated,
+            ignore_globs: self.ignore_globs.clone(),
             reply,
         };
         let initial_paths = self.index.indexed_note_paths().unwrap_or_default();
@@ -3540,6 +3554,8 @@ impl VaultActorBuilder {
         if let Some(config) = self.runtime_config {
             actor.watcher_enabled = config.watcher_enabled;
             actor.verification_interval = config.verification_interval;
+            actor.ignore_globs = config.ignore_globs;
+            actor.history_cap_bytes = config.change_log_budget_mib.saturating_mul(1024 * 1024);
             actor.coalescer = EventCoalescer::new(crate::coalesce::CoalescerConfig {
                 quiet_window: config.coalesce_quiet_window,
                 max_window: config.coalesce_max_window,
@@ -4473,6 +4489,7 @@ mod tests {
             mode: ReconcileMode::VerifyContent,
             watermark: 0,
             nominated: Default::default(),
+            ignore_globs: Vec::new(),
             reply: None,
         };
         let mut context = ReconcileContext {

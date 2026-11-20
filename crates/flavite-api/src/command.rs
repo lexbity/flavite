@@ -298,6 +298,9 @@ impl Invocation {
                 // Device-local theme management rides the same host trust
                 // level as device preferences, not the vault write scope.
                 Capability::Themes,
+                // Settings access rides the same host trust level; the
+                // vault document itself is the writable surface.
+                Capability::Settings,
             ],
         }
     }

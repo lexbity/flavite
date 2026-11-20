@@ -58,6 +58,8 @@ pub(crate) struct ReconcileJob {
     pub mode: ReconcileMode,
     pub watermark: u64,
     pub nominated: HashSet<PathBuf>,
+    /// User glob patterns excluding paths from scans (RFC-0007 D-12).
+    pub ignore_globs: Vec<String>,
     pub reply: Option<crossbeam::channel::Sender<crate::actor::VaultActorResp>>,
 }
 
@@ -69,6 +71,11 @@ pub struct ScanJob<'a> {
     pub id: u64,
     pub scope: &'a ReconcileScope,
     pub nominated: &'a HashSet<PathBuf>,
+    /// User glob patterns excluding paths from vault scans (RFC-0007
+    /// D-12). Applied to enumeration AND nominated observations; the
+    /// hardcoded `.flavite` plumbing exclusion is applied after these and
+    /// cannot be overridden.
+    pub ignore_globs: &'a [String],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +209,10 @@ pub fn scan(
     let full_scan = nominated.is_none();
     let (paths, traversal_incomplete) = if let Some(nominated) = nominated {
         (
+            // RFC-0007 D-12: user globs exclude nominated observations too
+            // (a watcher nomination must not smuggle an ignored file back
+            // into the index). The filter runs on the ordered vector so the
+            // emission stream stays order-deterministic across scan modes.
             nominated
                 .into_iter()
                 .map(|path| {
@@ -211,11 +222,12 @@ pub fn scan(
                         root.join(path)
                     }
                 })
+                .filter(|path| !is_ignored(root, path, job.ignore_globs))
                 .collect::<Vec<_>>(),
             false,
         )
     } else {
-        walk_paths(fs, root)
+        walk_paths(fs, root, job.ignore_globs)
     };
     let mut emitter = Emitter::new(
         job.id,
@@ -518,7 +530,7 @@ impl<'p> Emitter<'p> {
     }
 }
 
-fn walk_paths(fs: &dyn Fs, root: &Path) -> (Vec<PathBuf>, bool) {
+fn walk_paths(fs: &dyn Fs, root: &Path, ignore_globs: &[String]) -> (Vec<PathBuf>, bool) {
     let mut stack = vec![root.to_path_buf()];
     let mut paths = Vec::new();
     let mut incomplete = false;
@@ -531,16 +543,31 @@ fn walk_paths(fs: &dyn Fs, root: &Path) -> (Vec<PathBuf>, bool) {
             }
         };
         for entry in entries {
+            // User globs are checked first (RFC-0007 D-12); the hardcoded
+            // `.flavite` plumbing exclusion is applied after and cannot be
+            // overridden by any user glob.
+            let user_excluded = is_ignored(root, &entry.path, ignore_globs);
             if entry.is_dir {
-                if !entry.is_symlink && entry.name != ".flavite" {
+                if !entry.is_symlink && !user_excluded && entry.name != ".flavite" {
                     stack.push(entry.path);
                 }
-            } else if !entry.is_symlink {
+            } else if !entry.is_symlink && !user_excluded {
                 paths.push(entry.path);
             }
         }
     }
     (paths, incomplete)
+}
+
+/// Whether a path (absolute, under `root`) is excluded by any user glob.
+fn is_ignored(root: &Path, path: &Path, ignore_globs: &[String]) -> bool {
+    if ignore_globs.is_empty() {
+        return false;
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    crate::glob::matches_any(ignore_globs, relative)
 }
 
 #[cfg(test)]
