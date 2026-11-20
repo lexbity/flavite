@@ -72,7 +72,15 @@ pub struct ScannedSpan {
 ///
 /// A vector of [`ScannedSpan`]s in ascending byte order, non-overlapping.
 pub fn scan_inline(snapshot: &TextSnapshot, range: Range<usize>) -> Vec<ScannedSpan> {
-    let text = snapshot.text();
+    scan_inline_text(snapshot.text(), range)
+}
+
+/// Run the inline scanner over `text` within `range`.
+///
+/// Same semantics as [`scan_inline`], without needing a full [`TextSnapshot`]
+/// (the incremental structure engine rescans small damaged regions on the hot
+/// path and must not build an O(document) snapshot per keystroke).
+pub fn scan_inline_text(text: &str, range: Range<usize>) -> Vec<ScannedSpan> {
     let bytes = text.as_bytes();
 
     let start = range.start.min(text.len());

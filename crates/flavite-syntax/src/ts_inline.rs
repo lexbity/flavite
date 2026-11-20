@@ -44,10 +44,19 @@ pub(crate) fn parse_inline(text: &str) -> Option<Tree> {
 }
 
 /// Extend `excluded` with inline-grammar ranges that are not prose.
+/// Test-only: production paths use the parsed-tree variant.
+#[cfg(test)]
 pub(crate) fn extend_inline_exclusions(text: &str, excluded: &mut Vec<Range<usize>>) {
     let Some(tree) = parse_inline(text) else {
         return;
     };
+    extend_inline_exclusions_from_tree(&tree, excluded);
+}
+
+/// Extend `excluded` from an already-parsed inline tree. Used by the
+/// incremental structure engine, which owns the inline tree and must not
+/// re-parse the whole document per keystroke.
+pub(crate) fn extend_inline_exclusions_from_tree(tree: &Tree, excluded: &mut Vec<Range<usize>>) {
     let mut cursor = tree.root_node().walk();
     collect_inline_excluded_ranges(&mut cursor, excluded);
 }

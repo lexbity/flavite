@@ -10,7 +10,7 @@
 //! (`inline_link_anchor.md`) and the documentation file are excluded exactly
 //! as in the S6 parity harness.
 
-use flavite_editor::links::{scan_note, scan_note_ts};
+use flavite_editor::links::{spans_from_pulldown, ts_structure_spans};
 use std::fs;
 use std::path::PathBuf;
 
@@ -47,8 +47,10 @@ fn widget_structure_path_matches_pulldown_on_the_corpus() {
             .expect("fixture must be decodable")
             .text()
             .to_string();
-        let pulldown = scan_note(&text);
-        let ts = scan_note_ts(&text);
+        let parsed =
+            flavite_syntax::pulldown_glue::parse_normalized(&text).expect("pulldown parse");
+        let pulldown = spans_from_pulldown(parsed);
+        let ts = ts_structure_spans(&text);
         assert_eq!(
             ts,
             pulldown,

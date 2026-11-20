@@ -49,43 +49,41 @@ pub enum LinkResolution {
     NotApplicable,
 }
 
-/// Scan all non-code, non-HTML, non-math regions with the shared grammar.
-/// This follows the indexer's `parse_note` mask and therefore cannot invent an
-/// editor-only interpretation of link syntax.
+/// Scan links and decorations through the **tree-sitter** full-parse path
+/// (the S7 flag-on seam; S8 replaced the widget's use of this with the
+/// incremental `StructureEngine`). Kept for tests, diagnostics, and the
+/// rollback path: same types and scanner-shared semantics as the pulldown
+/// path; the parity corpus proves byte-identical ranges and kinds (AC-5).
 #[must_use]
-pub fn scan_links(text: &str) -> Vec<LinkSpan> {
-    scan_note(text).0
-}
-
-/// Scan links and decorations in one pass. The two views share the same
-/// canonical parse; running [`scan_links`] and [`scan_decorations`]
-/// separately parsed every keystroke's revision twice on the UI thread.
-#[must_use]
-pub fn scan_note(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
-    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
-        return (Vec::new(), Vec::new());
-    };
-    spans_from_parsed(parsed.links, parsed.tags, parsed.block_ids)
-}
-
-/// Scan links and decorations through the **tree-sitter** structure path
-/// (RFC-0008 S7, flag-on): spans replace `scan_note`'s output with the same
-/// types and scanner-shared semantics; the parity corpus proves byte-identical
-/// ranges and kinds (AC-5).
-#[must_use]
-pub fn scan_note_ts(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
+pub fn ts_structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
     let Ok(parsed) = flavite_syntax::ts_ranges::parse_note_ts(text.as_bytes()) else {
         return (Vec::new(), Vec::new());
     };
     spans_from_ts(parsed)
 }
 
-/// Convert a tree-sitter parse into the widget's span views. Public so the
-/// widget can drive the structure engine (`StructureEngine::sync`) and
-/// convert its output without re-parsing.
+/// Convert a tree-sitter full parse into the widget's span views.
 #[must_use]
 pub fn spans_from_ts(
     parsed: flavite_syntax::ts_ranges::TsParsedNote,
+) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
+    spans_from_parsed(parsed.links, parsed.tags, parsed.block_ids)
+}
+
+/// Convert the incremental structure engine's spans into the widget's views.
+#[must_use]
+pub fn spans_from_structure(
+    spans: flavite_syntax::structure::StructureSpans,
+) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
+    spans_from_parsed(spans.links, spans.tags, spans.block_ids)
+}
+
+/// Convert a pulldown parse into the widget's span views. The widget no
+/// longer depends on the pulldown parse path (S8); this converter exists for
+/// parity tests and diagnostics.
+#[must_use]
+pub fn spans_from_pulldown(
+    parsed: flavite_syntax::pulldown_glue::ParsedNote,
 ) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
     spans_from_parsed(parsed.links, parsed.tags, parsed.block_ids)
 }
@@ -142,13 +140,6 @@ pub fn resolve_link(span: &LinkSpan, verdict: Option<LinkResolution>) -> LinkRes
         return LinkResolution::NotApplicable;
     }
     verdict.unwrap_or(LinkResolution::Unresolved)
-}
-
-/// Canonical tag/block-ID decorations; links are supplied by [`scan_links`].
-/// Code, math, HTML, and frontmatter are excluded by the shared parser.
-#[must_use]
-pub fn scan_decorations(text: &str) -> Vec<ScannedSpan> {
-    scan_note(text).1
 }
 
 /// Rank a bounded in-memory candidate list by subsequence match. The host
@@ -209,7 +200,7 @@ mod tests {
     fn decorations_match_canonical_structure_without_rescanning_links() {
         let text = "---\ntitle: '#hidden'\n---\n# Heading\n\n[[a*b*|label]] #visible ^block\n\n`#code`\n\n$#math$\n\n<div>#html</div>\n";
         let parsed = flavite_syntax::pulldown_glue::parse_normalized(text).unwrap();
-        let (links, decorations) = scan_note(text);
+        let (links, decorations) = spans_from_pulldown(parsed.clone());
         assert_eq!(links.len(), parsed.links.len());
         let tags: Vec<_> = decorations
             .iter()
@@ -245,13 +236,15 @@ mod tests {
     }
 
     #[test]
-    fn scan_note_matches_the_individual_scans() {
-        // The combined pass exists so a keystroke parses the document once;
-        // it must return exactly what the two single-purpose scans return.
+    fn ts_full_path_matches_pulldown_conversion() {
+        // The two converters (ts full path vs pulldown) must agree on the
+        // same spans — the widget's flag-on path equivalence (AC-5).
         let text = "[[Ideas]] `[[code]]`\n\n```md\n[[fence]]\n```\n\n$[[math]]$ ![[diagram.png]] #topic ^block\n\n*emphasis* and **strong** with [[Another]]".repeat(20);
-        let (links, decorations) = scan_note(&text);
-        assert_eq!(links, scan_links(&text));
-        assert_eq!(decorations, scan_decorations(&text));
+        let (links, decorations) = ts_structure_spans(&text);
+        let parsed = flavite_syntax::pulldown_glue::parse_normalized(&text).unwrap();
+        let (p_links, p_decorations) = spans_from_pulldown(parsed);
+        assert_eq!(links, p_links);
+        assert_eq!(decorations, p_decorations);
         assert!(!links.is_empty());
         assert!(!decorations.is_empty());
     }
@@ -261,7 +254,7 @@ mod tests {
         // A closed wikilink whose target has no indexed note still scans as
         // a link (the graph's grey node and the create-from-link flow both
         // key off this payload); spaces in the target are legal.
-        let links = scan_links("# Alpha\n\nalpha body\n[[zz test]]");
+        let links = ts_structure_spans("# Alpha\n\nalpha body\n[[zz test]]").0;
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].payload.target_raw, "zz test");
         assert!(!links[0].embed);
@@ -270,13 +263,12 @@ mod tests {
     #[test]
     fn links_and_decorations_use_shared_scanner_and_exclusions() {
         let text = "[[Ideas]] `[[code]]`\n\n```md\n[[fence]]\n```\n\n$[[math]]$ ![[diagram.png]] #topic ^block";
-        let links = scan_links(text);
+        let (links, decorations) = ts_structure_spans(text);
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].payload.target_raw, "Ideas");
         assert!(!links[0].embed);
         assert_eq!(links[1].payload.target_raw, "diagram.png");
         assert!(links[1].embed);
-        let decorations = scan_decorations(text);
         assert_eq!(
             decorations
                 .iter()

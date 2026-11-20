@@ -24,7 +24,7 @@ use std::ops::Range;
 use tree_sitter::{Language, Node, Parser, Tree};
 
 /// Get the tree-sitter language for markdown.
-fn markdown_language() -> Language {
+pub(crate) fn markdown_language() -> Language {
     tree_sitter_md::LANGUAGE.into()
 }
 
@@ -80,8 +80,9 @@ pub fn parse_note_ts(bytes: &[u8]) -> Result<TsParsedNote, String> {
     // ONE block-grammar parse. The same tree feeds both the mask builder and
     // the scan-window walk (S6 stage A: parse once, walk twice).
     let tree = parse_block(text).ok_or("failed to parse with tree-sitter")?;
+    let inline = crate::ts_inline::parse_inline(text);
 
-    let (mask, windows) = build_mask_and_windows(text, &tree);
+    let (mask, windows) = mask_and_windows_from_trees(text, &tree, inline.as_ref());
 
     // Collect inline spans from unmasked prose windows.
     let mut links = Vec::new();
@@ -112,9 +113,10 @@ fn parse_block(text: &str) -> Option<Tree> {
     parser.parse(text, None)
 }
 
-/// Build the exclusion mask and the prose scan windows from a block tree.
+/// Build the exclusion mask and the prose scan windows from already-parsed
+/// block + inline trees.
 ///
-/// One tree walk produces both:
+/// One walk over the block tree produces both:
 /// * **exclusions** — code blocks, HTML blocks and YAML frontmatter
 ///   (`minus_metadata`), plus the shared frontmatter heuristic
 ///   ([`find_frontmatter_close`]) and the inline-grammar exclusions;
@@ -122,7 +124,11 @@ fn parse_block(text: &str) -> Option<Tree> {
 ///   heading content (without their `#`/underline markers) and table cells
 ///   (without their `|` separators). This mirrors pulldown's scan windows so
 ///   AC-5 parity holds (RFC-0008 S6).
-fn build_mask_and_windows(text: &str, tree: &Tree) -> (TextMask, Vec<Range<usize>>) {
+pub(crate) fn mask_and_windows_from_trees(
+    text: &str,
+    tree: &Tree,
+    inline: Option<&Tree>,
+) -> (TextMask, Vec<Range<usize>>) {
     let mut excluded: Vec<Range<usize>> = Vec::new();
     let mut windows: Vec<Range<usize>> = Vec::new();
 
@@ -143,7 +149,9 @@ fn build_mask_and_windows(text: &str, tree: &Tree) -> (TextMask, Vec<Range<usize
 
     walk_block_structure(tree.root_node(), &mut excluded, &mut windows);
 
-    crate::ts_inline::extend_inline_exclusions(text, &mut excluded);
+    if let Some(inline) = inline {
+        crate::ts_inline::extend_inline_exclusions_from_tree(inline, &mut excluded);
+    }
     excluded.extend(math_ranges(text, &excluded));
 
     windows.sort_by_key(|r| (r.start, r.end));
@@ -278,15 +286,26 @@ fn scan_window(
     block_ids: &mut Vec<Span<TextByte>>,
 ) {
     for span in scan_inline(snapshot, range) {
-        match span.kind {
-            SpanKind::Link | SpanKind::Embed => {
-                if let Some(link) = super::pulldown_glue::Link::from_scanned(span) {
-                    links.push(link);
-                }
+        push_scanned_span(span, links, tags, block_ids);
+    }
+}
+
+/// Route one scanned span by kind. Shared by the full-parse scan and the
+/// incremental structure engine's damaged-region rescans.
+pub(crate) fn push_scanned_span(
+    span: crate::scanner::ScannedSpan,
+    links: &mut Vec<super::pulldown_glue::Link>,
+    tags: &mut Vec<Span<TextByte>>,
+    block_ids: &mut Vec<Span<TextByte>>,
+) {
+    match span.kind {
+        SpanKind::Link | SpanKind::Embed => {
+            if let Some(link) = super::pulldown_glue::Link::from_scanned(span) {
+                links.push(link);
             }
-            SpanKind::Tag => tags.push(span.span),
-            SpanKind::BlockId => block_ids.push(span.span),
         }
+        SpanKind::Tag => tags.push(span.span),
+        SpanKind::BlockId => block_ids.push(span.span),
     }
 }
 
@@ -319,7 +338,8 @@ mod tests {
     fn mask_excludes_code() {
         let src = "`[[not a link]]`";
         let tree = parse_block(src).expect("parse");
-        let (mask, _windows) = build_mask_and_windows(src, &tree);
+        let inline = crate::ts_inline::parse_inline(src);
+        let (mask, _windows) = mask_and_windows_from_trees(src, &tree, inline.as_ref());
         assert!(mask.is_masked(2));
         let result = parse_note_ts(src.as_bytes()).expect("parse");
         assert!(result.links.is_empty());
@@ -368,7 +388,8 @@ mod tests {
     fn windows_strip_heading_markers_and_cover_whole_tables() {
         let src = "# H [[link]]\n\n| a | b |\n|---|---|\n| [[x]] | y |\n";
         let tree = parse_block(src).expect("parse");
-        let (_mask, windows) = build_mask_and_windows(src, &tree);
+        let inline = crate::ts_inline::parse_inline(src);
+        let (_mask, windows) = mask_and_windows_from_trees(src, &tree, inline.as_ref());
         let table_start = src.find("| a |").expect("table start");
         let table_end = src.find("\n| [[x]]").map(|i| i + 1).expect("table end");
         let table_window = windows

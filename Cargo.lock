@@ -1636,6 +1636,7 @@ name = "flavite-syntax"
 version = "0.1.0"
 dependencies = [
  "flavite-encoding",
+ "proptest",
  "pulldown-cmark",
  "serde",
  "serde_json",

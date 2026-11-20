@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e75bffcbfdc45d1577e36dc9f56aad1e18c64a77dba9424635f0762c6cf1a599 # shrinks to base = "# H [[link]] #tag ^block\n\nBody with `[[code]]` and ![[embed.png]].\n", seed = 0, steps = 3
+cc 294ab306adb47d379bc140c73514108c1b8c6f18086db8230d5a29c68ae68430 # shrinks to base = "[[a]] [[b]] [[c]]\n\n#tag ^block\n", seed = 773, steps = 3
