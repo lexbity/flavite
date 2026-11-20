@@ -76,9 +76,7 @@ fn run_with_globs(
 ) -> ScanResult {
     let root = PathBuf::from(ROOT);
     let (tx, rx) = crossbeam::channel::bounded::<WorkerMessage>(16_384);
-    let collector = std::thread::spawn(move || {
-        while let Ok(_) = rx.recv() {}
-    });
+    let collector = std::thread::spawn(move || while let Ok(_) = rx.recv() {});
     let job = ScanJob {
         id: 43,
         scope: &ReconcileScope::Full,
@@ -454,7 +452,8 @@ fn glob_corpus() -> MemFs {
         fs.write_new(&root.join(format!("scratch/s-{index}.md")), b"# scratch")
             .expect("scratch note");
     }
-    fs.write_new(&root.join("scratch/tmp.tmp"), b"tmp").expect("tmp");
+    fs.write_new(&root.join("scratch/tmp.tmp"), b"tmp")
+        .expect("tmp");
     fs.write_new(&root.join("pics.png"), b"png").expect("png");
     fs.write_new(&root.join(".flavite/settings.toml"), b"schema = 2")
         .expect("settings");
@@ -473,7 +472,11 @@ fn ignore_globs_exclude_paths_from_enumeration_and_nominations() {
     assert!(result.present_notes.contains(&key(&fs, "note-0.md")));
     assert!(!result.present_notes.contains(&key(&fs, "scratch/s-0.md")));
     assert!(result.present_attachments.contains(&key(&fs, "pics.png")));
-    assert!(!result.present_attachments.contains(&key(&fs, "scratch/tmp.tmp")));
+    assert!(
+        !result
+            .present_attachments
+            .contains(&key(&fs, "scratch/tmp.tmp"))
+    );
     // A watcher-style nomination of an ignored path must be filtered too —
     // a nomination must never smuggle an ignored file back into the scan.
     let mut nominated = HashSet::new();
@@ -492,12 +495,16 @@ fn flavite_plumbing_rule_survives_user_globs() {
     // state must stay out of every presence set either way.
     let globs: Vec<String> = vec![".flavite*".into()];
     let result = run_with_globs(&fs, &globs, &HashSet::new(), None);
-    assert!(!result
-        .present_notes
-        .contains(&key(&fs, ".flavite/settings.toml")));
-    assert!(!result
-        .present_attachments
-        .contains(&key(&fs, ".flavite/settings.toml")));
+    assert!(
+        !result
+            .present_notes
+            .contains(&key(&fs, ".flavite/settings.toml"))
+    );
+    assert!(
+        !result
+            .present_attachments
+            .contains(&key(&fs, ".flavite/settings.toml"))
+    );
     // Other files still enumerate normally.
     assert!(result.present_notes.contains(&key(&fs, "note-0.md")));
     assert!(result.present_notes.contains(&key(&fs, "scratch/s-0.md")));
@@ -505,7 +512,9 @@ fn flavite_plumbing_rule_survives_user_globs() {
     // The same corpus without globs must include `.flavite` neither — the
     // hard rule is baseline behavior.
     let plain = run_with_globs(&fs, &[], &HashSet::new(), None);
-    assert!(!plain
-        .present_notes
-        .contains(&key(&fs, ".flavite/settings.toml")));
+    assert!(
+        !plain
+            .present_notes
+            .contains(&key(&fs, ".flavite/settings.toml"))
+    );
 }

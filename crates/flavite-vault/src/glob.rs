@@ -49,11 +49,14 @@ pub fn matches(pattern: &str, relative: &Path) -> bool {
     if !normalized.contains('/') {
         // Basename rule: a single-component pattern matches any single
         // component of the path.
-        return components.iter().any(|component| {
-            component_matches(normalized, component)
-        });
+        return components
+            .iter()
+            .any(|component| component_matches(normalized, component));
     }
-    let pattern_components: Vec<&str> = normalized.split('/').filter(|part| !part.is_empty()).collect();
+    let pattern_components: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     if pattern_components.is_empty() {
         return false;
     }

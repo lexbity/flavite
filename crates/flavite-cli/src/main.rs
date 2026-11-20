@@ -976,10 +976,8 @@ impl CliDriver {
         match action {
             SettingsAction::Show { id } => {
                 if let Some(id) = id {
-                    let (_, data) = self.run_settings_command(
-                        "settings.get",
-                        serde_json::json!({ "id": id }),
-                    )?;
+                    let (_, data) =
+                        self.run_settings_command("settings.get", serde_json::json!({ "id": id }))?;
                     if self.json {
                         println!("{}", serde_json::to_string(&data)?);
                     } else {
@@ -1044,8 +1042,8 @@ impl CliDriver {
                 Ok(())
             }
             SettingsAction::Reset { id } => {
-                let (_, data) = self
-                    .run_settings_command("settings.reset", serde_json::json!({ "id": id }))?;
+                let (_, data) =
+                    self.run_settings_command("settings.reset", serde_json::json!({ "id": id }))?;
                 if self.json {
                     println!("{}", serde_json::to_string(&data)?);
                 } else {

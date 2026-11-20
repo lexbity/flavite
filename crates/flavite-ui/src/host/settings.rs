@@ -1031,14 +1031,14 @@ fn current_list(app: &App, id: &str) -> Vec<String> {
 /// document generation moved. The appearance host re-adopts the resolved
 /// values so an externally changed theme or scale repaints.
 fn adopt_on_focus(app: &mut App) -> iced::Task<Message> {
-    let changed = app
-        .flavite
-        .as_ref()
-        .is_some_and(|flavite| match flavite.read_stored_settings() {
-            Ok(Some(stored)) => stored.generation != app.settings.generation,
-            Ok(None) => false,
-            Err(_) => app.settings.load_error.is_none(),
-        });
+    let changed =
+        app.flavite
+            .as_ref()
+            .is_some_and(|flavite| match flavite.read_stored_settings() {
+                Ok(Some(stored)) => stored.generation != app.settings.generation,
+                Ok(None) => false,
+                Err(_) => app.settings.load_error.is_none(),
+            });
     if changed {
         if let Some(flavite) = app.flavite.as_ref() {
             app.settings.load(flavite);

@@ -6,6 +6,7 @@
 //! §4.16.1).
 
 pub mod budget;
+pub mod chunks;
 pub mod commands;
 pub mod eol;
 pub mod history;
