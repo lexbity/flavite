@@ -31,3 +31,5 @@ test-support = []
 # The crate enables its own test-support feature for its unit and
 # integration tests.
 flavite-editor = { path = ".", features = ["test-support"] }
+# RFC-0008 S2-T2: persistent-vs-fresh layout equivalence (R1).
+proptest = { workspace = true }

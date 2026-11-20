@@ -80,6 +80,13 @@ fn model_keystroke_cost_tracks_the_reference_table() {
     println!("doc_bytes,keystroke_ms_p50,keystroke_ms_p90,undo_burst_ms,boundary_ms");
     for size in [2 * 1024, 100 * 1024, 1024 * 1024, 5 * 1024 * 1024] {
         let mut model = model_of(size);
+        // A generous budget isolates the keystroke/undo measurements from
+        // eviction churn (eviction semantics are covered by the budget and
+        // ceiling benches separately).
+        model.set_history_budget(flavite_buffer::budget::Budget {
+            max_bytes: 8 * 1024 * 1024 * 1024,
+            max_nodes: 2_000,
+        });
         for _ in 0..10 {
             type_char(&mut model);
         } // warm-up: lazy statics + callsite interest
@@ -121,13 +128,35 @@ fn model_keystroke_cost_tracks_the_reference_table() {
                 "keystroke p50 {:.4} ms > 5× baseline {baseline} ms at {size} bytes",
                 ms(p50)
             );
-            // §3.2: undo of a coalesced burst 0.55–3.2 ms @1–5 MB.
-            let undo_baseline = if size >= 1024 * 1024 { 3.2 } else { 0.55 };
+            // RFC-0008 NFR-2 (post-S5): the interactive model path builds no
+            // snapshot/serialization artifacts, so keystroke model cost is
+            // ≤0.6 ms @1 MB and ≤1.2 ms @5 MB (hard gates on the reference
+            // machine).
+            if size >= 1024 * 1024 {
+                let budget = if size >= 5 * 1024 * 1024 { 1.2 } else { 0.6 };
+                assert!(
+                    ms(p50) <= budget,
+                    "keystroke model p50 {:.4} ms > NFR-2 {budget} ms at {size} bytes",
+                    ms(p50)
+                );
+            }
+            // §3.2: undo of a coalesced burst 0.55–3.2 ms @1–5 MB (pre-S5);
+            // RFC-0008 NFR-4 post-S5: ≤5 ms @1 MB including one
+            // materialization (hard gate, generous wall on the reference
+            // machine).
+            let undo_baseline = if size >= 1024 * 1024 { 6.0 } else { 0.55 };
             assert!(
                 ms(undo_burst) <= undo_baseline * 5.0,
                 "undo burst {:.4} ms > 5× baseline {undo_baseline} ms at {size} bytes",
                 ms(undo_burst)
             );
+            if size >= 1024 * 1024 {
+                assert!(
+                    ms(undo_burst) <= 6.0,
+                    "undo burst {:.4} ms > NFR-4 wall 6 ms at {size} bytes (target 5)",
+                    ms(undo_burst)
+                );
+            }
             // §3.2: boundary install 3.3–6.4 ms @1 MB; smaller docs scale down.
             let boundary_baseline = match size {
                 s if s <= 2 * 1024 => 0.05,
@@ -204,4 +233,86 @@ fn history_ceiling_keystroke_stays_sub_perceptual() {
         ms(ceiling_p50)
     );
     let _ = ceiling_p90;
+}
+
+/// S4-T4: the coalesce merge (`merge_mapped`) is local — O(burst), not
+/// O(document) — and costs a sub-fraction of the O(document) snapshot diff it
+/// replaced. Measured on a 1 MB document with a realistic 1 KB typing burst.
+#[test]
+#[ignore = "perf budget; runs under just bench-edit (release, --ignored)"]
+fn coalesce_merge_cost_is_local_and_sub_fraction_of_model_apply() {
+    use flavite_buffer::undo::{EditOp, merge_mapped};
+    use flavite_syntax::text::{Span, TextByte};
+
+    let doc_len = 1024 * 1024;
+    let burst_len = 1024;
+    let text = "x".repeat(doc_len);
+    // A coalesced typing burst: prev inserted `burst_len` chars at EOF; the
+    // next keystroke appends one more char (adjacent at the span end).
+    let start = doc_len - burst_len;
+    let prev = EditOp::new(
+        Span::new(TextByte(start), TextByte(start)),
+        "a".repeat(burst_len),
+    );
+    let next = EditOp::new(Span::new(TextByte(doc_len), TextByte(doc_len)), "b".into());
+
+    // Warm up + measure the map.
+    let mut map_samples = Vec::with_capacity(10_000);
+    for _ in 0..10_000 {
+        let t0 = Instant::now();
+        let merged = merge_mapped(&prev, &next).expect("adjacent burst merges");
+        map_samples.push(t0.elapsed());
+        let _ = merged.range; // keep the merged op alive
+    }
+    let map_p50 = percentile(&mut map_samples, 50);
+
+    // The replaced O(document) algorithm: byte-zip diff of parent vs after.
+    let after = next.apply(&prev.apply(&text));
+    let mut diff_samples = Vec::with_capacity(50);
+    for _ in 0..50 {
+        let t0 = Instant::now();
+        let mut prefix = text
+            .bytes()
+            .zip(after.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while prefix > 0 && (!text.is_char_boundary(prefix) || !after.is_char_boundary(prefix)) {
+            prefix -= 1;
+        }
+        let mut suffix = text.as_bytes()[prefix..]
+            .iter()
+            .rev()
+            .zip(after.as_bytes()[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while suffix > 0
+            && (!text.is_char_boundary(text.len() - suffix)
+                || !after.is_char_boundary(after.len() - suffix))
+        {
+            suffix -= 1;
+        }
+        let _ = EditOp::new(
+            Span::new(TextByte(prefix), TextByte(text.len() - suffix)),
+            after[prefix..after.len() - suffix].to_owned(),
+        );
+        diff_samples.push(t0.elapsed());
+    }
+    let diff_p50 = percentile(&mut diff_samples, 50);
+
+    println!(
+        "coalesce_1mb: merge_mapped_us_p50={:.2} old_snapshot_diff_us_p50={:.2} ratio={:.2}",
+        ms(map_p50) * 1000.0,
+        ms(diff_p50) * 1000.0,
+        map_p50.as_secs_f64() / diff_p50.as_secs_f64().max(1e-12)
+    );
+    // The map's work scales with the burst, not the document: on a 1 MB doc
+    // with a 1 KB burst it must be a small fraction of the full-document diff.
+    assert!(
+        map_p50 * 4 < diff_p50,
+        "coalesce merge {map_p50:?} not <25% of the O(document) diff {diff_p50:?}"
+    );
+    assert!(
+        map_p50 < Duration::from_micros(150),
+        "coalesce merge p50 {map_p50:?} ≥ 150 µs"
+    );
 }

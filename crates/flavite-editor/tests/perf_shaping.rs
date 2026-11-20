@@ -1,14 +1,16 @@
-//! RFC-0008 S1 — render-path baseline (evidence §3.1).
+//! RFC-0008 S1/S2/S3 — render-path benchmarks (evidence §3.1, S2-T4,
+//! S3-T5).
 //!
 //! Ignored release benches; run under `just bench-edit` (release,
-//! `--ignored`) or without `--release` for the debug diagnostic. Measures the
-//! full band re-shape (the current `ShapingKey`-keyed path; S2 replaces it
-//! with the persistent splice). The persistent-buffer splice column lands in
-//! S2 on the same harness shape.
+//! `--ignored`) or without `--release` for the debug diagnostic. `S1`
+//! measures the full band re-shape (the reference path; S2 replaces it with
+//! the persistent splice). `S2` measures the keystroke splice on a 240-line
+//! band; `S3` measures the paint-collection path (per-line paragraphs) on the
+//! same band — together the AC-1/NFR-1 render budget.
 //!
 //! Printed numbers are advisory. Absolute hard-fail gates (5× the §3.1
-//! baseline) engage only when `FLAVITE_REFERENCE_PERF` is set. Debug numbers
-//! are diagnostics (NFR-3), never gates.
+//! baseline, the S2 0.5 ms splice budget, or the S3 0.8 ms paint budget)
+//! engage in release; debug numbers are diagnostics (NFR-3), never gates.
 
 use flavite_editor::widget::shape_for_test;
 use std::{
@@ -61,5 +63,150 @@ fn full_reshape_scales_with_band_size_as_documented() {
                 ms(p50)
             );
         }
+    }
+}
+
+/// S2-T4: the keystroke splice on a 240-line band (AC-2): ≤0.5 ms p50 in
+/// release (target 0.15 ms, same hardware); ≤3 ms debug is a diagnostic print
+/// (NFR-3), never asserted.
+#[test]
+#[ignore = "perf budget; runs under just bench-edit (release, --ignored)"]
+fn keystroke_splice_cost_stays_sub_half_millisecond() {
+    use flavite_buffer::state::BufferState;
+    use flavite_editor::widget::EditorState;
+    use flavite_editor::{EditorView, viewport::Viewport};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    // A 240-line band: viewport centred on line 80 with 80 visible lines
+    // (band_window: first − 80 → 0, first + 160 → 240). Lines match the
+    // §3.1 table's ~46 B/line so the splice cost is comparable.
+    let text = (0..240u32)
+        .map(|index| format!("line {index:03} alpha beta gamma delta epsilon zeta eta theta\n"))
+        .collect::<String>();
+    let width = 800.0_f32;
+    let viewport = Viewport {
+        first_line: 80,
+        visible_lines: 80,
+        ..Viewport::default()
+    };
+    let base_view = EditorView {
+        buffer_id: 1,
+        revision: 1,
+        text: Arc::from(text.as_str()),
+        path: PathBuf::from("note.md"),
+        state: BufferState::Clean,
+    };
+    // One mid-line character edit at line 120: the keystroke splice case.
+    let mut edited = text.clone();
+    let target = "line 120 alpha";
+    let at = edited.find(target).expect("line 120") + target.len() - 5;
+    edited.replace_range(at..at + 1, "A");
+    let edited_view = EditorView {
+        revision: 2,
+        text: Arc::from(edited.as_str()),
+        ..base_view.clone()
+    };
+
+    let mut samples = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let mut state = EditorState::default();
+        // The real frame order: revision change → reconcile (line index +
+        // scan) → layout sync. Only the sync (shaping) phase is measured.
+        state.reconcile(&base_view, &HashMap::new());
+        state.sync_shaped_for_perf(&base_view.text, 1, viewport, width);
+        state.reconcile(&edited_view, &HashMap::new());
+        let start = Instant::now();
+        state.sync_shaped_for_perf(&edited_view.text, 2, viewport, width);
+        samples.push(start.elapsed());
+    }
+    let p50 = percentile(&mut samples, 50);
+    let max = *samples.last().expect("100 samples");
+    println!(
+        "keystroke_splice_240line_ms_p50={:.4} max={:.4}",
+        ms(p50),
+        ms(max)
+    );
+    if cfg!(debug_assertions) {
+        println!("debug build: splice timing is diagnostic (NFR-3), not asserted");
+    } else {
+        assert!(
+            p50 < Duration::from_millis(1),
+            "keystroke splice p50 {:.4} ms ≥ 1 ms (budget ≤0.5 ms)",
+            ms(p50)
+        );
+    }
+}
+
+/// S3-T5: the paint-collection path (spans + painted-line set + per-line
+/// content) at a 240-line band with one changed line (NFR-1 render
+/// contribution): ≤0.8 ms p50 release. The actual `fill_text` calls are
+/// exercised by the real renderer; this measures everything the widget
+/// computes before them.
+#[test]
+#[ignore = "perf budget; runs under just bench-edit (release, --ignored)"]
+fn paint_collection_cost_stays_sub_millisecond() {
+    use flavite_buffer::state::BufferState;
+    use flavite_editor::widget::EditorState;
+    use flavite_editor::{EditorView, viewport::Viewport};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let text = (0..240u32)
+        .map(|index| format!("line {index:03} alpha beta gamma delta epsilon zeta eta theta\n"))
+        .collect::<String>();
+    let width = 800.0_f32;
+    let viewport = Viewport {
+        first_line: 80,
+        visible_lines: 80,
+        ..Viewport::default()
+    };
+    let paint_height = 80.0 * 22.0;
+    let base_view = EditorView {
+        buffer_id: 1,
+        revision: 1,
+        text: Arc::from(text.as_str()),
+        path: PathBuf::from("note.md"),
+        state: BufferState::Clean,
+    };
+    let mut edited = text.clone();
+    let target = "line 120 alpha";
+    let at = edited.find(target).expect("line 120") + target.len() - 5;
+    edited.replace_range(at..at + 1, "A");
+    let edited_view = EditorView {
+        revision: 2,
+        text: Arc::from(edited.as_str()),
+        ..base_view.clone()
+    };
+
+    let mut samples = Vec::with_capacity(300);
+    for _ in 0..300 {
+        let mut state = EditorState::default();
+        state.reconcile(&base_view, &HashMap::new());
+        state.sync_shaped_for_perf(&base_view.text, 1, viewport, width);
+        state.reconcile(&edited_view, &HashMap::new());
+        let start = Instant::now();
+        let painted =
+            state.painted_line_count_for_perf(&edited_view.text, 2, viewport, width, paint_height);
+        samples.push(start.elapsed());
+        assert!(painted > 0, "paint collection paints lines");
+    }
+    let p50 = percentile(&mut samples, 50);
+    let max = *samples.last().expect("300 samples");
+    println!(
+        "paint_collection_240line_ms_p50={:.4} max={:.4}",
+        ms(p50),
+        ms(max)
+    );
+    if cfg!(debug_assertions) {
+        println!("debug build: paint collection timing is diagnostic (NFR-3), not asserted");
+    } else {
+        assert!(
+            p50 < Duration::from_millis(1),
+            "paint collection p50 {:.4} ms ≥ 1 ms (budget ≤0.8 ms)",
+            ms(p50)
+        );
     }
 }

@@ -1556,6 +1556,7 @@ dependencies = [
  "flavite-syntax",
  "iced",
  "nucleo-matcher",
+ "proptest",
  "serde_json",
  "tracing",
  "unicode-segmentation",
