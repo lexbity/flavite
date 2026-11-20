@@ -117,10 +117,6 @@
       "kind": "external"
     },
     {
-      "id": "ropey",
-      "kind": "external"
-    },
-    {
       "id": "rusqlite",
       "kind": "external"
     },
@@ -262,11 +258,6 @@
     {
       "from": "flavite-buffer",
       "to": "flavite-syntax",
-      "kind": "normal"
-    },
-    {
-      "from": "flavite-buffer",
-      "to": "ropey",
       "kind": "normal"
     },
     {

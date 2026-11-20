@@ -70,7 +70,6 @@ Normal/build:
 - `blake3` (normal)
 - `flavite-encoding` (normal)
 - `flavite-syntax` (normal)
-- `ropey` (normal)
 - `tracing` (normal)
 
 ### `flavite-cli`
@@ -254,7 +253,6 @@ Normal/build:
 - `nucleo` ← flavite-ui
 - `nucleo-matcher` ← flavite-editor
 - `pulldown-cmark` ← flavite-index, flavite-syntax
-- `ropey` ← flavite-buffer
 - `rusqlite` ← flavite-api, flavite-index, xtask
 - `similar` ← flavite-vault
 - `tantivy` ← flavite-index, xtask

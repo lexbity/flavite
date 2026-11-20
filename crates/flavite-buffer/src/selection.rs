@@ -345,6 +345,16 @@ impl SelectionSet {
         Self::normalize(text, candidates, primary_hint)
     }
 
+    /// Geometry-only canonicalization for validation paths that already have
+    /// bounds/grapheme-checked endpoints (RFC-0011 S2). Mirrors the private
+    /// `canonicalize` used by `normalize`.
+    pub(crate) fn canonicalize_members(
+        candidates: Vec<(u32, usize, usize)>,
+        primary_hint: Option<u32>,
+    ) -> Result<(Self, IdRemap), SetError> {
+        Self::canonicalize(candidates, primary_hint)
+    }
+
     /// The pure span algebra: sort, merge, absorb, assign the primary.
     /// Inputs are already validated (bounds/grapheme) by the caller.
     fn canonicalize(

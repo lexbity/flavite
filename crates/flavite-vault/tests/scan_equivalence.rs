@@ -76,7 +76,7 @@ fn run_with_globs(
 ) -> ScanResult {
     let root = PathBuf::from(ROOT);
     let (tx, rx) = crossbeam::channel::bounded::<WorkerMessage>(16_384);
-    let collector = std::thread::spawn(move || while let Ok(_) = rx.recv() {});
+    let collector = std::thread::spawn(move || while rx.recv().is_ok() {});
     let job = ScanJob {
         id: 43,
         scope: &ReconcileScope::Full,

@@ -84,10 +84,7 @@ impl Leaf {
     fn split(&self, at: usize) -> (Leaf, Leaf) {
         debug_assert!(at <= self.bytes.len());
         debug_assert!(self.bytes.is_char_boundary(at));
-        (
-            Leaf::new(&self.bytes[..at]),
-            Leaf::new(&self.bytes[at..]),
-        )
+        (Leaf::new(&self.bytes[..at]), Leaf::new(&self.bytes[at..]))
     }
 
     /// Merge with a following leaf.
@@ -472,6 +469,14 @@ impl ChunkRoot {
             .collect()
     }
 
+    /// The leaf segment containing byte `pos`, as `(bytes, local_offset)`
+    /// where `local_offset` indexes into `bytes` (RFC-0011 S2 boundary
+    /// probes; safe for mid-character positions).
+    pub(crate) fn leaf_context_at(&self, pos: usize) -> Option<(Arc<str>, usize)> {
+        let (bytes, lo, _hi, _base) = self.segments_in(pos, pos + 1).into_iter().next()?;
+        Some((bytes, lo))
+    }
+
     // ------------------------------------------------------------------
     // Editing
     // ------------------------------------------------------------------
@@ -660,10 +665,7 @@ fn concat_nodes(a: Arc<Node>, b: Arc<Node>) -> Vec<Arc<Node>> {
                 // Both leaves: merge when the seam stays small.
                 let total = a.summary.byte_len as usize + b.summary.byte_len as usize;
                 if total <= TARGET_CHUNK {
-                    let merged = a
-                        .as_leaf()
-                        .expect("leaf")
-                        .merge(b.as_leaf().expect("leaf"));
+                    let merged = a.as_leaf().expect("leaf").merge(b.as_leaf().expect("leaf"));
                     return vec![Node::leaf(merged)];
                 }
             }
@@ -692,9 +694,7 @@ fn insert_into_spine(node: Arc<Node>, sub: Arc<Node>, right: bool) -> Vec<Arc<No
                 .is_some_and(|c| matches!(c.kind, NodeKind::Leaf(_)));
             if last_is_leaf && sub_h == 0 {
                 let last = children.last().expect("last");
-                if last.summary.byte_len as usize + sub.summary.byte_len as usize
-                    <= TARGET_CHUNK
-                {
+                if last.summary.byte_len as usize + sub.summary.byte_len as usize <= TARGET_CHUNK {
                     let merged = last
                         .as_leaf()
                         .expect("leaf")
@@ -711,9 +711,7 @@ fn insert_into_spine(node: Arc<Node>, sub: Arc<Node>, right: bool) -> Vec<Arc<No
                 .is_some_and(|c| matches!(c.kind, NodeKind::Leaf(_)));
             if first_is_leaf && sub_h == 0 {
                 let first = children[0].clone();
-                if first.summary.byte_len as usize + sub.summary.byte_len as usize
-                    <= TARGET_CHUNK
-                {
+                if first.summary.byte_len as usize + sub.summary.byte_len as usize <= TARGET_CHUNK {
                     let merged = sub
                         .as_leaf()
                         .expect("leaf")

@@ -48,7 +48,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 fn type_char(model: &mut EditorModel) {
-    let at = model.text().len();
+    let at = model.len(); // O(1); never materializes the document
     let op = EditOp::new(Span::new(TextByte(at), TextByte(at)), "x".to_owned());
     let record = EditorEdit {
         before_primary: 0,
@@ -74,11 +74,7 @@ fn hot_path_tracing_instrumentation_allocates_nothing_without_a_subscriber() {
     // event macro shapes with the default (NoSubscriber) dispatcher.
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     for _ in 0..1_000 {
-        let span = tracing::info_span!(
-            "edit.model_apply",
-            ops = 1usize,
-            doc_len = model.text().len()
-        );
+        let span = tracing::info_span!("edit.model_apply", ops = 1usize, doc_len = model.len());
         let _entered = span.entered();
         let coalesce = tracing::info_span!("edit.undo_coalesce", coalesced = false);
         let _coalesce = coalesce.entered();

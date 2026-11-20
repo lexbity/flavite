@@ -17,7 +17,7 @@ use std::time::Instant;
 fn ensure_helper_installed() {
     let exe = std::env::current_exe().expect("current_exe");
     let dir = exe.parent().expect("test executable parent");
-    let mut sibling = dir.join("flavite-text-search-worker");
+    let sibling = dir.join("flavite-text-search-worker");
     #[cfg(windows)]
     sibling.set_extension("exe");
     if sibling.is_file() {
@@ -61,7 +61,7 @@ fn ensure_helper_installed() {
         let after = dir.join("..").join("flavite-text-search-worker");
         #[cfg(windows)]
         let after = {
-            let mut a = after;
+            let a = after;
             a.set_extension("exe");
             a
         };

@@ -38,7 +38,8 @@ impl Rng {
     }
 }
 
-const TEXT_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \n.,!?_-()[]{}";
+const TEXT_ALPHABET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \n.,!?_-()[]{}";
 const BYTE_ALPHABET: &[u8] = b"abc\n\r\xEF\xBB\xBF\x00\xE2\x82\xAC\xF0\x9F\x98\x80";
 
 fn random_doc(rng: &mut Rng, max: usize) -> String {
@@ -117,14 +118,20 @@ fn oracle_line_starts_in(text: &str, start: usize, end: usize) -> Vec<usize> {
 
 fn check_tree_invariants(tree: &ChunkRoot, text: &str) {
     assert_eq!(tree.len(), text.len(), "summary byte_len drift");
-    assert_eq!(tree.line_count(), oracle_line_index_of(text, text.len()) + 1);
+    assert_eq!(
+        tree.line_count(),
+        oracle_line_index_of(text, text.len()) + 1
+    );
     assert_eq!(tree.materialize(), text);
     // Use the public leaf view for an exhaustive structural check.
     let leaves = tree.leaves();
     let mut concat = String::new();
     let mut last_end = 0usize;
     for leaf in &leaves {
-        assert!(leaf.len() <= flavite_buffer::chunks::MAX_CHUNK, "leaf over max");
+        assert!(
+            leaf.len() <= flavite_buffer::chunks::MAX_CHUNK,
+            "leaf over max"
+        );
         concat.push_str(leaf);
         last_end += leaf.len();
     }
@@ -139,7 +146,9 @@ fn check_tree_invariants(tree: &ChunkRoot, text: &str) {
 #[test]
 fn oracle_10000_seeded_cases() {
     for seed in 0..10_000u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0xD1B54E32AB7F9981));
+        let mut rng = Rng(seed
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(0xD1B54E32AB7F9981));
         let mut text = random_doc(&mut rng, 2048);
         let mut tree = ChunkRoot::from_text(&text);
         let steps = 1 + rng.below(24);
@@ -148,7 +157,11 @@ fn oracle_10000_seeded_cases() {
             text.replace_range(start..end, &repl);
             tree = tree.edit(start..end, &repl);
             // Full-text + geometry equality every step.
-            assert_eq!(tree.materialize(), text, "seed {seed} step {step} materialize");
+            assert_eq!(
+                tree.materialize(),
+                text,
+                "seed {seed} step {step} materialize"
+            );
             assert_eq!(tree.len(), text.len(), "seed {seed} step {step} len");
             assert_eq!(
                 tree.line_count(),
@@ -257,7 +270,10 @@ fn mutation_skipped_newline_count_is_caught_by_the_oracle() {
     let _ = tree;
     // The oracle passes on the correct implementation:
     let tree = ChunkRoot::from_text(text);
-    assert_eq!(tree.line_count(), oracle_line_index_of(text, text.len()) + 1);
+    assert_eq!(
+        tree.line_count(),
+        oracle_line_index_of(text, text.len()) + 1
+    );
     // Now simulate the defect by comparing against a WRONG expected count.
     // The oracle harness (S1-T1) asserts exact equality, so the mutated
     // count would fail it. Demonstrated here directly:
@@ -278,7 +294,14 @@ fn boundary_fuzz_chunk_edges_and_weird_bytes() {
     let r = flavite_buffer::chunks::TARGET_CHUNK;
     // Documents sized to straddle chunk boundaries.
     let sizes = [
-        0usize, 1, 7, r.saturating_sub(1), r, r + 1, 2 * r, 2 * r + 1,
+        0usize,
+        1,
+        7,
+        r.saturating_sub(1),
+        r,
+        r + 1,
+        2 * r,
+        2 * r + 1,
         flavite_buffer::chunks::MAX_CHUNK,
         flavite_buffer::chunks::MAX_CHUNK + 1,
     ];
@@ -348,7 +371,10 @@ fn boundary_fuzz_chunk_edges_and_weird_bytes() {
             tree = tree.edit(start..end, &repl);
             assert_eq!(tree.materialize(), text);
             assert_eq!(tree.len(), text.len());
-            assert_eq!(tree.line_count(), oracle_line_index_of(&text, text.len()) + 1);
+            assert_eq!(
+                tree.line_count(),
+                oracle_line_index_of(&text, text.len()) + 1
+            );
         }
         check_tree_invariants(&tree, &text);
     }
@@ -399,7 +425,10 @@ fn old_roots_are_immutable_across_edits() {
     // A deleted range must stay deleted in every old root.
     let before = roots[0].clone();
     let _ = tree.edit(0..4, "");
-    assert_eq!(before.materialize(), "the quick brown fox jumps over the lazy dog\n");
+    assert_eq!(
+        before.materialize(),
+        "the quick brown fox jumps over the lazy dog\n"
+    );
 }
 
 // ----------------------------------------------------------------------
@@ -442,6 +471,9 @@ fn tree_perf_scale_smoke() {
     writeln!(report, "1MiB materialize {full:?}").unwrap();
     println!("{report}");
     // Loose advisory walls only (runner noise must not gate).
-    assert!(full < Duration::from_millis(200), "materialize too slow: {full:?}");
+    assert!(
+        full < Duration::from_millis(200),
+        "materialize too slow: {full:?}"
+    );
     assert!(Duration::from_micros(200) >= Duration::ZERO);
 }
