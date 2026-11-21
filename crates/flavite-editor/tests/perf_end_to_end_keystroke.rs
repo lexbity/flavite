@@ -224,16 +224,14 @@ fn render_phases_ms() -> (f64, f64) {
     for _ in 0..200 {
         let mut state = EditorState::default();
         state.reconcile(&view, &std::collections::HashMap::new());
-        let view_text = view.text.materialize();
-        let edited_text = edited_view.text.materialize();
-        state.sync_shaped_for_perf(&view_text, 1, viewport, width);
+        state.sync_shaped_for_perf(&view.text, 1, viewport, width);
         state.reconcile(&edited_view, &std::collections::HashMap::new());
         let start = Instant::now();
-        state.sync_shaped_for_perf(&edited_text, 2, viewport, width);
+        state.sync_shaped_for_perf(&edited_view.text, 2, viewport, width);
         shaping.push(start.elapsed());
         let start = Instant::now();
         let painted =
-            state.painted_line_count_for_perf(&edited_text, 2, viewport, width, paint_height);
+            state.painted_line_count_for_perf(&edited_view.text, 2, viewport, width, paint_height);
         assert!(painted > 0, "paint collection paints lines");
         paint.push(start.elapsed());
     }

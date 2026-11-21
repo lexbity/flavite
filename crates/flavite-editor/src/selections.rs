@@ -8,7 +8,10 @@
 //! support (delivered behavior is the N=1 case of every accessor).
 
 use crate::viewport::{clamp_char_boundary, clamp_grapheme_boundary};
-use flavite_buffer::selection::{RawSelection, Selection, SelectionSet};
+use flavite_buffer::chunks::DocumentText;
+use flavite_buffer::selection::{
+    RawSelection, Selection, SelectionSet, is_grapheme_boundary_document,
+};
 
 /// The live selection state of one editor widget. Never empty; members are
 /// canonical (sorted, non-overlapping, grapheme-aligned).
@@ -339,6 +342,90 @@ impl EditorSelections {
             .unwrap_or(0);
         self.replace_with(text, &members, primary_input);
     }
+
+    /// Re-clamp every member against a [`DocumentText`] (RFC-0011 S4): the
+    /// revision-change path when no materialized copy exists (plain-mode /
+    /// huge documents). Identical semantics to [`EditorSelections::clamp`] —
+    /// offsets shrink into range and endpoints snap to extended-grapheme
+    /// boundaries; primary identity survives — with the grapheme boundary
+    /// checks served by windowed probes, so the cost is O(#members × probe),
+    /// never O(document).
+    pub fn clamp_document(&mut self, text: &DocumentText) {
+        let members = self.set.members();
+        let members: Vec<(usize, usize)> = members
+            .iter()
+            .map(|member| (member.anchor(), member.head()))
+            .collect();
+        let primary_input = members
+            .iter()
+            .enumerate()
+            .find(|(id, _)| {
+                let (a, h) = members[*id];
+                a == self.set.primary().anchor() && h == self.set.primary().head()
+            })
+            .map(|(id, _)| id)
+            .unwrap_or(0);
+        let raw: Vec<RawSelection> = members
+            .iter()
+            .enumerate()
+            .map(|(id, &(anchor, head))| RawSelection {
+                id: Some(id as u32),
+                anchor: clamp_grapheme_boundary_document(
+                    text,
+                    clamp_char_boundary_document(text, anchor),
+                ),
+                head: clamp_grapheme_boundary_document(
+                    text,
+                    clamp_char_boundary_document(text, head),
+                ),
+            })
+            .collect();
+        let primary_id = members
+            .get(primary_input)
+            .map_or(0, |_| primary_input as u32);
+        let (set, _) = SelectionSet::normalize_document(text, raw, Some(primary_id))
+            .expect("clamped members always normalize");
+        let count = set.len();
+        self.set = set;
+        self.preferred_x = vec![None; count];
+    }
+}
+
+/// Clamp `byte` to the nearest UTF-8 scalar boundary at or before it, using
+/// only tree queries (O(log n + 4)).
+#[must_use]
+fn clamp_char_boundary_document(text: &DocumentText, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
+
+/// Clamp `byte` to the nearest extended-grapheme boundary at or before it,
+/// using windowed probes over the tree (RFC-0011 S4).
+#[must_use]
+fn clamp_grapheme_boundary_document(text: &DocumentText, byte: usize) -> usize {
+    let byte = clamp_char_boundary_document(text, byte);
+    if is_grapheme_boundary_document(text, byte) {
+        return byte;
+    }
+    let mut lo = byte.saturating_sub(flavite_buffer::selection::DOCUMENT_PROBE_MARGIN);
+    while lo > 0 && !text.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    let mut hi = (byte + 1).min(text.len());
+    while hi < text.len() && !text.is_char_boundary(hi) {
+        hi += 1;
+    }
+    let window = text.slice(lo..hi);
+    let local = byte - lo;
+    let prev = flavite_syntax::text::prev_grapheme_boundary(
+        &window,
+        flavite_syntax::text::TextByte(local),
+    )
+    .0;
+    lo + prev
 }
 
 #[cfg(test)]
@@ -388,5 +475,73 @@ mod tests {
         assert!(!selections.is_single_caret());
         selections.replace_with(text, &[(3, 3)], 0);
         assert!(selections.is_single_caret());
+    }
+
+    /// RFC-0011 S4: the document clamp (windowed probes) decides exactly what
+    /// the `&str` clamp decides — same members, same canonicalization, same
+    /// primary. Both paths start from the same raw, un-clamped offsets (the
+    /// reload/pre-receipt state) and run on grapheme-heavy, CRLF, empty,
+    /// and over-long texts.
+    #[test]
+    fn clamp_document_matches_clamp_on_the_str_path() {
+        let cases: &[(&str, &[(usize, usize)])] = &[
+            ("a🧑🏽‍💻 bc", &[(8, 8), (17, 18)]),
+            ("", &[(0, 0)]),
+            ("alpha\r\nbeta", &[(0, 6), (6, 10)]),
+            ("é漢😀\n二行", &[(1, 3), (3, 12), (12, 20)]),
+        ];
+        for (text, members) in cases {
+            let mut from_str = EditorSelections::caret_at_origin();
+            from_str.replace_beyond_text(members, 0);
+            from_str.clamp(text);
+            let mut from_doc = EditorSelections::caret_at_origin();
+            from_doc.replace_beyond_text(members, 0);
+            let doc = DocumentText::from(*text);
+            from_doc.clamp_document(&doc);
+            assert_eq!(
+                from_doc.members(),
+                from_str.members(),
+                "document clamp diverges from str clamp on {text:?}"
+            );
+            assert_eq!(
+                from_doc.primary_id(),
+                from_str.primary_id(),
+                "primary diverges on {text:?}"
+            );
+            assert_eq!(
+                from_doc.preferred_x_all(),
+                from_str.preferred_x_all(),
+                "preferred-x width diverges on {text:?}"
+            );
+        }
+    }
+
+    /// RFC-0011 S4: clamping a set whose endpoints are out of range / on
+    /// non-boundaries (as after the text shrinks under the same identity)
+    /// lands on valid boundaries via tree queries.
+    #[test]
+    fn clamp_document_snaps_out_of_range_endpoints() {
+        let text = "ab";
+        let mut selections = EditorSelections::caret_at_origin();
+        selections.replace_with(text, &[(0, 2)], 0);
+        // The doc "shrank" conceptually: clamp against a shorter document.
+        let short = DocumentText::from("a");
+        // Replace with an out-of-range member first (the reload contract),
+        // then clamp against the short document.
+        selections.replace_beyond_text(&[(0, 1)], 0);
+        selections.clamp_document(&short);
+        assert!(
+            selections
+                .members()
+                .iter()
+                .all(|member| { member.end() <= short.len() && member.start() <= short.len() })
+        );
+        assert!(selections.caret() <= short.len());
+        // Mid-grapheme endpoint snapped to a boundary.
+        let cluster = "a🧑🏽‍💻e";
+        let cluster_doc = DocumentText::from(cluster);
+        selections.replace_with(cluster, &[(2, 2)], 0); // inside the emoji cluster
+        selections.clamp_document(&cluster_doc);
+        assert_eq!(selections.caret(), 1, "clamped to the cluster start");
     }
 }

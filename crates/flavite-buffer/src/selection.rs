@@ -15,11 +15,54 @@
 //! - Never empty; at most [`MAX_SELECTIONS`] members; endpoints validated
 //!   against the current text (bounds + extended-grapheme boundaries).
 
+use crate::chunks::DocumentText;
 use flavite_syntax::text::{TextByte, next_grapheme_boundary, prev_grapheme_boundary};
 use std::collections::HashMap;
 
 /// Maximum number of members in one canonical selection set (D-4).
 pub const MAX_SELECTIONS: usize = 10_000;
+
+/// Probe window (bytes) around an endpoint for grapheme-boundary checks on
+/// a [`DocumentText`] (RFC-0011 S4). The boundary verdict depends only on
+/// the extended grapheme cluster containing the endpoint; any realistic
+/// cluster (emoji ZWJ runs, flags, combining marks) is a few bytes to a
+/// few dozen bytes, so a 4 KiB margin covers every realistic document. A
+/// cluster larger than the margin (pathological — thousands of consecutive
+/// ZWJ-joined graphemes) can make the probe report a boundary where the
+/// full-text scanner would not; this is documented as the probe's bound.
+pub const DOCUMENT_PROBE_MARGIN: usize = 4096;
+
+/// Windowed mirror of [`is_grapheme_boundary`] for a [`DocumentText`]:
+/// probes a bounded neighborhood instead of requiring a contiguous full-text
+/// `&str`. Results equal the full-text answer when the cluster containing
+/// `at` fits inside the probe window (true for all realistic documents).
+#[must_use]
+pub fn is_grapheme_boundary_document(text: &DocumentText, at: usize) -> bool {
+    if at > text.len() {
+        return false;
+    }
+    if at == 0 || at == text.len() {
+        return true;
+    }
+    if !text.is_char_boundary(at) {
+        return false;
+    }
+    // Snap the probe edges to char boundaries so `slice` is safe.
+    let mut lo = at.saturating_sub(DOCUMENT_PROBE_MARGIN);
+    let mut hi = (at + DOCUMENT_PROBE_MARGIN).min(text.len());
+    while lo > 0 && !text.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    while hi < text.len() && !text.is_char_boundary(hi) {
+        hi += 1;
+    }
+    let window = text.slice(lo..hi);
+    let local = at - lo;
+    let mut cursor = unicode_segmentation::GraphemeCursor::new(local, window.len(), true);
+    cursor
+        .is_boundary(&window, 0)
+        .expect("complete window supplies grapheme context")
+}
 
 /// A stable identity within one view's set. Deterministic under
 /// normalization: a merged survivor keeps the earliest id of its members.
@@ -275,6 +318,64 @@ impl SelectionSet {
             // members), so later duplicates are reassigned synthetic ids;
             // the first occurrence keeps its id so a primary hint still
             // resolves.
+            let id = match candidate.id {
+                Some(id) if !assigned_ids.contains_key(&id) => {
+                    assigned_ids.insert(id, id);
+                    id
+                }
+                Some(_) | None => {
+                    while reserved.contains(&synthetic_next)
+                        || assigned_ids.contains_key(&synthetic_next)
+                    {
+                        synthetic_next = synthetic_next.checked_add(1).unwrap_or(0);
+                    }
+                    let id = synthetic_next;
+                    assigned_ids.insert(id, id);
+                    synthetic_next = synthetic_next.checked_add(1).unwrap_or(0);
+                    id
+                }
+            };
+            seen.push((id, candidate.anchor, candidate.head));
+        }
+        Self::canonicalize(seen, primary_hint)
+    }
+
+    /// Mirror of [`SelectionSet::normalize`] for a [`DocumentText`] (RFC-0011
+    /// S4): identical validation and canonicalization, with the grapheme
+    /// boundary check served by the windowed [`is_grapheme_boundary_document`]
+    /// probe instead of a contiguous full-text `&str`. Used by the widget's
+    /// revision-change clamp when no materialized copy exists (plain-mode /
+    /// huge documents) — the cost is O(#candidates × probe), never O(document).
+    pub fn normalize_document(
+        text: &DocumentText,
+        candidates: Vec<RawSelection>,
+        primary_hint: Option<u32>,
+    ) -> Result<(Self, IdRemap), SetError> {
+        if candidates.is_empty() {
+            return Err(SetError::Empty);
+        }
+        if candidates.len() > MAX_SELECTIONS {
+            return Err(SetError::TooMany {
+                observed: candidates.len(),
+            });
+        }
+        let mut seen = Vec::with_capacity(candidates.len());
+        let mut assigned_ids = HashMap::with_capacity(candidates.len());
+        let reserved: std::collections::HashSet<_> = candidates
+            .iter()
+            .filter_map(|candidate| candidate.id)
+            .collect();
+        let max_existing = reserved.iter().copied().max().unwrap_or(0);
+        let mut synthetic_next = max_existing.checked_add(1).unwrap_or(1);
+        for candidate in candidates {
+            for endpoint in [candidate.anchor, candidate.head] {
+                if endpoint > text.len() {
+                    return Err(SetError::OutOfBounds { at: endpoint });
+                }
+                if !is_grapheme_boundary_document(text, endpoint) {
+                    return Err(SetError::NotGraphemeBoundary { at: endpoint });
+                }
+            }
             let id = match candidate.id {
                 Some(id) if !assigned_ids.contains_key(&id) => {
                     assigned_ids.insert(id, id);
@@ -1338,6 +1439,49 @@ fn normalize_with_hint_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC-0011 S4: `normalize_document` (windowed grapheme probes) decides
+    /// exactly what `normalize` decides on the same candidates — same set,
+    /// same canonical order, same primary, same id remap. Runs on
+    /// grapheme-heavy, CRLF, empty, and document-edge texts.
+    #[test]
+    fn normalize_document_matches_normalize_on_the_str_path() {
+        type RawCandidate = (Option<u32>, usize, usize);
+        let cases: &[(&str, &[RawCandidate])] = &[
+            ("", &[(None, 0, 0)]),
+            ("a🧑🏽‍💻 bc", &[(None, 1, 1), (None, 17, 18)]),
+            ("alpha\r\nbeta", &[(Some(7), 0, 6), (None, 6, 10)]),
+            (
+                "é漢😀\n二行",
+                &[(None, 1, 3), (Some(9), 3, 12), (None, 12, 20)],
+            ),
+            ("one two three", &[(None, 8, 12), (None, 0, 3)]),
+        ];
+        for (text, raw) in cases {
+            let candidates: Vec<RawSelection> = raw
+                .iter()
+                .map(|&(id, anchor, head)| RawSelection { id, anchor, head })
+                .collect();
+            let via_str = SelectionSet::normalize(text, candidates.clone(), None);
+            let doc = crate::chunks::DocumentText::from(*text);
+            let via_doc = SelectionSet::normalize_document(&doc, candidates, None);
+            match (via_str, via_doc) {
+                (Ok((set_str, remap_str)), Ok((set_doc, remap_doc))) => {
+                    assert_eq!(set_doc.members(), set_str.members(), "{text:?}");
+                    assert_eq!(set_doc.primary_id(), set_str.primary_id(), "{text:?}");
+                    assert_eq!(remap_doc, remap_str, "{text:?}");
+                }
+                (Err(err_str), Err(err_doc)) => {
+                    assert_eq!(format!("{err_doc:?}"), format!("{err_str:?}"), "{text:?}");
+                }
+                (str_result, doc_result) => {
+                    panic!(
+                        "normalize/normalize_document diverged on {text:?}: str={str_result:?} doc={doc_result:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn raw(anchor: usize, head: usize) -> RawSelection {
         RawSelection {

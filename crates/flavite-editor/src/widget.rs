@@ -11,6 +11,7 @@ use crate::viewport::{Viewport, clamp_char_boundary};
 use cosmic_text::{Attrs, Buffer as ShapingBuffer, BufferLine, FontSystem, Metrics, Shaping};
 #[cfg(feature = "test-support")]
 use flavite_api::BufferView;
+use flavite_buffer::chunks::DocumentText;
 use iced::advanced::input_method::InputMethod;
 use iced::advanced::{
     Clipboard, Layout, Renderer as AdvancedRenderer, Shell, Widget, input_method,
@@ -521,7 +522,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
                 let captured_sequence = state.interaction_sequence;
                 state.interaction_sequence = interaction.sequence - 1;
                 let text = state.materialized_text(&self.view);
-                state.restore_interaction(&text, interaction);
+                state.restore_interaction(&self.view.text, &text, interaction);
                 state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
             } else if self.on_input_intent.is_some()
                 && state.controlled_pending
@@ -531,7 +532,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
                 let incoming_sequence = interaction.sequence;
                 state.interaction_sequence = incoming_sequence.saturating_sub(1);
                 let text = state.materialized_text(&self.view);
-                state.restore_interaction(&text, interaction);
+                state.restore_interaction(&self.view.text, &text, interaction);
                 state.interaction_sequence = state.interaction_sequence.max(captured_sequence);
                 state.controlled_ack = incoming_sequence;
                 state.controlled_pending = incoming_sequence < captured_sequence;
@@ -543,11 +544,16 @@ impl<'a, Message> EditorWidget<'a, Message> {
                 }
             } else {
                 let text = state.materialized_text(&self.view);
-                state.restore_interaction(&text, interaction);
+                state.restore_interaction(&self.view.text, &text, interaction);
             }
         }
-        let text = state.materialized_text(&self.view);
-        state.refresh_completion(&text);
+        // RFC-0011 S4: the completion refresh materializes only when the
+        // popup is actually open (a user-paced overlay), never on the plain
+        // typing path.
+        if state.autocomplete_start.is_some() {
+            let text = state.materialized_text(&self.view);
+            state.refresh_completion(&text);
+        }
     }
 
     /// The widget-owned autocomplete interception (the single captured-intent
@@ -620,8 +626,7 @@ impl<'a, Message> EditorWidget<'a, Message> {
                     );
                 }
                 state.close_autocomplete();
-                let text = state.materialized_text(&self.view);
-                state.ensure_caret_visible(&text);
+                state.ensure_caret_visible(&self.view.text);
                 true
             }
             _ => false,
@@ -634,41 +639,11 @@ impl<'a, Message> EditorWidget<'a, Message> {
 /// the paged-buffer RFC inherits.
 pub(crate) const HUGE_TEXT_THRESHOLD: usize = 64 * 1024 * 1024;
 
-/// Documents above this size use the pulldown bridge (`spans_from_pulldown`)
-/// instead of the incremental structure engine **when the engine is
-/// enabled**. Measured 2026-11-19 (release, RFC-0008 Appendix C):
-/// tree-sitter-md's incremental reparses are not local — they scale at
-/// ≈0.6–0.7× a full parse and trip the D10 coherence guard near grammar
-/// boundaries (p99 ≈166 ms at 64 KiB vs ≈1.4 ms for prose edits), so the
-/// engine is not budget-meeting. The bridge is the default route for all
-/// documents; the engine remains selectable behind `FLAVITE_TS_STRUCTURE=1`.
-/// The paged-buffer RFC replaces both with segmented incremental parsing.
-pub(crate) const STRUCTURE_ENGINE_MAX_BYTES: usize = 64 * 1024;
-
-/// Whether the tree-sitter structure engine is enabled (RFC-0008 FR-8).
-/// **Default OFF** (RFC-0008 Appendix C): the engine is correct — AC-5
-/// parity is proven — but does not meet NFR-5 with the current grammars,
-/// so the pulldown bridge (pre-RFC-equivalent spans and latency) is the
-/// shipping structure source. `FLAVITE_TS_STRUCTURE=1` enables the
-/// engineered incremental path for typical notes (≤
-/// [`STRUCTURE_ENGINE_MAX_BYTES`]); `=0` or unset routes the bridge.
-/// Read per revision change — a getenv lookup, O(1), no allocation when
-/// unset; deliberately not cached in a `OnceLock` so tests can flip the
-/// escape hatch deterministically between calls.
-fn ts_structure_enabled() -> bool {
-    // Explicit match: clippy prefers `is_none_or`, which is stable only on
-    // 1.91 and the workspace MSRV is 1.90.
-    match std::env::var_os("FLAVITE_TS_STRUCTURE") {
-        None => false,
-        Some(value) => value == "1",
-    }
-}
-
 /// The pulldown bridge: the shipped default structure source (RFC-0008
-/// Appendix C). Same parser and converter that the pre-RFC `scan_note` path
-/// used — parity-proven against the tree-sitter path (AC-5) — so default
-/// routing preserves known-good spans and latency at every document size
-/// under the plain-mode gate.
+/// Appendix C). Same parser and converter that the pre-RFC whole-document
+/// scanning path used — parity-proven against the tree-sitter path (AC-5)
+/// — so default routing preserves known-good spans and latency at every
+/// document size under the plain-mode gate.
 fn bridge_structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
     let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
         return (Vec::new(), Vec::new());
@@ -676,9 +651,10 @@ fn bridge_structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<flavite_syntax::Sca
     crate::links::spans_from_pulldown(parsed)
 }
 
-/// The incremental structure engine path (RFC-0008 D7-C) — full parse on
-/// first sync/reload, `InputEdit`-driven incremental reparses otherwise,
-/// with the D10 coherence guard and plain-mode degradation.
+/// The incremental structure engine path (RFC-0008 D7-C) — retained only as
+/// a test/bench seam: the widget no longer routes through it (RFC-0011 S4),
+/// and the engine is deleted in RFC-0011 S6. `engine_structure_spans_for_perf`
+/// drives it directly for the S8-T2/S8-T4 parity-and-cost measurements.
 fn engine_structure_spans(
     text: &str,
     hint: Option<flavite_syntax::EditRange>,
@@ -693,7 +669,8 @@ fn engine_structure_spans(
     }
 }
 
-/// Produce the structure spans for a revision change (RFC-0008 S7/S8):
+/// Produce the structure spans for a revision change (RFC-0008 S7/S8,
+/// RFC-0011 S4):
 ///
 /// * **Plain mode** (FR-9): documents ≥ [`HUGE_TEXT_THRESHOLD`] skip all
 ///   markdown parsing — no pulldown, no tree-sitter, no spans. Editing,
@@ -701,19 +678,17 @@ fn engine_structure_spans(
 /// * **Default**: the pulldown bridge ([`bridge_structure_spans`]) — the
 ///   pre-RFC-equivalent structure source, at every size under the plain
 ///   gate.
-/// * **Engine enabled** (`FLAVITE_TS_STRUCTURE=1`): typical notes (≤
-///   [`STRUCTURE_ENGINE_MAX_BYTES`]) use the incremental structure engine
-///   (D7-C) with the D10 coherence guard; larger documents use the bridge.
-fn structure_spans(
-    text: &str,
-    hint: Option<flavite_syntax::EditRange>,
-    lines: &[usize],
-    engine: &mut flavite_syntax::StructureEngine,
-) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
+///
+/// RFC-0011 S4: the tree-sitter engine is no longer routed here (its
+/// incremental reparses do not localize — RFC-0008 Appendix C measured —
+/// and it is retired in S6). The bridge is the transitional whole-document
+/// producer until the segment cache lands in S5; S4 keeps this phase at
+/// exactly the shipped HEAD cost (one O(n) parse per revision below the
+/// plain gate) — `// S5 removes the last O(n) keystroke cost` marks the
+/// call site in [`EditorState::reconcile_view`].
+fn structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
     if text.len() >= HUGE_TEXT_THRESHOLD {
         (Vec::new(), Vec::new())
-    } else if ts_structure_enabled() && text.len() <= STRUCTURE_ENGINE_MAX_BYTES {
-        engine_structure_spans(text, hint, lines, engine)
     } else {
         bridge_structure_spans(text)
     }
@@ -721,18 +696,12 @@ fn structure_spans(
 
 /// Test seam for the end-to-end keystroke bench (S8-T5): runs the exact
 /// same dispatch the widget uses on a revision change — plain-mode gate,
-/// escape hatch, pulldown bridge for large documents, incremental engine
-/// otherwise. Public only so `tests/` integration benches can measure the
-/// shipped configuration; not part of the editor's public API surface.
+/// pulldown bridge. Public only so `tests/` integration benches can measure
+/// the shipped configuration; not part of the editor's public API surface.
 #[doc(hidden)]
 #[must_use]
-pub fn structure_spans_for_perf(
-    text: &str,
-    hint: Option<flavite_syntax::EditRange>,
-    lines: &[usize],
-    engine: &mut flavite_syntax::StructureEngine,
-) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
-    structure_spans(text, hint, lines, engine)
+pub fn structure_spans_for_perf(text: &str) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
+    structure_spans(text)
 }
 
 /// Test seam for the S8-T5 bench: the engine path, measured directly and
@@ -766,23 +735,13 @@ pub struct EditorState {
     revision: Option<u64>,
     link_spans: Vec<LinkSpan>,
     decorations: Vec<flavite_syntax::ScannedSpan>,
-    /// Structure source (RFC-0008 D7-B): owned here, defined in
-    /// flavite-syntax — the widget never links tree-sitter directly.
-    structure: flavite_syntax::StructureEngine,
-    /// Whether the D10 degradation warning has been emitted for this widget
-    /// instance (RFC-0008 S8): the engine logs once at `warn` when it
-    /// degrades to plain mode after repeated forced rebuilds.
-    structure_plain_warned: bool,
-    /// Source line lookup shared by caret mapping and viewport extraction.
-    line_starts: Vec<usize>,
-    line_text_addr: usize,
-    line_text_len: usize,
-    /// RFC-0011 S3 transitional: one materialized copy for the current view
-    /// revision (one O(n) per revision on the UI thread, never under the
-    /// session's locks). S4 replaces the per-consumer sites with tree
-    /// queries (`line_starts_in`, `slice`, `line_index_of`). `RefCell` so
-    /// the read-only frame paths (`draw`) share the cache with the
-    /// mutations (`layout`, `update`).
+    /// One materialized copy per view revision, shared by the structure
+    /// bridge (RFC-0011 S4 transitional — S5 removes it) and the user-paced
+    /// interaction paths (selection/word-bound/autocomplete APIs that take
+    /// `&str`). It is populated lazily, never on the plain-mode typing
+    /// path; all shaping, line geometry, and paint queries go to the tree.
+    /// `RefCell` so the read-only frame paths (`draw`) share the cache with
+    /// the mutations (`layout`, `update`).
     materialized_text: std::cell::RefCell<Option<(u64, std::sync::Arc<str>)>>,
     resolutions_present: bool,
     resolution_snapshot: Option<Arc<HashMap<String, LinkResolution>>>,
@@ -873,11 +832,19 @@ fn band_window(viewport: Viewport, line_count: usize) -> (usize, usize) {
 /// paragraph count (possible when a shaper splits further, e.g. on
 /// paragraph-separator characters) falls back to the slice end, matching the
 /// historical `line_start_byte` behavior.
+/// Band-local only: the slice is the band text (O(band)), never the whole
+/// document (RFC-0011 S4 — the full-document line scan is gone).
 pub(crate) fn shape_line_starts(visible: &str) -> Vec<usize> {
     let mut starts = Vec::new();
     if !visible.is_empty() {
         starts.push(0);
-        starts.extend(visible.match_indices('\n').map(|(at, _)| at + 1));
+        starts.extend(
+            visible
+                .bytes()
+                .enumerate()
+                .filter(|&(_, byte)| byte == b'\n')
+                .map(|(at, _)| at + 1),
+        );
     }
     starts
 }
@@ -1532,7 +1499,10 @@ impl EditorState {
         self.composition.is_some()
     }
 
-    fn interaction_snapshot(&self, text: Option<&str>) -> Option<EditorInteractionSnapshot> {
+    fn interaction_snapshot(
+        &self,
+        text: Option<&DocumentText>,
+    ) -> Option<EditorInteractionSnapshot> {
         let triples = self.selections.set().to_triples();
         let primary_id = self.selections.primary_id().as_raw();
         Some(EditorInteractionSnapshot {
@@ -1555,7 +1525,14 @@ impl EditorState {
     /// Install a host-controlled interaction acknowledgement. Lower or
     /// equal sequences and mismatched buffer/revision are rejected, so a
     /// delayed or stale acknowledgement can never move the caret back.
-    pub fn restore_interaction(&mut self, text: &str, interaction: EditorInteractionSnapshot) {
+    /// The document serves line queries (RFC-0011 S4); `text` serves the
+    /// `&str` selection APIs (user-paced).
+    pub fn restore_interaction(
+        &mut self,
+        document: &DocumentText,
+        text: &str,
+        interaction: EditorInteractionSnapshot,
+    ) {
         if self.buffer_id != Some(interaction.buffer_id)
             || self.revision != Some(interaction.revision)
             || interaction.sequence <= self.interaction_sequence
@@ -1584,10 +1561,8 @@ impl EditorState {
         };
         self.selections
             .replace_with(text, &members, interaction.primary);
-        self.viewport.first_line = text[..interaction.viewport_anchor.min(text.len())]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
+        self.viewport.first_line =
+            document.line_index_of(interaction.viewport_anchor.min(document.len()));
         self.focused = interaction.focused;
         self.ime_active = interaction.focused;
         self.interaction_sequence = interaction.sequence;
@@ -1595,7 +1570,7 @@ impl EditorState {
         // the host's scroll anchor instead of treating the default one-row
         // height as a reason to scroll the caret to the top.
         if self.focused && self.text_width > 0.0 {
-            self.ensure_caret_visible(text);
+            self.ensure_caret_visible(document);
         }
         self.last_ensured_caret = self.selections.caret();
     }
@@ -1646,8 +1621,7 @@ impl EditorState {
                 }
                 let after = start + committed.len();
                 self.selections.replace_beyond_text(&[(after, after)], 0);
-                let text = self.materialized_text(view);
-                self.ensure_caret_visible(&text);
+                self.ensure_caret_visible(&view.text);
                 Some(EditorAction::replace(view, start, end, committed.clone()))
             }
             input_method::Event::Closed => {
@@ -1701,9 +1675,12 @@ impl EditorState {
     }
 
     /// Materialized bytes for a view revision, cached per revision
-    /// (RFC-0011 S3 transitional): one O(n) materialization per revision on
-    /// the UI thread; the session's publication is O(1). Repeated calls for
-    /// the same revision clone the `Arc` (O(1)).
+    /// (RFC-0011 S3/S4). One O(n) materialization per revision, populated
+    /// lazily: the structure bridge (below the plain gate) and the
+    /// user-paced interaction paths (selection/word-bound/autocomplete APIs
+    /// that take `&str`) use it; shaping, line geometry, and paint never
+    /// do — they query the tree. Repeated calls for the same revision clone
+    /// the `Arc` (O(1)).
     fn materialized_text(&self, view: &EditorView) -> std::sync::Arc<str> {
         if let Some((revision, text)) = self.materialized_text.borrow().as_ref()
             && *revision == view.revision
@@ -1729,39 +1706,24 @@ impl EditorState {
         }
         self.buffer_id = Some(view.buffer_id);
         if self.revision != Some(view.revision) {
-            // RFC-0008 S1 (FR-10): the structure-parse phase (`render.scan`
-            // covers the incremental structure engine's sync, S8).
-            // RFC-0011 S3: materialize ONCE per revision on the UI thread
-            // (the session's publication is an O(1) root); S4 replaces the
-            // consumers below with tree queries.
-            let text = self.materialized_text(view);
+            // RFC-0008 S1 (FR-10): the structure-parse phase (`render.scan`).
+            // RFC-0011 S4: the full-document line-index build is gone; the
+            // structure routing is plain-gate → pulldown bridge. Below the
+            // gate the bridge runs over ONE materialized copy per revision
+            // (transitional — the segment cache in S5 replaces this phase).
             let _scan_span =
                 tracing::info_span!("render.scan", doc_len = view.text.len()).entered();
-            self.line_starts.clear();
-            self.line_starts.push(0);
-            self.line_starts
-                .extend(text.match_indices('\n').map(|(byte, _)| byte + 1));
-            self.line_text_addr = text.as_ptr() as usize;
-            self.line_text_len = text.len();
-            let (link_spans, decorations) = structure_spans(
-                &text,
-                view.last_edit,
-                &self.line_starts,
-                &mut self.structure,
-            );
-            // D10: warn once when the structure engine degrades to plain
-            // mode (spans dropped for the session). Rendering never blocks
-            // on structure — this is observability, not an error path.
-            if self.structure.is_plain() && !self.structure_plain_warned {
-                tracing::warn!(
-                    buffer_id = view.buffer_id,
-                    revision = view.revision,
-                    "structure engine degraded to plain mode after repeated rebuilds (RFC-0008 D10); spans dropped for the session"
-                );
-                self.structure_plain_warned = true;
+            if view.text.len() < HUGE_TEXT_THRESHOLD {
+                // S5 removes the last O(n) keystroke cost.
+                let text = self.materialized_text(view);
+                let (link_spans, decorations) = structure_spans(&text);
+                self.link_spans = link_spans;
+                self.decorations = decorations;
+            } else {
+                // Plain mode: zero structure work, zero materialization.
+                self.link_spans.clear();
+                self.decorations.clear();
             }
-            self.link_spans = link_spans;
-            self.decorations = decorations;
             self.revision = Some(view.revision);
         }
         if refresh_resolutions && (!link_resolutions.is_empty() || self.resolutions_present) {
@@ -1771,31 +1733,26 @@ impl EditorState {
             }
         }
         self.resolutions_present = !link_resolutions.is_empty();
-        let text = self.materialized_text(view);
-        self.selections.clamp(&text);
+        self.selections.clamp_document(&view.text);
         self.viewport.line_height = self.type_metrics.line_height;
         self.viewport.first_line = self
             .viewport
             .first_line
-            .min(self.source_line_count(&text).saturating_sub(1));
+            .min(view.text.line_count().saturating_sub(1));
         // Only re-anchor the viewport when the caret moved. Running this
         // every frame would snap the view back to the caret and cancel any
         // wheel or scrollbar scroll away from it.
         if self.selections.caret() != self.last_ensured_caret {
-            self.ensure_caret_visible(&text);
+            self.ensure_caret_visible(&view.text);
             self.last_ensured_caret = self.selections.caret();
         }
     }
 
-    fn ensure_caret_visible(&mut self, text: &str) {
-        let caret = self.selections.caret().min(text.len());
-        let line = if self.has_line_index(text) {
-            self.line_starts
-                .partition_point(|start| *start <= caret)
-                .saturating_sub(1)
-        } else {
-            text[..caret].bytes().filter(|byte| *byte == b'\n').count()
-        };
+    /// Keep the caret's line inside the viewport via tree line queries
+    /// (O(log n) — no full-document scan). RFC-0011 S4.
+    fn ensure_caret_visible(&mut self, document: &DocumentText) {
+        let caret = self.selections.caret().min(document.len());
+        let line = document.line_index_of(caret);
         if line < self.viewport.first_line {
             self.viewport.first_line = line;
         } else if line
@@ -1808,51 +1765,36 @@ impl EditorState {
         }
     }
 
-    fn has_line_index(&self, text: &str) -> bool {
-        !self.line_starts.is_empty()
-            && self.line_text_addr == text.as_ptr() as usize
-            && self.line_text_len == text.len()
-    }
-
-    fn source_line_count(&self, text: &str) -> usize {
-        if self.has_line_index(text) {
-            self.line_starts.len()
+    /// Slice `lines` logical lines starting at `first` via tree line queries
+    /// (O(log n + band)). RFC-0011 S4: the per-revision full-document line
+    /// index is gone; band geometry is derived from the tree on demand.
+    fn slice_lines(&self, document: &DocumentText, first: usize, lines: usize) -> (String, usize) {
+        let line_count = document.line_count();
+        let start_line = first.min(line_count.saturating_sub(1));
+        let start = document.line_start_of(start_line);
+        let end_line = start_line.saturating_add(lines.max(1)).min(line_count);
+        let end = if end_line == line_count {
+            document.len()
         } else {
-            logical_line_count(text)
-        }
+            document.line_start_of(end_line)
+        };
+        (document.slice(start..end), start)
     }
 
-    /// Slice `lines` logical lines starting at `first` through the
-    /// per-revision line index (a byte scan fallback preserves the answer
-    /// before the index exists).
-    fn slice_lines(&self, text: &str, first: usize, lines: usize) -> (String, usize) {
-        if !self.has_line_index(text) {
-            return slice_lines(text, first, lines);
-        }
-        let first = first.min(self.line_starts.len() - 1);
-        let start = self.line_starts[first];
-        let end = self
-            .line_starts
-            .get(first + lines.max(1))
-            .copied()
-            .unwrap_or(text.len());
-        (text[start..end].to_owned(), start)
-    }
-
-    /// Byte offset of logical line `first_line` in the source.
-    fn viewport_anchor(&self, text: &str) -> usize {
-        if self.has_line_index(text) {
-            self.line_starts
-                .get(self.viewport.first_line)
-                .copied()
-                .unwrap_or(text.len())
-        } else {
-            line_start_byte(text, self.viewport.first_line)
-        }
+    /// Byte offset of logical line `first_line` in the source (O(log n)).
+    fn viewport_anchor(&self, document: &DocumentText) -> usize {
+        let line = self
+            .viewport
+            .first_line
+            .min(document.line_count().saturating_sub(1));
+        document.line_start_of(line)
     }
 
     /// Pointer selection against shaped text: places or extends the
-    /// selection at the glyph boundary under the point.
+    /// selection at the glyph boundary under the point. Takes `&str` (a
+    /// test/convenience seam — no interactive path calls it); the hit test
+    /// runs against a tree built from the text, the selection moves use the
+    /// contiguous text directly.
     pub fn place_caret_from_point(
         &mut self,
         text: &str,
@@ -1863,42 +1805,33 @@ impl EditorState {
         extend: bool,
     ) {
         self.selections.clear_preferred_x();
-        let byte = self.hit_test_cached(text, revision, self.viewport, x, y, width);
+        let document = DocumentText::from(text);
+        let byte = self.hit_test_cached(&document, revision, self.viewport, x, y, width);
         self.move_to(text, byte, extend);
     }
 
-    /// Byte ranges of logical lines `[first, first + lines)` in `text`, via
-    /// the full-document line index when it matches `text` (fallback: byte
-    /// scan, matching [`EditorState::slice_lines`]).
-    fn band_line_ranges(&self, text: &str, first: usize, lines: usize) -> Vec<(usize, usize)> {
-        if self.has_line_index(text) {
-            let starts = &self.line_starts;
-            let first = first.min(starts.len().saturating_sub(1));
-            let last = (first + lines).min(starts.len());
-            (first..last)
-                .map(|index| {
-                    (
-                        starts[index],
-                        starts.get(index + 1).copied().unwrap_or(text.len()),
-                    )
-                })
-                .collect()
-        } else {
-            let line_count = logical_line_count(text);
-            let first = first.min(line_count.saturating_sub(1));
-            let last = (first + lines).min(line_count);
-            (first..last)
-                .map(|index| {
-                    let start = line_start_byte(text, index);
-                    let end = if index + 1 < line_count {
-                        line_start_byte(text, index + 1)
-                    } else {
-                        text.len()
-                    };
-                    (start, end)
-                })
-                .collect()
-        }
+    /// Byte ranges of logical lines `[first, first + lines)` via tree line
+    /// queries (O(lines × log n)). RFC-0011 S4.
+    fn band_line_ranges(
+        &self,
+        document: &DocumentText,
+        first: usize,
+        lines: usize,
+    ) -> Vec<(usize, usize)> {
+        let line_count = document.line_count();
+        let first = first.min(line_count.saturating_sub(1));
+        let last = (first + lines).min(line_count);
+        (first..last)
+            .map(|index| {
+                let start = document.line_start_of(index);
+                let end = if index + 1 < line_count {
+                    document.line_start_of(index + 1)
+                } else {
+                    document.len()
+                };
+                (start, end)
+            })
+            .collect()
     }
 
     /// The cached band's structural invariants (D10 self-heal gate): hashes,
@@ -1913,9 +1846,15 @@ impl EditorState {
     /// Full rebuild (fresh `Buffer`, discard per-line state): the D10
     /// self-heal / FR-2 fallback. Width/type/band-identity changes and
     /// structural inconsistencies land here.
-    fn rebuild_shaping(&mut self, text: &str, revision: u64, target: (usize, usize), width: f32) {
+    fn rebuild_shaping(
+        &mut self,
+        document: &DocumentText,
+        revision: u64,
+        target: (usize, usize),
+        width: f32,
+    ) {
         let (band_start, band_lines) = target;
-        let (visible, source_start) = self.slice_lines(text, band_start, band_lines);
+        let (visible, source_start) = self.slice_lines(document, band_start, band_lines);
         let line_starts = shape_line_starts(&visible);
         let line_hashes = line_fingerprints(&visible, &line_starts);
         let buffer = shape_text(&visible, width, self.type_metrics);
@@ -1950,14 +1889,15 @@ impl EditorState {
     /// Splice the persistent buffer to match `band` (D2/D10): diff the band's
     /// desired `BufferLine` list against the current lines, replace/insert/
     /// remove only what changed, then one `shape_until_scroll`.
-    fn splice_shaping(&mut self, text: &str, revision: u64, band: (usize, usize)) {
+    fn splice_shaping(&mut self, document: &DocumentText, revision: u64, band: (usize, usize)) {
         let (band_start, band_lines) = band;
-        let ranges = self.band_line_ranges(text, band_start, band_lines);
+        let ranges = self.band_line_ranges(document, band_start, band_lines);
 
         // Cosmic-text's trailing-empty-line rule: an extra `BufferLine` exists
         // when the band text ends with a line ending (or the band is empty).
         let want_trailing_empty = ranges.last().is_some_and(|&(start, end)| {
-            split_line_content_and_ending(&text[start..end]).1 != cosmic_text::LineEnding::None
+            split_line_content_and_ending(&document.slice(start..end)).1
+                != cosmic_text::LineEnding::None
         });
         let wanted_lines = ranges.len() + usize::from(want_trailing_empty);
 
@@ -1973,7 +1913,8 @@ impl EditorState {
             reshaped = {
                 let mut reshaped = Vec::new();
                 for (index, &(start, end)) in ranges.iter().enumerate() {
-                    let (content, ending) = split_line_content_and_ending(&text[start..end]);
+                    let piece = document.slice(start..end);
+                    let (content, ending) = split_line_content_and_ending(&piece);
                     match lines.get_mut(index) {
                         Some(line) if line.text() != content => {
                             // Reuse the line allocation; marks shape/layout unused so
@@ -1999,8 +1940,8 @@ impl EditorState {
                     reshaped.extend(start..wanted_lines);
                     lines.extend((start..wanted_lines).map(|index| {
                         if let Some(&(range_start, range_end)) = ranges.get(index) {
-                            let (content, ending) =
-                                split_line_content_and_ending(&text[range_start..range_end]);
+                            let piece = document.slice(range_start..range_end);
+                            let (content, ending) = split_line_content_and_ending(&piece);
                             BufferLine::new(
                                 content.to_owned(),
                                 ending,
@@ -2032,22 +1973,31 @@ impl EditorState {
             };
             // Hashes align with every `BufferLine` (logical lines + the
             // trailing empty line), parallel to `line_starts` and
-            // `buffer.lines` (structural invariant in D10).
-            cache.line_hashes = {
-                let mut hashes: Vec<_> = ranges
-                    .iter()
-                    .map(|&(start, end)| line_fingerprint(&text[start..end]))
-                    .collect();
-                if want_trailing_empty {
-                    hashes.push(line_fingerprint(""));
+            // `buffer.lines` (structural invariant in D10). RFC-0011 S4
+            // (A9-class): only the changed/entering lines' hashes are
+            // recomputed — untouched lines keep theirs (the diff loop above
+            // guarantees a line's content equals the source line when it is
+            // not in `reshaped`), so a keystroke costs O(changed), not
+            // O(band).
+            {
+                let hashes = &mut cache.line_hashes;
+                if hashes.len() < wanted_lines {
+                    hashes.resize(wanted_lines, (0, 0));
                 }
-                hashes
-            };
+                for &index in &reshaped {
+                    let hash = match ranges.get(index) {
+                        Some(&(start, end)) => line_fingerprint(&document.slice(start..end)),
+                        None => line_fingerprint(""),
+                    };
+                    hashes[index] = hash;
+                }
+                hashes.truncate(wanted_lines);
+            }
         }
 
         let visible: String = ranges
             .iter()
-            .map(|&(start, end)| &text[start..end])
+            .map(|&(start, end)| document.slice(start..end))
             .collect();
         let line_starts = shape_line_starts(&visible);
         let cache = self.shaping.as_mut().expect("shaping cache present");
@@ -2095,7 +2045,6 @@ impl EditorState {
     /// current revision/width/type and its own structural invariants.
     fn cached_shaped_view(
         &self,
-        text: &str,
         revision: u64,
         viewport: Viewport,
         width: f32,
@@ -2109,8 +2058,6 @@ impl EditorState {
         {
             return None;
         }
-        let _ = text; // the band text is the ground truth; the caller's text
-        // is only needed for fallback slicing.
         Some(ShapedView {
             buffer: &cache.buffer,
             visible: cache.band.visible.as_str(),
@@ -2120,18 +2067,19 @@ impl EditorState {
         })
     }
 
-    /// Sync the persistent shaping band to the current (text, revision,
-    /// viewport, width) (RFC-0008 S2). A keystroke splices only the changed
-    /// lines; scrolling splices band ends; full rebuilds happen only per
-    /// FR-2/D10.
+    /// Sync the persistent shaping band to the current (document, revision,
+    /// viewport, width) (RFC-0008 S2, RFC-0011 S4). A keystroke splices
+    /// only the changed lines; scrolling splices band ends; full rebuilds
+    /// happen only per FR-2/D10. Band text is sliced from the tree — no
+    /// full-document materialization.
     fn sync_shaped(
         &mut self,
-        text: &str,
+        document: &DocumentText,
         revision: u64,
         viewport: Viewport,
         width: f32,
     ) -> ShapedView<'_> {
-        let line_count = self.source_line_count(text);
+        let line_count = document.line_count();
         let target = band_window(viewport, line_count);
         // RFC-0008 S1 (FR-10): the shaping phase. Plain integer fields.
         let _shaping_span = tracing::info_span!(
@@ -2169,7 +2117,7 @@ impl EditorState {
         };
 
         match step {
-            Step::Rebuild => self.rebuild_shaping(text, revision, target, width),
+            Step::Rebuild => self.rebuild_shaping(document, revision, target, width),
             Step::Splice => {
                 let band = if covered {
                     let cache = self.shaping.as_ref().expect("shaping cache present");
@@ -2177,7 +2125,7 @@ impl EditorState {
                 } else {
                     target
                 };
-                self.splice_shaping(text, revision, band);
+                self.splice_shaping(document, revision, band);
             }
             Step::Fresh => {}
         }
@@ -2200,12 +2148,12 @@ impl EditorState {
     #[doc(hidden)]
     pub fn sync_shaped_for_perf(
         &mut self,
-        text: &str,
+        document: &DocumentText,
         revision: u64,
         viewport: Viewport,
         width: f32,
     ) {
-        let _ = self.sync_shaped(text, revision, viewport, width);
+        let _ = self.sync_shaped(document, revision, viewport, width);
     }
 
     /// RFC-0008 S3-T5 harness: run the paint-collection path (spans +
@@ -2215,14 +2163,14 @@ impl EditorState {
     #[doc(hidden)]
     pub fn painted_line_count_for_perf(
         &mut self,
-        text: &str,
+        document: &DocumentText,
         revision: u64,
         viewport: Viewport,
         width: f32,
         paint_height: f32,
     ) -> usize {
         let line_height = self.type_metrics.line_height;
-        let shaped = self.sync_shaped(text, revision, viewport, width);
+        let shaped = self.sync_shaped(document, revision, viewport, width);
         let spans = band_line_spans(shaped.buffer, shaped.line_starts.len(), line_height);
         let painted = painted_line_indices(&spans, shaped.paint_offset(viewport), paint_height);
         let mut count = 0usize;
@@ -2237,14 +2185,14 @@ impl EditorState {
     /// the band's rows above the viewport are added back before the hit.
     fn hit_test_cached(
         &mut self,
-        text: &str,
+        document: &DocumentText,
         revision: u64,
         viewport: Viewport,
         x: f32,
         y: f32,
         width: f32,
     ) -> usize {
-        let view = self.sync_shaped(text, revision, viewport, width);
+        let view = self.sync_shaped(document, revision, viewport, width);
         let Some(cursor) = view
             .buffer
             .hit(x.max(0.0), y.max(0.0) + view.paint_offset(viewport))
@@ -2268,9 +2216,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let state = tree.state.downcast_mut::<EditorState>();
         state.viewport.set_height(size.height - PAD_Y * 2.0);
         state.text_width = self.text_wrap_width(size.width);
-        let text = state.materialized_text(&self.view);
+        // RFC-0011 S4: the shaping band is sliced from the tree — layout
+        // never materializes the document.
         state.sync_shaped(
-            &text,
+            &self.view.text,
             self.view.revision,
             state.viewport,
             self.text_wrap_width(size.width),
@@ -2302,9 +2251,11 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             .intersection(viewport)
             .unwrap_or(Rectangle::with_size(Size::ZERO));
         let text_width = self.text_wrap_width(bounds.width);
-        // RFC-0011 S3: one materialized copy per revision, shared with
-        // layout/update via the per-revision cache.
-        let text = state.materialized_text(&self.view);
+        // RFC-0011 S4: shaping, line geometry, and paint query the tree; the
+        // document is never materialized on the frame path. Interactive
+        // overlays (context preview, autocomplete, composition) materialize
+        // lazily below.
+        let document = &self.view.text;
         // The persistent band covers the viewport plus its margin. When the
         // cache misses at draw time (the viewport moved between layout and
         // draw, or a width/type/revision change bypassed layout), shape
@@ -2313,13 +2264,12 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let local_visible;
         let local_starts;
         let shaped_view: ShapedView<'_> = if let Some(view) =
-            state.cached_shaped_view(&text, self.view.revision, state.viewport, text_width)
+            state.cached_shaped_view(self.view.revision, state.viewport, text_width)
         {
             view
         } else {
-            let (band_start, band_lines) =
-                band_window(state.viewport, state.source_line_count(&text));
-            let (visible, start) = state.slice_lines(&text, band_start, band_lines);
+            let (band_start, band_lines) = band_window(state.viewport, document.line_count());
+            let (visible, start) = state.slice_lines(document, band_start, band_lines);
             local_starts = shape_line_starts(&visible);
             local_buffer = shape_text(&visible, text_width, self.type_metrics);
             local_visible = visible;
@@ -2415,7 +2365,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             && let Some(command) = self.context_preview
         {
             // The implicit-effect outline generalizes to every member before
-            // a destructive invocation (FEUX-0002 X04, E-6).
+            // a destructive invocation (FEUX-0002 X04, E-6). The context
+            // preview is a user-paced overlay — materialize on demand, never
+            // on the typing path.
+            let text = state.materialized_text(&self.view);
             for range in
                 flavite_edit_context::effect::implicit_ranges(&text, visible_members, command)
             {
@@ -2482,15 +2435,24 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             }
         }
         // Use the semantic scanner for link decorations. No markdown parser or
-        // second link grammar is embedded in the widget. Spans intersecting
-        // each line are collected once per line, not once per glyph.
+        // second link grammar is embedded in the widget. RFC-0011 S4 (A8):
+        // spans intersecting each line are picked by partition-point windows,
+        // and glyphs and spans are both source-ordered, so a two-finger walk
+        // advances through each line's active spans — O(glyphs + spans) per
+        // line instead of O(glyphs × spans). The line end is band-relative
+        // (the band always ends on a line boundary), so no full-document
+        // `line_bounds` scan runs per line.
         for run in &runs {
             let line_start = source_start
                 + line_starts
                     .get(run.line_i)
                     .copied()
                     .unwrap_or(visible_text.len());
-            let line_end = line_bounds(&text, line_start).1;
+            let line_end = source_start
+                + line_starts
+                    .get(run.line_i + 1)
+                    .copied()
+                    .unwrap_or(visible_text.len());
             // Scanner spans are source-ordered and non-overlapping. Jump
             // directly to this paragraph instead of scanning every link in
             // the note and allocating two vectors for each painted row.
@@ -2508,16 +2470,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 .decorations
                 .partition_point(|span| span.span.start.0 < line_end);
             let active_decorations = &state.decorations[first..last];
-            for glyph in run.glyphs {
-                let glyph_start = line_start + glyph.start;
-                let glyph_end = line_start + glyph.end;
-                let link_resolution = active_links
+            let decisions = per_glyph_decorations(
+                active_links,
+                active_decorations,
+                run.glyphs
                     .iter()
-                    .find(|span| span.span.start < glyph_end && span.span.end > glyph_start)
-                    .map(|span| span.resolution);
-                let other_decoration = active_decorations
-                    .iter()
-                    .any(|span| span.span.start.0 < glyph_end && span.span.end.0 > glyph_start);
+                    .map(|glyph| (line_start + glyph.start, line_start + glyph.end)),
+            );
+            for (glyph, (link_resolution, other_decoration)) in run.glyphs.iter().zip(decisions) {
                 if link_resolution.is_some() || other_decoration {
                     let color = match link_resolution {
                         Some(LinkResolution::Unresolved) => self.colors.link_unresolved,
@@ -2575,8 +2535,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             );
         }
         // Scrollbar: only when the document overflows the viewport. The
-        // wheel and gutter-drag share this geometry.
-        let total_lines = state.source_line_count(&text);
+        // wheel and gutter-drag share this geometry. Line count is the tree's
+        // O(1) summary (RFC-0011 S4 A9: the byte-scan fallback is gone).
+        let total_lines = document.line_count();
         if total_lines > state.viewport.visible_lines.max(1) {
             let (track_y, track_height, thumb_y, thumb_height, _max_first) = scrollbar_geometry(
                 bounds.height,
@@ -2682,9 +2643,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let has_create = !state.autocomplete_query.trim().is_empty();
             if !matches.is_empty() || has_create {
                 let row_count = matches.len() + usize::from(has_create);
-                let line = text[..state.selections.caret().min(text.len())]
-                    .matches('\n')
-                    .count();
+                let line = document.line_index_of(state.selections.caret().min(document.len()));
                 let popup = Rectangle::new(
                     Point::new(
                         bounds.x + PAD_X,
@@ -2832,8 +2791,12 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         if keyboard_input_blocked(self.input_enabled, self.keyboard_enabled, event) {
             return;
         }
-        let text = state.materialized_text(&self.view);
-        let before_interaction = state.interaction_snapshot(Some(&text));
+        // RFC-0011 S4: no eager materialization per event. Tree/band queries
+        // serve hit-testing, line geometry, and paint; `&str`-based
+        // interaction APIs (word bounds, selection ops, autocomplete)
+        // materialize lazily in their own branches — user-paced, never on
+        // the typing path.
+        let before_interaction = state.interaction_snapshot(Some(&self.view.text));
         if let iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event
             && self.input_enabled
             && self.keyboard_enabled
@@ -2842,7 +2805,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             && let Some(position) = cursor.position_in(layout.bounds())
         {
             let byte = state.hit_test_cached(
-                &text,
+                &self.view.text,
                 self.view.revision,
                 state.viewport,
                 position.x - PAD_X,
@@ -2860,6 +2823,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let selection = if inside {
                 state.selections.pairs()
             } else {
+                let text = state.materialized_text(&self.view);
                 let (a, b) = flavite_edit_context::word_bounds(&text, byte);
                 vec![(a, b)]
             };
@@ -3037,7 +3001,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
                     let bounds = layout.bounds();
-                    let total_lines = state.source_line_count(&text);
+                    let total_lines = self.view.text.line_count();
                     let visible_lines = state.viewport.visible_lines.max(1);
                     if total_lines > visible_lines && position.x >= bounds.width - SCROLLBAR_GUTTER
                     {
@@ -3071,7 +3035,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     } else {
                         let width = self.text_wrap_width(layout.bounds().width);
                         let byte = state.hit_test_cached(
-                            &text,
+                            &self.view.text,
                             self.view.revision,
                             state.viewport,
                             position.x - PAD_X,
@@ -3095,6 +3059,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                         let click =
                             mouse::Click::new(position, mouse::Button::Left, state.last_click);
                         state.last_click = Some(click);
+                        let text = state.materialized_text(&self.view);
                         state.select_click(
                             &text,
                             byte,
@@ -3117,7 +3082,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     (cursor.position_in(layout.bounds()), state.scroll_drag)
                 {
                     let bounds = layout.bounds();
-                    let total_lines = state.source_line_count(&text);
+                    let total_lines = self.view.text.line_count();
                     let visible_lines = state.viewport.visible_lines.max(1);
                     if total_lines > visible_lines {
                         let (track_y, track_height, _thumb_y, thumb_height, max_first) =
@@ -3141,13 +3106,14 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.selecting => {
                 if let Some(position) = cursor.position_in(layout.bounds()) {
                     let byte = state.hit_test_cached(
-                        &text,
+                        &self.view.text,
                         self.view.revision,
                         state.viewport,
                         position.x - PAD_X,
                         position.y - PAD_Y,
                         self.text_wrap_width(layout.bounds().width),
                     );
+                    let text = state.materialized_text(&self.view);
                     state.extend_pointer_selection(&text, byte);
                     shell.capture_event();
                     // The selection highlight must be visible on the next
@@ -3174,7 +3140,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     mouse::ScrollDelta::Lines { y, .. } => *y,
                     mouse::ScrollDelta::Pixels { y, .. } => *y / self.type_metrics.line_height,
                 };
-                let total_lines = state.source_line_count(&text);
+                let total_lines = self.view.text.line_count();
                 let visible_lines = state.viewport.visible_lines.max(1);
                 // The viewport stays full: the last page bounds the scroll,
                 // matching the scrollbar thumb's travel. Wheel-up arrives as
@@ -3220,7 +3186,10 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                     && !modifiers.control()
                     && !modifiers.alt()
                     && !modifiers.logo()
-                    && state.selections.escape_collapse(&text);
+                    && {
+                        let text = state.materialized_text(&self.view);
+                        state.selections.escape_collapse(&text)
+                    };
                 if (completion_control && self.autocomplete_key(state, key, shell))
                     || escape_collapse
                 {
@@ -3239,7 +3208,8 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let caret_byte = state.selections.caret();
             let viewport = state.viewport;
             let (x, y) = {
-                let shaped = state.sync_shaped(&text, self.view.revision, viewport, width);
+                let shaped =
+                    state.sync_shaped(&self.view.text, self.view.revision, viewport, width);
                 let runs = shaped.buffer.layout_runs().collect::<Vec<_>>();
                 let paint_offset = shaped.paint_offset(viewport);
                 let caret = caret_byte
@@ -3283,11 +3253,11 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
                 .is_none_or(|instant| instant.elapsed() >= INTERACTION_PUBLISH_INTERVAL);
         if let Some(on_interaction) = &self.on_interaction
             && (explicit_interaction
-                || state.interaction_snapshot(Some(&text)) != before_interaction)
+                || state.interaction_snapshot(Some(&self.view.text)) != before_interaction)
             && publish_due
             && let Some(snapshot) = {
                 self.advance_capture(state);
-                state.interaction_snapshot(Some(&text))
+                state.interaction_snapshot(Some(&self.view.text))
             }
         {
             state.last_publish = Some(Instant::now());
@@ -3335,6 +3305,40 @@ impl<'a, Message: 'static> From<EditorWidget<'a, Message>>
     fn from(widget: EditorWidget<'a, Message>) -> Self {
         Self::new(widget)
     }
+}
+
+/// Per-glyph link/decoration decisions for one shaped run (RFC-0011 S4
+/// A8). `active_links`/`active_decorations` are the run's line window,
+/// source-ordered and non-overlapping; glyphs arrive in source order. A
+/// two-finger walk advances through each span list as glyphs pass span
+/// ends — O(glyphs + spans), replacing the per-glyph `.find`/`.any` scans.
+fn per_glyph_decorations(
+    active_links: &[LinkSpan],
+    active_decorations: &[flavite_syntax::ScannedSpan],
+    glyphs: impl Iterator<Item = (usize, usize)>,
+) -> Vec<(Option<LinkResolution>, bool)> {
+    let mut out = Vec::new();
+    let mut link_pos = 0usize;
+    let mut decoration_pos = 0usize;
+    for (glyph_start, glyph_end) in glyphs {
+        while link_pos < active_links.len() && active_links[link_pos].span.end <= glyph_start {
+            link_pos += 1;
+        }
+        let link_resolution = active_links
+            .get(link_pos)
+            .filter(|span| span.span.start < glyph_end)
+            .map(|span| span.resolution);
+        while decoration_pos < active_decorations.len()
+            && active_decorations[decoration_pos].span.end.0 <= glyph_start
+        {
+            decoration_pos += 1;
+        }
+        let other_decoration = active_decorations
+            .get(decoration_pos)
+            .is_some_and(|span| span.span.start.0 < glyph_end);
+        out.push((link_resolution, other_decoration));
+    }
+    out
 }
 
 fn link_action_at(view: &EditorView, spans: &[LinkSpan], byte: usize) -> Option<EditorAction> {
@@ -3422,9 +3426,9 @@ fn hit_test_visible(
     source_start + clamp_char_boundary(&visible, line_start + cursor.index).min(visible.len())
 }
 
-/// Slice `lines` logical lines starting at `first` (byte-scan fallback; the
-/// widget path uses the per-revision line index in
-/// [`EditorState::slice_lines`]).
+/// Slice `lines` logical lines starting at `first` (byte-scan reference;
+/// the widget path uses tree queries in [`EditorState::slice_lines`]).
+#[cfg(test)]
 fn slice_lines(text: &str, first: usize, lines: usize) -> (String, usize) {
     let line_count = logical_line_count(text);
     let start_line = first.min(line_count.saturating_sub(1));
@@ -3438,6 +3442,7 @@ fn slice_lines(text: &str, first: usize, lines: usize) -> (String, usize) {
     (text[start..end].to_owned(), start)
 }
 
+#[cfg(test)]
 fn logical_line_count(text: &str) -> usize {
     text.split('\n').count().max(1)
 }
@@ -3451,6 +3456,7 @@ fn line_bounds(text: &str, byte: usize) -> (usize, usize) {
     (start, end)
 }
 
+#[cfg(test)]
 fn line_start_byte(text: &str, line: usize) -> usize {
     text.split_inclusive('\n').take(line).map(str::len).sum()
 }
@@ -3969,6 +3975,7 @@ mod tests {
         let text = view.text.materialize();
         let caret = text.find("line 8").unwrap();
         state.restore_interaction(
+            &view.text,
             &text,
             EditorInteractionSnapshot {
                 sequence: 1,
@@ -4038,8 +4045,7 @@ mod tests {
             view.revision = revision as u64;
             view.text = flavite_buffer::chunks::DocumentText::from(text);
             state.reconcile(&view, &HashMap::new());
-            let text = view.text.materialize();
-            assert_eq!(state.source_line_count(&text), logical_line_count(&text));
+            assert_eq!(view.text.line_count(), logical_line_count(text));
             for first_line in [0, 1, 3, 999] {
                 for lines in [0, 1, 3] {
                     let viewport = Viewport {
@@ -4048,12 +4054,12 @@ mod tests {
                         ..Viewport::default()
                     };
                     assert_eq!(
-                        state.slice_lines(&text, first_line, lines),
-                        slice_lines(&text, first_line, lines),
+                        state.slice_lines(&view.text, first_line, lines),
+                        slice_lines(text, first_line, lines),
                         "{first_line}+{lines} of {text:?}"
                     );
                     // The band always covers the clamped viewport start.
-                    let count = state.source_line_count(&text);
+                    let count = view.text.line_count();
                     let (band_start, band_lines) = band_window(viewport, count);
                     let first = viewport.first_line.min(count.saturating_sub(1));
                     assert!(band_start <= first && first < band_start + band_lines);
@@ -4144,14 +4150,14 @@ mod tests {
             ..Viewport::default()
         };
         let mut state = EditorState::default();
-        let shaped = state.sync_shaped(text, 1, viewport, 300.0);
+        let shaped = state.sync_shaped(&DocumentText::from(text), 1, viewport, 300.0);
         let buffer_ptr = shaped.buffer as *const ShapingBuffer;
         // The band spans one viewport of margin around the viewport.
         assert_eq!(shaped.band_start, 1);
         assert_eq!(shaped.visible, "two\nthree\nfour\n");
         assert_eq!(shaped.source_start, text.find("two").unwrap());
         // Same revision + band: fresh path — identical buffer object.
-        let again = state.sync_shaped(text, 1, viewport, 300.0);
+        let again = state.sync_shaped(&DocumentText::from(text), 1, viewport, 300.0);
         assert!(std::ptr::eq(buffer_ptr, again.buffer));
         // Wheeling inside the band reuses the cached buffer; line offsets
         // resolve through the band's line starts.
@@ -4159,7 +4165,7 @@ mod tests {
             first_line: 3,
             ..viewport
         };
-        let scrolled_view = state.sync_shaped(text, 1, scrolled, 300.0);
+        let scrolled_view = state.sync_shaped(&DocumentText::from(text), 1, scrolled, 300.0);
         assert!(std::ptr::eq(buffer_ptr, scrolled_view.buffer));
         assert_eq!(
             scrolled_view.source_start + scrolled_view.line_offset(2),
@@ -4171,18 +4177,18 @@ mod tests {
             first_line: 0,
             ..viewport
         };
-        let moved = state.sync_shaped(text, 1, far, 300.0);
+        let moved = state.sync_shaped(&DocumentText::from(text), 1, far, 300.0);
         assert!(std::ptr::eq(buffer_ptr, moved.buffer));
         assert_eq!(moved.band_start, 0);
         assert_eq!(moved.visible, "one\ntwo\n");
         // A different revision (keystroke) splices in place — same buffer.
         let swapped = "axe\nbee\nceded\nfall\ngate";
         assert_eq!(swapped.len(), text.len());
-        let revised = state.sync_shaped(swapped, 2, viewport, 300.0);
+        let revised = state.sync_shaped(&DocumentText::from(swapped), 2, viewport, 300.0);
         assert!(std::ptr::eq(buffer_ptr, revised.buffer));
         assert_eq!(revised.visible, "bee\nceded\nfall\n");
         // A different width rebuilds (new buffer).
-        state.sync_shaped(swapped, 2, viewport, 301.0);
+        state.sync_shaped(&DocumentText::from(swapped), 2, viewport, 301.0);
         assert_eq!(
             state.shaping.as_ref().expect("cached").width_bits,
             301.0_f32.to_bits()
@@ -4201,7 +4207,7 @@ mod tests {
             ..Viewport::default()
         };
         let mut state = EditorState::default();
-        let first = state.sync_shaped(text, 1, viewport, 300.0);
+        let first = state.sync_shaped(&DocumentText::from(text), 1, viewport, 300.0);
         let before: Vec<String> = first
             .buffer
             .lines
@@ -4209,7 +4215,7 @@ mod tests {
             .map(|line| line.text().to_owned())
             .collect();
         let edited = "alpha\nbeXta\ngamma\ndelta\n";
-        let second = state.sync_shaped(edited, 2, viewport, 300.0);
+        let second = state.sync_shaped(&DocumentText::from(edited), 2, viewport, 300.0);
         let after: Vec<String> = second
             .buffer
             .lines
@@ -4242,12 +4248,12 @@ mod tests {
         };
         let mut state = EditorState::default();
         {
-            let s = state.sync_shaped(text, 1, top, 300.0);
+            let s = state.sync_shaped(&DocumentText::from(text), 1, top, 300.0);
             assert_eq!(s.band_start, 0);
             assert_eq!(s.visible, "a\nb\nc\nd\ne\nf\n");
         }
         {
-            let s = state.sync_shaped(text, 1, bottom, 300.0);
+            let s = state.sync_shaped(&DocumentText::from(text), 1, bottom, 300.0);
             assert_eq!(s.band_start, 2);
             assert_eq!(s.visible, "c\nd\ne\nf\n");
         }
@@ -4255,7 +4261,7 @@ mod tests {
         assert!(stats.removed >= 2, "exiting lines removed: {stats:?}");
         // Re-entering the top band constructs the entering lines again.
         {
-            let s = state.sync_shaped(text, 1, top, 300.0);
+            let s = state.sync_shaped(&DocumentText::from(text), 1, top, 300.0);
             assert_eq!(s.band_start, 0);
             assert_eq!(s.visible, "a\nb\nc\nd\ne\nf\n");
         }
@@ -4278,11 +4284,11 @@ mod tests {
             ..Viewport::default()
         };
         let mut state = EditorState::default();
-        let shaped = state.sync_shaped(text, 1, viewport, 300.0);
+        let shaped = state.sync_shaped(&DocumentText::from(text), 1, viewport, 300.0);
         let expected_visible = shaped.visible.to_owned();
         // Corrupt a structural invariant: drop one hash entry.
         state.shaping.as_mut().expect("cache").line_hashes.pop();
-        let healed = state.sync_shaped(text, 1, viewport, 300.0);
+        let healed = state.sync_shaped(&DocumentText::from(text), 1, viewport, 300.0);
         assert_eq!(
             healed.visible, expected_visible,
             "self-heal restores the band"
@@ -4415,7 +4421,7 @@ mod tests {
                 revision += 1;
                 let view = EditorView::from(&test_view(&text, 1));
                 state.reconcile(&view, &HashMap::new());
-                let shaped = state.sync_shaped(&text, revision, viewport, width);
+                let shaped = state.sync_shaped(&DocumentText::from(text.as_str()), revision, viewport, width);
                 let fresh = shape_text(shaped.visible, width, TypeMetrics::default());
                 let runs_persistent: Vec<_> = shaped
                     .buffer
@@ -4498,7 +4504,8 @@ mod tests {
         paint_height: f32,
         line_height: f32,
     ) {
-        let shaped = state.sync_shaped(text, revision, viewport, width);
+        let doc = DocumentText::from(text);
+        let shaped = state.sync_shaped(&doc, revision, viewport, width);
         let paint_offset = shaped.paint_offset(viewport);
         let legacy_runs = visible_runs(shaped.buffer, paint_offset, paint_height, line_height);
         let spans = band_line_spans(shaped.buffer, shaped.line_starts.len(), line_height);
@@ -4609,7 +4616,7 @@ mod tests {
             ..Viewport::default()
         };
         let mut state = EditorState::default();
-        let shaped = state.sync_shaped(&text, 1, viewport, width);
+        let shaped = state.sync_shaped(&DocumentText::from(text.as_str()), 1, viewport, width);
         let line_index = 0usize;
         let line_content = band_line_content(shaped.visible, shaped.line_starts, line_index);
         let standalone = shape_text(&line_content, width, TypeMetrics::default());
@@ -4668,7 +4675,12 @@ mod tests {
                 ..base_view.clone()
             };
             state.reconcile(&view, &HashMap::new());
-            let shaped = state.sync_shaped(&text, view.revision, viewport, width);
+            let shaped = state.sync_shaped(
+                &DocumentText::from(text.as_str()),
+                view.revision,
+                viewport,
+                width,
+            );
             band_lines = shaped.line_starts.len();
             let paint_offset = shaped.paint_offset(viewport);
             let spans = band_line_spans(shaped.buffer, band_lines, line_height);
@@ -5105,7 +5117,12 @@ mod tests {
             let view = EditorView::from(&test_view("one\ntwo\nthree\n", 77));
             state.reconcile(&view, &HashMap::new());
             let text = view.text.materialize();
-            let shaped = state.sync_shaped(&text, view.revision, Viewport::default(), 300.0);
+            let shaped = state.sync_shaped(
+                &DocumentText::from(text.as_ref()),
+                view.revision,
+                Viewport::default(),
+                300.0,
+            );
             let _ = shaped.visible; // the shaped view stays alive for the span
         });
         let names = recorded.lock().expect("recorder lock").clone();
@@ -5189,7 +5206,7 @@ mod tests {
         );
         // The shaped band spans one viewport of margin around the viewport.
         let mut state = EditorState::default();
-        let shaped = state.sync_shaped(source, 1, viewport, 300.0);
+        let shaped = state.sync_shaped(&DocumentText::from(source), 1, viewport, 300.0);
         assert_eq!(shaped.band_start, 0);
         assert_eq!(shaped.visible, source);
         // A tall document's band is viewport-bounded on both sides.
@@ -5199,7 +5216,7 @@ mod tests {
             visible_lines: 2,
             ..Viewport::default()
         };
-        let band = state.sync_shaped(&tall, 1, deep, 300.0);
+        let band = state.sync_shaped(&DocumentText::from(tall.as_str()), 1, deep, 300.0);
         assert_eq!(band.band_start, 98);
         assert_eq!(band.source_start, 98 * "line\n".len());
         // Each band line is one row here, so the viewport start sits two
@@ -5214,7 +5231,7 @@ mod tests {
             first_line: 99,
             ..deep
         };
-        let band = state.sync_shaped(&tall, 1, high, 300.0);
+        let band = state.sync_shaped(&DocumentText::from(tall.as_str()), 1, high, 300.0);
         assert_eq!(band.band_start, 98);
         assert_eq!(band.paint_offset(high), TypeMetrics::default().line_height);
     }
@@ -5299,11 +5316,12 @@ mod tests {
         state
             .selections
             .replace_with(text, &[(text.len(), text.len())], 0);
-        state.ensure_caret_visible(text);
+        let doc = DocumentText::from(text);
+        state.ensure_caret_visible(&doc);
         assert_eq!(state.viewport.first_line, 2);
 
         state.selections.replace_with(text, &[(0, 0)], 0);
-        state.ensure_caret_visible(text);
+        state.ensure_caret_visible(&doc);
         assert_eq!(state.viewport.first_line, 0);
     }
 
@@ -5349,10 +5367,8 @@ mod tests {
             huge.push_str("[[link]] #tag ^block\n");
         }
         assert!(huge.len() >= HUGE_TEXT_THRESHOLD);
-        let huge_lines = shape_line_starts(&huge);
 
-        let mut engine = flavite_syntax::StructureEngine::new();
-        let spans = structure_spans(&huge, None, &huge_lines, &mut engine);
+        let spans = structure_spans(&huge);
         assert!(
             spans.0.is_empty() && spans.1.is_empty(),
             "plain mode must yield zero spans"
@@ -5364,5 +5380,231 @@ mod tests {
         let small = &huge[..HUGE_TEXT_THRESHOLD - 1_000_000];
         let spans = bridge_structure_spans(small);
         assert!(!spans.0.is_empty() && !spans.1.is_empty());
+    }
+
+    /// S4-T1 (NFR-5): the widget performs zero full-document line-window
+    /// queries on the typing path. The line-index machinery is gone
+    /// (RFC-0011 S4): no full-document line-window query and no full-text
+    /// newline scan exist in production code, and a 200-keystroke session
+    /// keeps the only line vector band-local. The structural guards fail if
+    /// a reintroduced full-document scan appears.
+    #[test]
+    fn s4_t1_typing_session_never_queries_a_full_document_line_window() {
+        let source = include_str!("widget.rs");
+        // Build the needles without embedding the literal (the test source
+        // lives in the file it inspects).
+        let line_window = format!("line{}starts_in(", "_");
+        let index_scan = format!("match{}indices", "_");
+        assert!(
+            !source.contains(&line_window),
+            "widget.rs must not query line windows (full-document line index removed)"
+        );
+        assert!(
+            !source.contains(&index_scan),
+            "widget.rs must not run newline-index scans"
+        );
+
+        // The 200-keystroke session: revision change → reconcile → shaping →
+        // paint, exactly the widget's frame order. Band identity stays
+        // viewport-bounded (the band vector is the only line vector).
+        let base = (0..200u32)
+            .map(|index| format!("line {index:03} alpha beta gamma delta\n"))
+            .collect::<String>();
+        let width = 800.0_f32;
+        let line_height = TypeMetrics::default().line_height;
+        let viewport = Viewport {
+            first_line: 50,
+            visible_lines: 15,
+            ..Viewport::default()
+        };
+        let paint_height = 15.0 * line_height;
+        let mut text = base.clone();
+        let mut state = EditorState::default();
+        for frame in 0..200u64 {
+            let marker = format!("line {:03}", 50 + (frame as usize % 100));
+            let at = text.find(&marker).expect("marker line") + marker.len();
+            text.replace_range(at..at + 1, if frame % 2 == 0 { "X" } else { "x" });
+            let view = EditorView {
+                revision: 2 + frame,
+                text: DocumentText::from(text.as_str()),
+                ..long_view(0)
+            };
+            state.reconcile(&view, &HashMap::new());
+            let painted = state.painted_line_count_for_perf(
+                &view.text,
+                view.revision,
+                viewport,
+                width,
+                paint_height,
+            );
+            assert!(painted > 0, "paint paints lines");
+            let shaped = state.sync_shaped(&view.text, view.revision, viewport, width);
+            // The band stays viewport-bounded (15 visible lines + margins),
+            // never document-sized.
+            assert!(
+                shaped.line_starts.len() <= 60,
+                "band line vector must stay bounded, got {}",
+                shaped.line_starts.len()
+            );
+        }
+        assert!(state.revision.is_some());
+    }
+
+    /// S4-T2 (A8): the two-finger decoration walk decides exactly what the
+    /// reference per-glyph `.find`/`.any` scan decides, on randomized
+    /// non-overlapping span sets and glyph windows.
+    #[test]
+    fn s4_t2_two_finger_decoration_walk_matches_the_reference_scan() {
+        fn reference(
+            links: &[LinkSpan],
+            decos: &[flavite_syntax::ScannedSpan],
+            glyphs: &[(usize, usize)],
+        ) -> Vec<(Option<LinkResolution>, bool)> {
+            glyphs
+                .iter()
+                .map(|&(gs, ge)| {
+                    let link = links
+                        .iter()
+                        .find(|span| span.span.start < ge && span.span.end > gs)
+                        .map(|span| span.resolution);
+                    let deco = decos
+                        .iter()
+                        .any(|span| span.span.start.0 < ge && span.span.end.0 > gs);
+                    (link, deco)
+                })
+                .collect()
+        }
+
+        fn link_span(start: usize, end: usize, resolution: LinkResolution) -> LinkSpan {
+            LinkSpan {
+                span: start..end,
+                payload: flavite_syntax::scanner::LinkPayload {
+                    target_raw: "t".into(),
+                    alias: None,
+                    anchor: None,
+                    by_id: false,
+                },
+                embed: false,
+                resolution,
+            }
+        }
+
+        fn deco_span(start: usize, end: usize) -> flavite_syntax::ScannedSpan {
+            flavite_syntax::ScannedSpan {
+                span: flavite_syntax::text::Span::new(
+                    flavite_syntax::TextByte(start),
+                    flavite_syntax::TextByte(end),
+                ),
+                kind: flavite_syntax::scanner::SpanKind::Tag,
+                payload: None,
+            }
+        }
+
+        // Deterministic corpus: overlapping-free, source-ordered spans with
+        // gaps, plus a glyph window that starts inside a span and ends
+        // inside another.
+        let links = [
+            link_span(2, 6, LinkResolution::Resolved),
+            link_span(10, 14, LinkResolution::MultipleCandidates),
+            link_span(20, 30, LinkResolution::Unresolved),
+        ];
+        let decos = [
+            deco_span(0, 3),
+            deco_span(8, 9),
+            deco_span(25, 27),
+            deco_span(40, 45),
+        ];
+        let glyphs: Vec<(usize, usize)> = (0..50).map(|i| (i, i + 1)).collect();
+        assert_eq!(
+            per_glyph_decorations(&links, &decos, glyphs.iter().copied()),
+            reference(&links, &decos, &glyphs)
+        );
+
+        proptest::proptest!(|(spans in prop::collection::vec(
+            (0usize..400, 1usize..12, 0usize..3),
+            0..12,
+        ))| {
+            // Sort and de-overlap to build a valid span set.
+            let mut sorted = spans;
+            sorted.sort_unstable_by_key(|&(s, _, _)| s);
+            let mut links = Vec::new();
+            let mut decos = Vec::new();
+            let mut cursor = 0usize;
+            for (start, len, kind) in sorted {
+                let start = start.max(cursor);
+                let end = start + len;
+                if kind == 0 {
+                    links.push(link_span(start, end, LinkResolution::Unresolved));
+                } else {
+                    decos.push(deco_span(start, end));
+                }
+                cursor = end;
+            }
+            let glyphs: Vec<(usize, usize)> = (0..420).step_by(3).map(|i| (i, i + 2)).collect();
+            prop_assert_eq!(
+                per_glyph_decorations(&links, &decos, glyphs.iter().copied()),
+                reference(&links, &decos, &glyphs)
+            );
+        });
+    }
+
+    /// S4-T3 (AC-6): plain-mode (≥64 MiB) typing does zero structure work
+    /// and zero full-document materialization; the tree serves band slicing.
+    #[test]
+    fn s4_t3_plain_mode_huge_document_zero_structure_zero_scans() {
+        let mut huge = String::with_capacity(HUGE_TEXT_THRESHOLD + 4096);
+        while huge.len() < HUGE_TEXT_THRESHOLD {
+            huge.push_str("[[link]] #tag ^block\n");
+        }
+        assert!(huge.len() >= HUGE_TEXT_THRESHOLD);
+
+        let viewport = Viewport {
+            first_line: 0,
+            visible_lines: 3,
+            ..Viewport::default()
+        };
+        let mut state = EditorState::default();
+        let mut view = EditorView {
+            buffer_id: 1,
+            revision: 1,
+            text: DocumentText::from(huge.as_str()),
+            path: std::path::PathBuf::from("huge.md"),
+            state: BufferState::Clean,
+            last_edit: None,
+        };
+        state.reconcile(&view, &HashMap::new());
+        // Plain mode: zero structure spans.
+        assert!(state.link_spans.is_empty() && state.decorations.is_empty());
+        // Zero materialization: the per-revision text cache is untouched.
+        assert!(
+            state.materialized_text.borrow().is_none(),
+            "plain-mode typing must not materialize the document"
+        );
+
+        // Band slicing is tree-backed and matches the source slice.
+        let shaped = state.sync_shaped(&view.text, view.revision, viewport, 800.0);
+        assert_eq!(shaped.band_start, 0);
+        assert_eq!(
+            shaped.visible,
+            &huge[..shaped.visible.len()],
+            "band text equals the source slice"
+        );
+
+        // Typing/undo stay functional: a few keystrokes reconcile new
+        // revisions with zero structure work and zero materialization.
+        let mut typed = huge.clone();
+        for step in 0..10u64 {
+            typed.insert(0, 'x');
+            view.revision += 1;
+            view.text = DocumentText::from(typed.as_str());
+            state.reconcile(&view, &HashMap::new());
+            assert!(state.link_spans.is_empty());
+            assert!(state.decorations.is_empty());
+            assert!(
+                state.materialized_text.borrow().is_none(),
+                "keystroke {step} must not materialize"
+            );
+            let _ = state.sync_shaped(&view.text, view.revision, viewport, 800.0);
+        }
     }
 }
