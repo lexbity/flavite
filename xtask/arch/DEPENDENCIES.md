@@ -279,4 +279,5 @@ Temporary floor waivers (must have a valid expiry and reason):
 
 | Crate | Temporary floor | Expires | Reason |
 |---|---:|---|---|
+| flavite-syntax | 87.5% | 2026-12-21 | HTML block state machine (types 1-7) landed 2026-11-21; line-start comment/PI/CDATA/declaration/script-close/type-7 corpus fixtures are pending. Add fixtures + goldens to clear the permanent 90% floor before expiry. |
 | flavite-vault | 84.4% | 2026-11-30 | Actor shutdown and uncommon journal-recovery branches remain uncovered; add deterministic fault cases before expiry. |

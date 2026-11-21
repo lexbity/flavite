@@ -3,7 +3,7 @@
 //! The document is partitioned into `Frontmatter | Fenced | Prose`
 //! segments by a line-level fence/frontmatter scanner; every prose
 //! segment's spans come from the shipped pulldown bridge
-//! ([`crate::pulldown_glue::parse_prose_segment`]) — the exact same
+//! (`parse_prose_segment`) — the exact same
 //! parser and converter as the whole-document bridge, so per-segment spans
 //! are byte-identical to the whole-document parse by construction.
 //!
@@ -332,45 +332,112 @@ fn build_segments(text: &impl StructureText) -> Vec<Segment> {
     let mut line = 0usize;
     let mut seg_start = 0usize;
     let mut state = FenceState::Closed;
-    let mut seg_class = step_class(text, 0, fm_end, state).0;
+    let mut para_open = false;
+    let mut html = None;
+    let mut seg_class = step_class(text, 0, fm_end, state, para_open, html).0;
     while line < line_count {
-        let (class, next_state) = step_class(text, line, fm_end, state);
+        let (class, next_state, next_para, next_html) =
+            step_class(text, line, fm_end, state, para_open, html);
         if class != seg_class {
             flush_segment(&mut segments, text, seg_start, line, seg_class);
             seg_start = line;
             seg_class = class;
         }
         state = next_state;
+        para_open = next_para;
+        html = next_html;
         line += 1;
     }
     flush_segment(&mut segments, text, seg_start, line_count, seg_class);
     segments
 }
 
-/// The class of line `line` and the fence state after it (see
-/// [`build_segments`]). Opener and closer lines belong to the fenced run.
+/// The class of line `line`, the fence state after it, and whether a
+/// paragraph is open after it (see [`build_segments`]). Opener and closer
+/// lines belong to the fenced run.
+///
+/// Fence openers are honored unconditionally outside the frontmatter
+/// region (pulldown opens fenced code blocks after paragraph lines too;
+/// the corpus and goldens encode this behavior). HTML blocks are the one
+/// exclusion: raw-HTML regions are classified `Fenced` and suppress fence
+/// openers while active, so no prose segment is ever re-parsed across an
+/// HTML boundary — per-segment bridge parses cannot carry an open
+/// comment/tag across a segment cut.
 fn step_class(
     text: &impl StructureText,
     line: usize,
     fm_end: usize,
     state: FenceState,
-) -> (SegmentKind, FenceState) {
+    para_open: bool,
+    html: Option<HtmlBlockKind>,
+) -> (SegmentKind, FenceState, bool, Option<HtmlBlockKind>) {
     let line_text = line_text(text, line);
     match state {
         FenceState::Closed => {
+            // An active HTML raw region suppresses all scanning: its lines
+            // are classified `Fenced` (excluded) so no prose segment is
+            // ever re-parsed across an HTML boundary — per-segment bridge
+            // parses cannot carry an open comment/tag across a segment cut.
+            if let Some(kind) = html {
+                // The terminator line belongs to the raw region too (the
+                // bridge masks it in full); the state clears after it.
+                return (
+                    SegmentKind::Fenced,
+                    FenceState::Closed,
+                    false,
+                    if html_block_ends(&line_text, kind) {
+                        None
+                    } else {
+                        html
+                    },
+                );
+            }
+            // HTML block start (any region, including frontmatter): types
+            // 1–5 may interrupt a paragraph; generic tags (type 6/7) may
+            // not — inside a paragraph they stay paragraph text.
+            if let Some(kind) = html_block_kind(&line_text) {
+                let can_start = if line >= fm_end {
+                    kind != HtmlBlockKind::Generic || !para_open
+                } else {
+                    true
+                };
+                if can_start {
+                    // If the opener line itself terminates the block (e.g.
+                    // `<? ... ?>`), the raw region ends with this line.
+                    let next_html = if html_block_ends(&line_text, kind) {
+                        None
+                    } else {
+                        Some(kind)
+                    };
+                    return (SegmentKind::Fenced, FenceState::Closed, false, next_html);
+                }
+            }
+            if line >= fm_end {
+                // Fence openers inside the frontmatter region are honored
+                // unconditionally (existing behavior): the region is a
+                // block, not a paragraph, so no gating applies.
+                if let Some((ch, n)) = fence_opener(&line_text) {
+                    return (SegmentKind::Fenced, FenceState::Open(ch, n), false, None);
+                }
+                if is_blank_line(&line_text) {
+                    return (SegmentKind::Prose, FenceState::Closed, false, None);
+                }
+                if is_block_interrupt(&line_text) {
+                    return (SegmentKind::Prose, FenceState::Closed, false, None);
+                }
+                return (SegmentKind::Prose, FenceState::Closed, true, None);
+            }
             if let Some((ch, n)) = fence_opener(&line_text) {
-                (SegmentKind::Fenced, FenceState::Open(ch, n))
-            } else if line < fm_end {
-                (SegmentKind::Frontmatter, FenceState::Closed)
+                (SegmentKind::Fenced, FenceState::Open(ch, n), false, None)
             } else {
-                (SegmentKind::Prose, FenceState::Closed)
+                (SegmentKind::Frontmatter, FenceState::Closed, false, None)
             }
         }
         FenceState::Open(ch, n) => {
             if fence_closer(&line_text, ch, n) {
-                (SegmentKind::Fenced, FenceState::Closed)
+                (SegmentKind::Fenced, FenceState::Closed, false, None)
             } else {
-                (SegmentKind::Fenced, FenceState::Open(ch, n))
+                (SegmentKind::Fenced, FenceState::Open(ch, n), false, None)
             }
         }
     }
@@ -437,10 +504,21 @@ fn resegment_from(
     } else {
         0
     };
-    let mut seg_class = step_class(text, back, fm_end, state).0;
+    // Paragraph state at `back`: when the rescan starts mid-document, derive
+    // it from the immediately preceding line (blank or a block-interrupt
+    // closes the paragraph; fence-shaped lines are treated as closed, which
+    // is exact for closers and conservative for gated openers — the cut
+    // verifier re-checks boundary trustworthiness).
+    let mut para_open = matches!(seed, FenceState::Closed) && back > 0 && {
+        let prev = line_text(text, back - 1);
+        !is_blank_line(&prev) && !is_block_interrupt(&prev) && !is_fence_shaped(&prev)
+    };
+    let mut html = None;
+    let mut seg_class = step_class(text, back, fm_end, state, para_open, html).0;
     let mut broke_at_cut = false;
     while line < line_count {
-        let (class, next_state) = step_class(text, line, fm_end, state);
+        let (class, next_state, next_para, next_html) =
+            step_class(text, line, fm_end, state, para_open, html);
         if class != seg_class {
             // Complete the current run first so a cut at this boundary
             // includes it in the kept window.
@@ -468,6 +546,8 @@ fn resegment_from(
             seg_class = class;
         }
         state = next_state;
+        para_open = next_para;
+        html = next_html;
         line += 1;
     }
     if !broke_at_cut {
@@ -715,6 +795,364 @@ fn validate_tiling(segments: &[Segment], text: &impl StructureText) -> bool {
 /// fences carry only indentation (≤3 spaces), which the fence rules accept.
 fn leading_spaces(s: &str) -> usize {
     s.bytes().take_while(|&b| b == b' ').count()
+}
+
+/// The line content after at most 3 leading spaces (container indentation
+/// is not stripped — see [`fence_opener`]).
+fn strip_container_indent(line: &str) -> &str {
+    &line[leading_spaces(line).min(3)..]
+}
+
+fn is_blank_line(line: &str) -> bool {
+    line.trim().is_empty()
+}
+
+/// ATX heading: 1–6 `#` followed by space/tab or end of line.
+fn is_atx_heading(line: &str) -> bool {
+    let rest = strip_container_indent(line);
+    let mut chars = rest.chars();
+    let mut n = 0usize;
+    for c in chars.by_ref() {
+        if c == '#' && n < 6 {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n >= 1 && matches!(chars.next(), None | Some(' ' | '\t'))
+}
+
+/// Setext heading underline (`=`/`-` run) or thematic break (`-` run ≥ 3).
+fn is_setext_or_thematic_dash(line: &str) -> bool {
+    let trimmed = strip_container_indent(line)
+        .trim_end_matches(['\n', '\r'])
+        .trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().all(|c| c == '=') {
+        return true;
+    }
+    trimmed.chars().all(|c| c == '-') && trimmed.len() >= 3
+}
+
+/// Thematic break of `*` or `_` (≥ 3 markers, whitespace between allowed).
+fn is_thematic_star_underscore(line: &str) -> bool {
+    let trimmed = strip_container_indent(line)
+        .trim_end_matches(['\n', '\r'])
+        .trim_end();
+    let ch = match trimmed.chars().next() {
+        Some(c @ ('*' | '_')) => c,
+        _ => return false,
+    };
+    let mut count = 0usize;
+    for c in trimmed.chars() {
+        if c == ch {
+            count += 1;
+        } else if c == ' ' || c == '\t' {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    count >= 3
+}
+
+/// List item marker: bullet (`-`/`+`/`*`) or ordered (`1.`/`1)`) followed
+/// by space/tab or end of line.
+fn is_list_marker_line(line: &str) -> bool {
+    let mut chars = strip_container_indent(line).chars();
+    match chars.next() {
+        Some('-' | '+' | '*') => matches!(chars.next(), Some(' ' | '\t') | None),
+        Some(d) if d.is_ascii_digit() => {
+            let mut digits = 1usize;
+            for c in chars.by_ref() {
+                if c.is_ascii_digit() && digits < 9 {
+                    digits += 1;
+                } else {
+                    break;
+                }
+            }
+            matches!(chars.next(), Some('.') | Some(')'))
+                && matches!(chars.next(), Some(' ' | '\t') | None)
+        }
+        _ => false,
+    }
+}
+
+fn is_blockquote_line(line: &str) -> bool {
+    matches!(strip_container_indent(line).chars().next(), Some('>'))
+}
+
+/// HTML block kind (CommonMark block types, approximated for the segment
+/// scanner's purpose: knowing when a raw-HTML region ends so fence openers
+/// inside it never fire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HtmlBlockKind {
+    /// Type 1: `<script`/`<pre`/`<style`/`<textarea` — ends at its closing
+    /// tag, ignoring blank lines.
+    ScriptClose(&'static str),
+    /// Type 2: `<!--` — ends at `-->`.
+    Comment,
+    /// Type 3: `<?` — ends at `?>`.
+    Pi,
+    /// Type 4: `<!` + uppercase letter — ends at `>`.
+    Declaration,
+    /// Type 5: `<!CDATA[[` — ends at `]]>`.
+    Cdata,
+    /// Types 6/7: any other `<`-tag — ends at the first blank line.
+    Generic,
+}
+
+/// The HTML block kind started at this line, if any.
+fn html_block_kind(line: &str) -> Option<HtmlBlockKind> {
+    let rest = strip_container_indent(line);
+    let bytes = rest.as_bytes();
+    if !bytes.starts_with(b"<") {
+        return None;
+    }
+    if rest.starts_with("<!--") {
+        return Some(HtmlBlockKind::Comment);
+    }
+    if rest.starts_with("<?") {
+        return Some(HtmlBlockKind::Pi);
+    }
+    if rest.starts_with("<![CDATA[") {
+        return Some(HtmlBlockKind::Cdata);
+    }
+    if rest.starts_with("<!") && bytes.get(2).is_some_and(|b| b.is_ascii_uppercase()) {
+        return Some(HtmlBlockKind::Declaration);
+    }
+    for tag in ["script", "pre", "style", "textarea"] {
+        if rest[1..].to_ascii_lowercase().starts_with(tag)
+            && html_name_boundary(rest.as_bytes(), 1 + tag.len())
+        {
+            return Some(HtmlBlockKind::ScriptClose(tag));
+        }
+    }
+    // Type 6: `<` followed by a known block-level tag name (commonmark.js
+    // whitelist; pulldown does not open an unclosed block for inline tags
+    // like `<em>`/`<span>` or unknown names). No closing `>` is required.
+    for tag in HTML_BLOCK_TAGS {
+        if rest[1..].starts_with(tag) && html_name_boundary(rest.as_bytes(), 1 + tag.len()) {
+            return Some(HtmlBlockKind::Generic);
+        }
+    }
+    // Type 7: a complete open or close tag — `<name …>` with a `>` on the
+    // line and only whitespace after it (a line with trailing content is
+    // an inline tag, masked by the bridge inside its prose segment, and is
+    // not a block).
+    let after_lt = if bytes.get(1) == Some(&b'/') {
+        &rest[2..]
+    } else {
+        &rest[1..]
+    };
+    if is_complete_tag(after_lt) {
+        // A complete open/close tag that ends at a `>` with only
+        // whitespace after it is a type-7 block; trailing content makes it
+        // an inline tag (masked by the bridge inside its prose segment).
+        if let Some(idx) = after_lt.find('>') {
+            let after = after_lt[idx + 1..].trim_end_matches(['\n', '\r']).trim();
+            if after.is_empty() {
+                return Some(HtmlBlockKind::Generic);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `s` (the text after `<` or `</`) is a syntactically complete
+/// HTML tag: a name, optional whitespace-separated attributes (possibly
+/// with quoted/unquoted values), optional self-closing `/`, then `>`.
+fn is_complete_tag(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.first().is_none_or(|c| !c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut i = 1usize;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'-') {
+        i += 1;
+    }
+    loop {
+        let mut saw_ws = false;
+        while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+            saw_ws = true;
+        }
+        if i >= b.len() {
+            return false;
+        }
+        match b[i] {
+            b'>' => return true,
+            b'/' => return b.get(i + 1) == Some(&b'>'),
+            _ => {
+                // Attribute name: CommonMark requires whitespace before
+                // each attribute (`<SSj1:>` is not a tag).
+                if !saw_ws {
+                    return false;
+                }
+                if !(b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b':') {
+                    return false;
+                }
+                while i < b.len()
+                    && (b[i].is_ascii_alphanumeric()
+                        || b[i] == b'_'
+                        || b[i] == b':'
+                        || b[i] == b'-'
+                        || b[i] == b'.')
+                {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'=' {
+                    i += 1;
+                    if i < b.len() && (b[i] == b'"' || b[i] == b'\'') {
+                        let quote = b[i];
+                        i += 1;
+                        while i < b.len() && b[i] != quote {
+                            i += 1;
+                        }
+                        if i >= b.len() {
+                            return false;
+                        }
+                        i += 1;
+                    } else {
+                        let start = i;
+                        while i < b.len() && !matches!(b[i], b' ' | b'\t' | b'\r' | b'\n' | b'>') {
+                            i += 1;
+                        }
+                        if i == start {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Block-level tag names recognized by pulldown's type-6 HTML blocks
+/// (the commonmark.js `htmlBlockTags` whitelist).
+const HTML_BLOCK_TAGS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+];
+
+/// An HTML tag name ends at byte `i`: end of line or whitespace/`>` (a
+/// `/` is only a valid boundary inside a complete tag, handled by
+/// [`is_complete_tag`]).
+fn html_name_boundary(bytes: &[u8], i: usize) -> bool {
+    bytes
+        .get(i)
+        .is_none_or(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'>'))
+}
+
+/// Whether line `line` ends an active HTML block of `kind`.
+fn html_block_ends(line: &str, kind: HtmlBlockKind) -> bool {
+    match kind {
+        HtmlBlockKind::Generic => is_blank_line(line),
+        HtmlBlockKind::Comment => line.contains("-->"),
+        HtmlBlockKind::Pi => line.contains("?>"),
+        HtmlBlockKind::Declaration => line.contains('>'),
+        HtmlBlockKind::Cdata => line.contains("]]>"),
+        HtmlBlockKind::ScriptClose(tag) => line.contains(&format!("</{tag}")),
+    }
+}
+
+/// A line that closes a paragraph: blank, or a block-level construct that
+/// CommonMark allows to interrupt a paragraph (heading, thematic break,
+/// list item, blockquote, HTML block). Fence openers are handled
+/// separately by [`step_class`].
+fn is_block_interrupt(line: &str) -> bool {
+    is_atx_heading(line)
+        || is_setext_or_thematic_dash(line)
+        || is_thematic_star_underscore(line)
+        || is_list_marker_line(line)
+        || is_blockquote_line(line)
+}
+
+/// A fence-shaped line (opener or closer candidate): ≥ 3 backticks/tildes
+/// at line start after ≤ 3 spaces, with only whitespace after.
+fn is_fence_shaped(line: &str) -> bool {
+    if fence_opener(line).is_some() {
+        return true;
+    }
+    let indent = leading_spaces(line);
+    if indent > 3 {
+        return false;
+    }
+    let mut chars = line[indent..].chars();
+    let ch = match chars.next() {
+        Some(c @ ('`' | '~')) => c,
+        _ => return false,
+    };
+    let mut n = 1usize;
+    for c in chars.by_ref() {
+        if c == ch {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n >= 3 && chars.all(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r')
 }
 
 /// A fence opener at this line: `(fence_char, length)`. Up to 3 leading

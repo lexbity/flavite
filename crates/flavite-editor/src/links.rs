@@ -232,10 +232,9 @@ mod tests {
         // A closed wikilink whose target has no indexed note still scans as
         // a link (the graph's grey node and the create-from-link flow both
         // key off this payload); spaces in the target are legal.
-        let parsed = flavite_syntax::pulldown_glue::parse_normalized(
-            "# Alpha\n\nalpha body\n[[zz test]]",
-        )
-        .unwrap();
+        let parsed =
+            flavite_syntax::pulldown_glue::parse_normalized("# Alpha\n\nalpha body\n[[zz test]]")
+                .unwrap();
         let links = spans_from_pulldown(parsed).0;
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].payload.target_raw, "zz test");

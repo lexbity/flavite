@@ -63,6 +63,9 @@ impl OpStoreIo for MemIo {
     fn remove(&self, path: &std::path::Path) -> Result<(), String> {
         self.0.remove(path).map_err(|e| e.to_string())
     }
+    fn remove_dir_all(&self, path: &std::path::Path) -> Result<(), String> {
+        self.0.remove_dir_all(path).map_err(|e| e.to_string())
+    }
 }
 
 fuzz_target!(|data: &[u8]| {

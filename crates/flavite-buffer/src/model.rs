@@ -309,7 +309,7 @@ impl EditorModel {
 
     /// A cheap, shareable text view over the current root (O(1); never
     /// materializes). Consumers hold this across revision boundaries; full
-    /// text is obtained with [`DocumentText::materialize`] on their own
+    /// text is obtained with [`crate::chunks::DocumentText::materialize`] on their own
     /// threads (RFC-0011 D-10/D-11).
     #[must_use]
     pub fn document_text(&self) -> crate::chunks::DocumentText {

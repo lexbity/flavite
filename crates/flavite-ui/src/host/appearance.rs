@@ -135,7 +135,7 @@ pub struct AppearanceHost {
     /// The last keymap-validation failure for Context Mode keys.
     pub keymap_error: Option<String>,
     /// The violation count of the last whole-layer keymap rejection at
-    /// adoption ([`EventKind::KeymapLayerRejected`]); `None` when the last
+    /// adoption ([`crate::host::editor_diagnostics::EventKind::KeymapLayerRejected`]); `None` when the last
     /// adoption accepted the layer. Consumed by the App via
     /// [`Self::take_keymap_rejection`] so the diagnostics ring records the
     /// event exactly once per rejection.
@@ -566,7 +566,7 @@ impl AppearanceHost {
 
     /// Consume the keymap-rejection record from the last adoption. The App
     /// calls this after every adoption path (attach, focus-gained, apply)
-    /// to emit [`EventKind::KeymapLayerRejected`] exactly once per
+    /// to emit [`crate::host::editor_diagnostics::EventKind::KeymapLayerRejected`] exactly once per
     /// rejection.
     #[must_use]
     pub fn take_keymap_rejection(&mut self) -> Option<usize> {

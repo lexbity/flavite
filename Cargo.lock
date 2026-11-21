@@ -1461,7 +1461,6 @@ dependencies = [
  "blake3",
  "chrono",
  "crossbeam",
- "directories",
  "flavite-buffer",
  "flavite-edit-context",
  "flavite-encoding",
@@ -1636,7 +1635,6 @@ name = "flavite-syntax"
 version = "0.1.0"
 dependencies = [
  "flavite-encoding",
- "proptest",
  "pulldown-cmark",
  "serde",
  "serde_json",

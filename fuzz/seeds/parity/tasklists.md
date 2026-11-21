@@ -1,0 +1,4 @@
+- [ ] unchecked task with [[unchecked-link]] and #unchecked-tag
+- [x] checked task with ![[checked-embed]]
+- [ ] another with ^unchecked-block
+- plain item with [[plain-item-link]]

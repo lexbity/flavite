@@ -54,11 +54,7 @@ fn widget_structure_path_matches_pulldown_on_the_corpus() {
         let mut segment = SegmentIndex::new();
         segment.sync(&text, None);
         let spans = segment.spans();
-        let segment_path = flavite_editor::links::spans_from_canonical(
-            spans.0,
-            spans.1,
-            spans.2,
-        );
+        let segment_path = flavite_editor::links::spans_from_canonical(spans.0, spans.1, spans.2);
         assert_eq!(
             segment_path,
             pulldown,

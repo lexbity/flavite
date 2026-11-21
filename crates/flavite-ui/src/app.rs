@@ -4834,7 +4834,7 @@ impl App {
     }
 
     /// Adopt-time keymap rejection hook: emit
-    /// [`EventKind::KeymapLayerRejected`] once when the last settings
+    /// [`crate::host::editor_diagnostics::EventKind::KeymapLayerRejected`] once when the last settings
     /// adoption refused the whole user keymap layer (FR-5 / E-6). Every
     /// adoption path (attach, focus-gained, apply, backup restore) calls
     /// this right after `appearance.load`/`apply_resolved`.

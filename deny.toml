@@ -61,6 +61,11 @@ ignore = [
     # Linux build. The advisory's suggested replacement (core::pin::pin!)
     # is upstream's to make in wasmtimer; re-evaluate on a wasmtimer update.
     { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.1 is reachable only via wasmtimer on wasm32 targets; not part of the shipped Linux build; review on wasmtimer update by 2027-04-30." },
+    # Review by 2027-04-30. chrono is unmaintained (all versions affected; no
+    # upgrade path) and is a DIRECT dependency of flavite-api, flavite-ui, and
+    # xtask (timestamps, serde-backed dates). Migration to jiff/time is a
+    # separate tracked effort; this ignore records the interim state.
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4 is unmaintained with no upgrade; direct dependency of flavite-api/ui/xtask; migration to jiff/time tracked separately; review by 2027-04-30." },
 ]
 
 [bans]

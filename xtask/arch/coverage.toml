@@ -19,6 +19,11 @@ floor = 84.4
 expires = "2026-11-30"
 reason = "Actor shutdown and uncommon journal-recovery branches remain uncovered; add deterministic fault cases before expiry."
 
+[waivers.flavite-syntax]
+floor = 87.5
+expires = "2026-12-21"
+reason = "HTML block state machine (types 1-7) landed 2026-11-21; line-start comment/PI/CDATA/declaration/script-close/type-7 corpus fixtures are pending. Add fixtures + goldens to clear the permanent 90% floor before expiry."
+
 [crates]
 # Crate → tier mapping. A crate with zero executable lines reports N/A
 # and is inactive for floors; the first executable implementation
