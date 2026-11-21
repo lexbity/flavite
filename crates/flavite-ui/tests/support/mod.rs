@@ -167,15 +167,21 @@ pub fn vault_stack(
     let cache = tempfile::tempdir().expect("cache dir");
     let db = cache.path().join("fixture-index.sqlite3");
     drop(flavite_index::open_or_init(&db).expect("index"));
+    let channels = ChannelSet::new();
     let actor = VaultActorBuilder::new()
         .with_fs(Box::new(SharedFs(fs.clone())) as Box<dyn Fs + Send + Sync>)
         .with_identity(identity.clone())
         .with_index(IndexActor::new(&db, 1).expect("index actor"))
+        // Production wiring (flavite-vault/src/open.rs): the actor publishes
+        // VaultChanged pulses into the channel the session drains. Without
+        // this the UI never sees a reconcile that finishes after its first
+        // catalog query — the catalog stays empty forever (stalled the
+        // vault_search_workbench CI leg, 2026-11-21).
+        .with_pulse_sender(channels.pulse.sender())
         .build()
         .expect("actor")
         .start()
         .expect("start");
-    let channels = ChannelSet::new();
     let data_dir = cache.path().join("device");
     let session = Session::new_with_data_dir(
         identity.clone(),
@@ -221,15 +227,16 @@ pub fn reopen_facade(
     let cache = tempfile::tempdir().expect("cache dir");
     let db = cache.path().join("reopen-index.sqlite3");
     drop(flavite_index::open_or_init(&db).expect("index"));
+    let channels = ChannelSet::new();
     let actor = VaultActorBuilder::new()
         .with_fs(Box::new(SharedFs(fs.clone())) as Box<dyn Fs + Send + Sync>)
         .with_identity(identity.clone())
         .with_index(IndexActor::new(&db, 1).expect("index actor"))
+        .with_pulse_sender(channels.pulse.sender())
         .build()
         .expect("actor")
         .start()
         .expect("start");
-    let channels = ChannelSet::new();
     let session = Session::new(
         identity.clone(),
         actor,

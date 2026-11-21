@@ -43,15 +43,16 @@ fn editor_latency_probe() {
         let db = cache.path().join("index.sqlite3");
         drop(flavite_index::open_or_init(&db).unwrap());
         let identity = flavite_api::VaultIdentity::new(uuid::Uuid::new_v4(), root, vec![7, 3, 1]);
+        let channels = ChannelSet::new();
         let actor = VaultActorBuilder::new()
             .with_fs(Box::new(fs) as Box<dyn Fs + Send + Sync>)
             .with_identity(identity.clone())
             .with_index(IndexActor::new(&db, 1).unwrap())
+            .with_pulse_sender(channels.pulse.sender())
             .build()
             .unwrap()
             .start()
             .unwrap();
-        let channels = ChannelSet::new();
         let session = Session::new(
             identity.clone(),
             actor,

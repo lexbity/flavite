@@ -16,7 +16,11 @@ use std::{
 };
 
 fn wait(app: &mut App, ready: impl Fn(&App) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s: the fixture catalog wait depends on the vault actor's initial
+    // reconcile (pulsed, retried after the 1s throttle) completing under
+    // 2-core CI contention; 10s expired there (CI 2026-11-21, network-denied
+    // leg) even with the pulse wiring fixed.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !ready(app) {
         assert!(
             Instant::now() < deadline,

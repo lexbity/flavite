@@ -38,15 +38,16 @@ pub fn fixture_with(notes: &[(&str, &str)]) -> (App, MemFs, tempfile::TempDir) {
     let db = cache.path().join("context-index.sqlite3");
     drop(flavite_index::open_or_init(&db).unwrap());
     let identity = flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root, vec![5, 1, 7]);
+    let channels = ChannelSet::new();
     let actor = VaultActorBuilder::new()
         .with_fs(Box::new(fs.clone()) as Box<dyn Fs + Send + Sync>)
         .with_identity(identity.clone())
         .with_index(IndexActor::new(&db, 1).unwrap())
+        .with_pulse_sender(channels.pulse.sender())
         .build()
         .unwrap()
         .start()
         .unwrap();
-    let channels = ChannelSet::new();
     let session = Session::new(
         identity.clone(),
         actor,
