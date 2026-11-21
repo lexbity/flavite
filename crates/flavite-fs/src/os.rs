@@ -397,6 +397,16 @@ impl Fs for OsFs {
         Ok(())
     }
 
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        std::fs::remove_dir_all(path).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                FsError::NotFound(path.to_path_buf())
+            } else {
+                FsError::Io(format!("failed to remove directory tree: {}", e))
+            }
+        })
+    }
+
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
         std::fs::rename(from, to).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {

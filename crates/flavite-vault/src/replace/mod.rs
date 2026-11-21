@@ -13,7 +13,7 @@ pub mod plan;
 pub mod preview;
 pub mod store;
 
-pub use crate::operation_key::{KeyStoreError, OperationKey, load_or_create_key};
+pub use crate::operation_key::{KeyStoreError, OperationKey, load_or_create_key_at_vault};
 pub use coordinator::{
     CoordinatorCtx, ItemEffect, JobItem, JobPhase, JobTotals, ReplaceItemOutcome,
     ReplaceItemRequest, read_draft_state, run_apply, run_revert, write_draft_state,
@@ -81,5 +81,9 @@ impl OpStoreIo for ActorOpStoreIo {
 
     fn remove(&self, path: &std::path::Path) -> Result<(), String> {
         self.actor.op_store_remove(path.to_path_buf())
+    }
+
+    fn remove_dir_all(&self, path: &std::path::Path) -> Result<(), String> {
+        self.actor.op_store_remove_dir_all(path.to_path_buf())
     }
 }

@@ -53,6 +53,12 @@ pub const DEFAULT_CHORDS: &[(&str, &str)] = &[
     ("note.save", "Mod+S"),
 ];
 
+/// Commands that ship **without** a default chord (FEUX-0003 E-15): they
+/// are bindable through the Settings shortcut capture flow, but render as
+/// `unbound` until the user assigns one. `resolved_chord` returns `None`
+/// for these unless a validated override exists.
+pub const CHORDLESS_COMMANDS: &[&str] = &["workspace.apply_profile"];
+
 /// The pressed modifier state as the API's chord bit mask.
 #[must_use]
 pub fn modifier_bits(modifiers: &Modifiers) -> u8 {
@@ -439,6 +445,10 @@ pub const UI_COMMANDS: &[UiCommand] = &[
         id: "workspace.close_group",
         title: "Close group",
     },
+    UiCommand {
+        id: "workspace.apply_profile",
+        title: "Apply profile",
+    },
 ];
 
 /// The UI portion of the host catalog, rendered as core `CommandSpec`s for
@@ -485,12 +495,23 @@ pub fn ui_specs(overrides: &std::collections::BTreeMap<String, String>) -> Vec<C
 }
 
 /// The effective chord for a command id: the validated preference
-/// override when present, otherwise the catalog default.
+/// override when present, otherwise the catalog default. Chordless
+/// commands ([`CHORDLESS_COMMANDS`]) have no default: they resolve only
+/// when the user assigned a validated override (FEUX-0003 E-15).
 #[must_use]
 pub fn resolved_chord(
     id: &str,
     overrides: &std::collections::BTreeMap<String, String>,
 ) -> Option<Chord> {
+    if CHORDLESS_COMMANDS.contains(&id) {
+        let chord = overrides
+            .get(id)
+            .and_then(|text| flavite_settings::chord::parse_chord(text))?;
+        return Some(Chord {
+            modifiers: chord.modifiers,
+            key: chord.key,
+        });
+    }
     let default = DEFAULT_CHORDS
         .iter()
         .find(|(command, _)| *command == id)
@@ -538,6 +559,7 @@ pub fn catalog_conflicts(core_ids: &[&str]) -> Vec<String> {
 /// precedence; plain typing never triggers layout commands.
 #[must_use]
 pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
+    use iced::keyboard::key::Physical;
     if let Some(message) = super::file_browser::keyboard_message(app, &event) {
         return Some(message);
     }
@@ -562,49 +584,120 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     }
     let keyboard::Event::KeyPressed {
         key,
+        physical_key,
         modifiers,
-        text,
         ..
     } = event
     else {
         return None;
     };
-    // A Preferences shortcut row is capturing: the next key press becomes
-    // that command's chord; Escape cancels (W11 collision editor).
-    if let Some(command) = app.settings.capture.clone() {
+    // A Preferences row is capturing: the next key press becomes either
+    // a chord for a catalog shortcut or a physical position for Context Mode.
+    if let Some(capture) = app.settings.capture.clone() {
         if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-            return Some(Message::Settings(
-                crate::host::settings::SettingsMessage::ShortcutCaptured {
-                    command,
-                    chord: None,
-                },
-            ));
+            // Escape cancels any capture
+            return match capture {
+                crate::host::settings::CaptureRequest::Chord(command) => Some(Message::Settings(
+                    crate::host::settings::SettingsMessage::ShortcutCaptured {
+                        command,
+                        chord: None,
+                    },
+                )),
+                crate::host::settings::CaptureRequest::ContextKey(binding_id) => Some(
+                    Message::Settings(crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                        binding_id,
+                        token: None,
+                    }),
+                ),
+            };
         }
-        let Some(token) = key_token(&key) else {
-            // Bare modifier key presses carry no key token; wait for the
-            // full combination.
-            return None;
-        };
-        let mut parts = Vec::new();
-        if modifiers.command() {
-            parts.push("Mod");
-        } else if modifiers.control() {
-            parts.push("Ctrl");
+
+        // Check for global modifiers (Ctrl/Alt/Logo) which are not allowed for Context Mode
+        let has_global_mod = modifiers.command() || modifiers.alt() || modifiers.logo();
+
+        match capture {
+            crate::host::settings::CaptureRequest::Chord(command) => {
+                // Chord capture: build the chord string
+                let Some(token) = key_token(&key) else {
+                    // Bare modifier key presses carry no key token; wait for the
+                    // full combination.
+                    return None;
+                };
+                let mut parts = Vec::new();
+                if modifiers.command() {
+                    parts.push("Mod");
+                } else if modifiers.control() {
+                    parts.push("Ctrl");
+                }
+                if modifiers.alt() {
+                    parts.push("Alt");
+                }
+                if modifiers.shift() {
+                    parts.push("Shift");
+                }
+                parts.push(token.as_str());
+                let chord = parts.join("+");
+                return Some(Message::Settings(
+                    crate::host::settings::SettingsMessage::ShortcutCaptured {
+                        command,
+                        chord: Some(chord),
+                    },
+                ));
+            }
+            crate::host::settings::CaptureRequest::ContextKey(binding_id) => {
+                // Context Mode key capture: convert to physical position token
+                // Global modifiers (Ctrl/Alt/Logo) are not allowed
+                if has_global_mod {
+                    // Return cancel message - the settings host will handle the error
+                    return Some(Message::Settings(
+                        crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                            binding_id,
+                            token: None,
+                        },
+                    ));
+                }
+
+                // Get the physical key code from the event
+                let Physical::Code(phys_code) = physical_key else {
+                    // Not a physical code we can capture
+                    return Some(Message::Settings(
+                        crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                            binding_id,
+                            token: None,
+                        },
+                    ));
+                };
+
+                // Convert to KeyCode using the editor's native_code
+                use flavite_editor::context::native_code;
+
+                let key_code = match native_code(phys_code) {
+                    Some(kc) => kc,
+                    None => {
+                        // Not in our vocabulary
+                        return Some(Message::Settings(
+                            crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                                binding_id,
+                                token: None,
+                            },
+                        ));
+                    }
+                };
+
+                // Build the token string
+                let mut token = format!("physical:{}", key_code.token());
+                if modifiers.shift() {
+                    token = format!("shift+{}", token);
+                }
+
+                return Some(Message::Settings(
+                    crate::host::settings::SettingsMessage::ContextKeyCaptured {
+                        binding_id,
+                        token: Some(token),
+                    },
+                ));
+            }
         }
-        if modifiers.alt() {
-            parts.push("Alt");
-        }
-        if modifiers.shift() {
-            parts.push("Shift");
-        }
-        parts.push(token.as_str());
-        let chord = parts.join("+");
-        return Some(Message::Settings(
-            crate::host::settings::SettingsMessage::ShortcutCaptured {
-                command,
-                chord: Some(chord),
-            },
-        ));
     }
     // Modal dialogs take Escape (cancel) and Enter (primary action) first;
     // the submit arm routes per dialog kind (W12).
@@ -619,6 +712,7 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     if matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
         && !app.palette_open
         && !app.picker.open
+        && app.profile_picker.is_none()
     {
         let tab = app.workspace.focused_tab();
         if app.note_search.finds.contains_key(&tab) {
@@ -639,7 +733,7 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
         };
     }
     // Overlay-local navigation first (§13.1: IME/plain typing precedence).
-    if app.palette_open || app.picker.open {
+    if app.palette_open || app.picker.open || app.profile_picker.is_some() {
         if modifiers.is_empty()
             && let keyboard::Key::Named(named) = &key
         {
@@ -660,8 +754,10 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
         {
             return Some(if app.palette_open {
                 Message::PaletteClose
-            } else {
+            } else if app.picker.open {
                 Message::PickerClose
+            } else {
+                Message::ProfilePickerClose
             });
         }
         return None;
@@ -715,7 +811,6 @@ pub fn keyboard_message(app: &App, event: keyboard::Event) -> Option<Message> {
     // An overlay hotkey that is also a printable character (P) must not
     // fire while the user types into a text field; overlays are the only
     // text inputs in W02, handled above.
-    let _ = text;
     None
 }
 
@@ -892,6 +987,8 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
         keyboard::key::Named::Escape => {
             if app.palette_open {
                 Some(Message::PaletteClose)
+            } else if app.profile_picker.is_some() {
+                Some(Message::ProfilePickerClose)
             } else {
                 Some(Message::PickerClose)
             }
@@ -899,6 +996,8 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
         keyboard::key::Named::ArrowDown => {
             if app.palette_open {
                 Some(Message::PaletteNext)
+            } else if app.profile_picker.is_some() {
+                Some(Message::ProfilePickerNext)
             } else {
                 Some(Message::PickerNext)
             }
@@ -906,6 +1005,8 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
         keyboard::key::Named::ArrowUp => {
             if app.palette_open {
                 Some(Message::PalettePrevious)
+            } else if app.profile_picker.is_some() {
+                Some(Message::ProfilePickerPrevious)
             } else {
                 Some(Message::PickerPrevious)
             }
@@ -913,6 +1014,8 @@ fn overlay_navigation(app: &App, named: keyboard::key::Named) -> Option<Message>
         keyboard::key::Named::Enter => {
             if app.palette_open {
                 Some(Message::PaletteSubmit)
+            } else if app.profile_picker.is_some() {
+                Some(Message::ProfilePickerSubmit)
             } else {
                 Some(Message::PickerSubmit)
             }
@@ -934,6 +1037,17 @@ pub fn dispatch(app: &mut App, id: &'static str) -> iced::Task<Message> {
             app,
             super::editor_diagnostics::DiagnosticsMessage::Export,
         );
+    }
+    // FEUX-0003 E-15: `workspace.apply_profile` is a chordless command
+    // that opens the profile chooser overlay. It is handled before the
+    // availability gate so an empty store reports its own named reason
+    // (the palette row stays disabled via `available`).
+    if id == "workspace.apply_profile" {
+        if app.settings.profiles.is_empty() {
+            app.status = "No saved profiles".into();
+            return iced::Task::none();
+        }
+        return app.update(Message::ProfilePickerOpen);
     }
     if (id.starts_with("editor.")
         || matches!(
@@ -1515,6 +1629,10 @@ pub fn available(app: &App, id: &str) -> bool {
         | "workspace.preferences"
         | "workspace.refresh_catalog" => app.flavite.is_some(),
         "help.about" => true,
+        "workspace.apply_profile" => {
+            // FEUX-0003 X07: disabled when there are no profiles
+            !app.settings.profiles.is_empty()
+        }
         _ => true,
     }
 }

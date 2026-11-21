@@ -1,0 +1,29 @@
+{
+  "links": [
+    {
+      "start": 93,
+      "end": 106,
+      "target_raw": "real-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 163,
+      "end": 177,
+      "target_raw": "still code",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      111,
+      121
+    ]
+  ],
+  "block_ids": []
+}

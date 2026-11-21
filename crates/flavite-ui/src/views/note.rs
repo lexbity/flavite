@@ -5,6 +5,7 @@
 //! failed loads render honest retry/close states.
 
 use crate::app::{App, Message};
+use crate::host::command_args::{CommandArgsMessage, FieldSpec};
 use crate::style;
 use crate::views::empty_state;
 use crate::workspace::{
@@ -13,7 +14,7 @@ use crate::workspace::{
     tab_strip,
 };
 use flavite_workspace::{LayoutAction, NoteLoad, TabId};
-use iced::widget::{button, column, container, row, rule, text, text_editor};
+use iced::widget::{Space, button, column, container, row, rule, text, text_editor};
 use iced::{Element, Length, alignment};
 
 /// Render one note tab for the active view slot.
@@ -158,7 +159,12 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             incarnation,
             input,
         })
-        .with_input_enabled(!app.picker.open && !app.palette_open && app.strip_menu.is_none())
+        .with_input_enabled(
+            !app.picker.open
+                && !app.palette_open
+                && app.profile_picker.is_none()
+                && app.strip_menu.is_none(),
+        )
         .with_interaction(move |snapshot| Message::EditorAction {
             tab,
             incarnation,
@@ -538,6 +544,13 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         let row_title = match search.kind {
             crate::host::selection_search::ApplyKind::Select => "Select matches…",
             crate::host::selection_search::ApplyKind::Split => "Split on matches…",
+            crate::host::selection_search::ApplyKind::Keep { keep } => {
+                if keep {
+                    "Keep matching…"
+                } else {
+                    "Drop non-matching…"
+                }
+            }
         };
         let caption = crate::host::selection_search::caption(app, tab);
         let apply_enabled = crate::host::selection_search::apply_enabled(app, tab);
@@ -582,6 +595,19 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
                                     tab,
                                 ),
                             )),
+                        // The scope toggle applies to select/split; keep/drop is
+                        // inherently selection-scoped (FEUX-0006 E-4).
+                        if !matches!(search.kind, crate::host::selection_search::ApplyKind::Keep { .. }) {
+                            button(if search.in_selections { "Selections" } else { "Document" })
+                                .style(style::ghost())
+                                .on_press(Message::SelectionSearch(
+                                    crate::host::selection_search::SelectionSearchMessage::ToggleInSelections(
+                                        tab,
+                                    ),
+                                ))
+                        } else {
+                            button("").style(style::ghost()).width(Length::Fixed(0.0))
+                        },
                         button("Apply")
                             .style(style::ghost())
                             .on_press_maybe(apply_enabled.then_some(Message::SelectionSearch(
@@ -607,6 +633,129 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
             content = content.push(text(error).size(12));
         }
     }
+    // FEUX-0004 X03, FEUX-0006 E-6: command-args draft row
+    if let Some(args) = app.command_args.tabs.get(&tab) {
+        let placeholder = match args.draft.fields.get(args.active_field) {
+            Some(FieldSpec::Text { placeholder, .. }) => *placeholder,
+            Some(FieldSpec::Regex { placeholder, .. }) => *placeholder,
+            Some(FieldSpec::Number { .. }) => "Line number",
+            None => "",
+        };
+        // Get the active field's error
+        let error_widget: Element<Message> = if let Some(field) = args.fields.get(args.active_field)
+        {
+            if let Some(ref error) = field.error {
+                use iced::widget::Text;
+                Text::new(error.as_str()).size(12).into()
+            } else {
+                Space::new().width(Length::Fixed(0.0)).into()
+            }
+        } else {
+            Space::new().width(Length::Fixed(0.0)).into()
+        };
+
+        // Get the active field's input - use first field as fallback if active_field is out of bounds
+        let active_input = args.fields.get(args.active_field).unwrap_or_else(|| {
+            args.fields
+                .first()
+                .expect("At least one field should exist")
+        });
+        let active_input = &active_input.input;
+
+        // Replace-regex live preview caption (FEUX-0006 E-6): exact totals
+        // from the compute-only replace_plan pass.
+        let replace_caption: Element<Message> = if args.draft.command
+            == flavite_edit_context::vocabulary::ContextCommand::ReplaceRegex
+        {
+            use iced::widget::Text;
+            if let Some(preview) = &args.preview {
+                Text::new(format!(
+                    "{} match{} · output {} chars",
+                    preview.match_count,
+                    if preview.match_count == 1 { "" } else { "es" },
+                    preview.output_len
+                ))
+                .size(12)
+                .into()
+            } else if args.pending.is_some() {
+                Text::new("Planning…").size(12).into()
+            } else {
+                Space::new().width(Length::Fixed(0.0)).into()
+            }
+        } else {
+            Space::new().width(Length::Fixed(0.0)).into()
+        };
+        let state_error: Element<Message> = if let Some(ref error) = args.state_error {
+            use iced::widget::Text;
+            Text::new(error.as_str()).size(12).into()
+        } else {
+            Space::new().width(Length::Fixed(0.0)).into()
+        };
+
+        content = content.push(bounds::observe(
+            container(
+                row![
+                    text(args.draft.command.title()).size(12),
+                    bounds::observe(
+                        text_editor(active_input)
+                            .id(command_args_id(tab).clone())
+                            .placeholder(placeholder)
+                            .height(48)
+                            .on_action(move |action| Message::CommandArgs(
+                                crate::host::command_args::CommandArgsMessage::DraftAction {
+                                    tab,
+                                    action,
+                                }
+                            ))
+                            .key_binding(move |key| { command_args_draft_binding(tab, key) }),
+                        move |rect| {
+                            Message::CommandArgs(
+                                crate::host::command_args::CommandArgsMessage::Bounds { tab, rect },
+                            )
+                        },
+                    ),
+                    button("Apply")
+                        .style(style::ghost())
+                        .on_press(Message::CommandArgs(
+                            crate::host::command_args::CommandArgsMessage::Apply(tab),
+                        )),
+                    button("Close")
+                        .style(style::ghost())
+                        .on_press(Message::CommandArgs(
+                            crate::host::command_args::CommandArgsMessage::Cancel(tab),
+                        )),
+                    // Add scope toggle for replace_regex (FEUX-0006 E-6)
+                    if args.draft.command
+                        == flavite_edit_context::vocabulary::ContextCommand::ReplaceRegex
+                    {
+                        let scope_label = if args.in_selections {
+                            "Selections"
+                        } else {
+                            "Document"
+                        };
+                        button(scope_label)
+                            .style(style::ghost())
+                            .on_press(Message::CommandArgs(
+                                crate::host::command_args::CommandArgsMessage::ToggleScope(tab),
+                            ))
+                    } else {
+                        button("").style(style::ghost()).width(Length::Fixed(0.0))
+                    },
+                    error_widget,
+                    replace_caption,
+                    state_error,
+                ]
+                .spacing(8),
+            )
+            .padding(8),
+            move |rect| {
+                Message::CommandArgs(crate::host::command_args::CommandArgsMessage::Bounds {
+                    tab,
+                    rect,
+                })
+            },
+        ));
+    }
     content
         .push(editor)
         .push(rule::horizontal(1))
@@ -614,6 +763,43 @@ fn ready_view<'a>(app: &'a App, tab: TabId) -> Element<'a, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+/// FEUX-0004 X03: command-args draft helpers
+fn command_args_id(tab: TabId) -> iced::widget::Id {
+    iced::widget::Id::from(format!("command_args_query_{:032x}", tab.raw()))
+}
+
+fn command_args_draft_binding(
+    tab: TabId,
+    key: iced::widget::text_editor::KeyPress,
+) -> Option<iced::widget::text_editor::Binding<Message>> {
+    use iced::keyboard::{Key, key::Named};
+    use iced::widget::text_editor::Binding;
+    if !matches!(
+        key.status,
+        iced::widget::text_editor::Status::Focused { .. }
+    ) {
+        return None;
+    }
+    match key.key {
+        Key::Named(Named::Enter) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::Apply(tab),
+        ))),
+        Key::Named(Named::Escape) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::Cancel(tab),
+        ))),
+        Key::Named(Named::Tab) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::NextField(tab),
+        ))),
+        Key::Named(Named::ArrowUp) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::AdjustUp(tab),
+        ))),
+        Key::Named(Named::ArrowDown) => Some(Binding::Custom(Message::CommandArgs(
+            CommandArgsMessage::AdjustDown(tab),
+        ))),
+        _ => Binding::from_key_press(key),
+    }
 }
 
 /// The pending encoding banner for a tab, when the core requires a typed

@@ -2,10 +2,11 @@
 //!
 //! This is the core of the buffer crate: a pure, testable, headless model
 //! that owns:
-//! - A `ropey::Rope` for the text content
+//! - A persistent COW chunk-tree root (RFC-0011 D-01) as the single text
+//!   representation — no `String` mirror, no rope
 //! - Multi-selection support
-//! - Undo/redo via an undo tree
-//! - Per-line EOL metadata
+//! - Undo/redo via an undo tree whose nodes hold immutable version roots
+//! - Per-line EOL metadata carried on the version
 //! - One authoritative [`SourceFormat`] descriptor plus its [`FormatStamp`]
 //!   (RFC-0006 D-15): the save format is buffer state, not EOL-table state
 //!   and not a filesystem guess.
@@ -13,20 +14,26 @@
 //! All editing operations produce `EditOp`s and are applied through
 //! the model. The model maintains revision numbers and can provide
 //! revisioned read views.
+//!
+//! Per-keystroke work is O(log n + chunk + window): the keystroke path
+//! NEVER materializes the full document. Text accessors (`text()`,
+//! `slice_str()`, `snapshot()`, `try_to_source_bytes()`) materialize on
+//! demand and are user-paced APIs.
 
 use flavite_encoding::{
-    CodecError, DecodeLimits, DecodeMap, DecodePolicy, EncodeLimits, FormatStamp, SourceFormat,
+    CodecError, DecodeLimits, DecodeMap, EncodeLimits, FormatStamp, SourceFormat,
     encode as codec_encode,
 };
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
-use ropey::{Rope, RopeSlice};
+use std::cell::OnceCell;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::budget::Budget;
-use crate::eol::EolTable;
+use crate::eol::{EolTable, LineEnding};
 use crate::revision::{BaseHash, BufferId, Revision};
 use crate::selection::{RawSelection, Selection, SelectionSet};
-use crate::undo::{EditOp, UndoTree};
+use crate::undo::{EditOp, UndoTree, VersionState};
 
 /// The headless editor model.
 ///
@@ -38,26 +45,19 @@ pub struct EditorModel {
     history_movement: Option<crate::history::HistoryMovement>,
     /// Unique identity for this buffer instance.
     buffer_id: BufferId,
-    /// The text content (normalized, CRLF folded to LF).
-    text: String,
-    /// The same content as [`Self::text`], for byte/line mapping. The rope is
-    /// only an index: `RopeSlice::as_str` is `None` for any slice spanning
-    /// more than one internal chunk, so text must never be read back
-    /// through the rope.
-    rope: Rope,
+    /// The immutable current document version: chunk-tree root + EOL state
+    /// + save descriptor (RFC-0011 D-01/D-04).
+    version: Arc<VersionState>,
+    /// Lazy full-text materialization cache for the `&str` accessors. This
+    /// is a derived convenience cache, NOT a second representation: it is
+    /// invalidated on every mutation and never touched by the keystroke
+    /// path.
+    cached_text: OnceCell<String>,
     /// Multi-selection: the canonical committed set (FEUX-0002 E-4).
     /// `None` means the default single caret at offset 0.
     selections: Option<SelectionSet>,
-    /// The undo tree for edit history.
+    /// The undo tree for edit history (nodes hold version roots).
     undo_tree: UndoTree,
-    /// Per-line EOL information.
-    eol_table: EolTable,
-    /// The authoritative save-format descriptor (RFC-0006 D-15). Ordinary
-    /// edits never change it; only explicit conversion or an acknowledged
-    /// reload/reopen does.
-    source_format: SourceFormat,
-    /// Codec/hint provenance for the descriptor.
-    format_stamp: FormatStamp,
     /// Current revision number.
     revision: Revision,
     /// Base hash of the content when last loaded or saved.
@@ -69,7 +69,7 @@ pub struct EditorModel {
 }
 
 /// Why a prepared batch was refused (typed, RFC-0006 D-06). The refusal
-/// happens before any state change: Rope, EOL table, revision and the Undo
+/// happens before any state change: tree, EOL table, revision and the Undo
 /// tree are untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchError {
@@ -122,239 +122,21 @@ impl std::fmt::Display for RecordedBatchError {
 }
 
 /// A fully prepared batch candidate (D-06/TD-7): the single combined edit
-/// plus the after-state Undo snapshot, both computed off the interactive
-/// turn from immutable state. The install is O(edit) and infallible.
+/// plus the after-state geometry, both computed off the interactive turn
+/// from immutable state. The install is O(edit) and infallible. No
+/// full-document text is materialized (RFC-0011 S2: the full after-state
+/// text copy is deleted).
 #[derive(Debug)]
 pub struct PreparedBatch {
     /// The combined, boundary-isolated edit over the prepare-time text.
     pub op: EditOp,
-    /// The after-state snapshot recorded as the isolated Undo node, carrying
-    /// text, spliced EOL state and the descriptor.
-    pub undo_snapshot: TextSnapshot,
+    /// The after-state byte length (used for recorded validation and delta
+    /// accounting without building a snapshot).
+    pub after_len: usize,
     /// The original per-op batch geometry in pre-change coordinates
     /// (FEUX-0002 E-13): retained on the undo node so movement across the
     /// transition maps carets in unchanged gaps exactly.
     pub spans: Vec<crate::selection::SpanEdit>,
-}
-
-/// Splice an EOL table from `old_text` to `new_text`: unchanged prefix and
-/// suffix lines keep their recorded endings; changed lines inherit the old
-/// dominant ending; a new final unterminated line stays unterminated. This
-/// is the affected-range splice (§6.9), never a whole-document
-/// reconstruction fallback.
-#[must_use]
-pub fn spliced_eol_table(old: &EolTable, old_text: &str, new_text: &str) -> EolTable {
-    let dominant = match old.dominant_eol() {
-        crate::eol::LineEnding::None => crate::eol::LineEnding::Lf,
-        ending => ending,
-    };
-    let snapshot = TextSnapshot::from_normalized(new_text);
-    let mut new_table = EolTable::from_snapshot(&snapshot);
-    let old_lines = logical_lines(old_text);
-    let new_lines = logical_lines(new_text);
-    let mut prefix = 0;
-    while prefix < old_lines.len()
-        && prefix < new_lines.len()
-        && old_lines[prefix] == new_lines[prefix]
-    {
-        prefix += 1;
-    }
-    let mut suffix = 0;
-    while suffix < old_lines.len().saturating_sub(prefix)
-        && suffix < new_lines.len().saturating_sub(prefix)
-        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-    let old_middle = old_lines.len() - prefix - suffix;
-    let new_middle = new_lines.len() - prefix - suffix;
-    for (line, ending) in new_table.line_endings.iter_mut().enumerate() {
-        // A replacement line without a newline is authoritative: do not
-        // carry the old file's ending onto the new final unterminated line.
-        if *ending == crate::eol::LineEnding::None {
-            continue;
-        }
-        let old_line = if line < prefix {
-            Some(line)
-        } else if line >= prefix + new_middle {
-            Some(old_lines.len() - (new_lines.len() - line))
-        } else if old_middle == new_middle {
-            Some(line)
-        } else {
-            None
-        };
-        *ending = old_line
-            .and_then(|old_line| old.get(old_line))
-            .unwrap_or(dominant);
-    }
-    new_table
-}
-
-/// Bounded affected-range splice (§6.9, S01): the EOL entries of only the
-/// edited line run are recomputed. `old_text` is the full pre-edit text,
-/// `window_start..tail_end` the pre-edit byte range of the edited run (a
-/// line-aligned run through the merge boundary), `window_new` its post-edit
-/// text (old head + replacement + unchanged tail), and `window_first` the
-/// table index of the run's first line. Unchanged prefix/suffix entries keep
-/// their recorded endings, changed lines inherit the old dominant ending,
-/// and a new final unterminated line stays unterminated — identical to
-/// [`spliced_eol_table`], which stays the reference path for prepared
-/// batches (the install path here must agree with it exactly).
-fn spliced_eol_table_in_window(
-    old: &EolTable,
-    old_text: &str,
-    window_start: usize,
-    tail_end: usize,
-    window_new: &str,
-    window_first: usize,
-) -> EolTable {
-    let window_old = &old_text[window_start..tail_end];
-    let old_count = old.line_count();
-    if window_new.is_empty() {
-        // The whole run was deleted. The surviving document is the
-        // unchanged, line-aligned head and tail: the run contributes no
-        // lines (a wholly deleted run is not a phantom unterminated line).
-        if window_start == 0 && tail_end == old_text.len() {
-            // The document is now empty: one unterminated line (§6.10).
-            return EolTable {
-                line_endings: vec![crate::eol::LineEnding::None],
-                has_trailing_newline: false,
-            };
-        }
-        let removed = old_count
-            .saturating_sub(window_first)
-            .min(window_old.split_inclusive('\n').count());
-        let mut table = old.clone();
-        table
-            .line_endings
-            .splice(window_first..window_first + removed, []);
-        // The surviving document tail is unchanged: the old final line when
-        // the tail survives, otherwise the (terminated) last head line.
-        table.has_trailing_newline = if tail_end < old_text.len() {
-            old.has_trailing_newline
-        } else {
-            window_start > 0
-        };
-        return table;
-    }
-    let dominant = match old.dominant_eol() {
-        crate::eol::LineEnding::None => crate::eol::LineEnding::Lf,
-        ending => ending,
-    };
-    // `logical_lines` maps an empty run to its one phantom line, matching
-    // the whole-document reference.
-    let old_lines = logical_lines(window_old);
-    let new_lines = logical_lines(window_new);
-    let removed = old_count.saturating_sub(window_first).min(old_lines.len());
-    let new_count = old_count - removed + new_lines.len();
-
-    let mut head = 0;
-    while head < old_lines.len() && head < new_lines.len() && old_lines[head] == new_lines[head] {
-        head += 1;
-    }
-    let prefix = window_first + head;
-    let mut suffix = 0;
-    while suffix < old_lines.len().saturating_sub(head)
-        && suffix < new_lines.len().saturating_sub(head)
-        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-    // The unchanged lines beyond the window are equal on both sides and
-    // always extend the whole-document suffix (the reference compares them
-    // line by line); the window tail matches stack on top of them.
-    let beyond_window = old_count
-        .saturating_sub(window_first)
-        .saturating_sub(removed);
-    let suffix = (suffix + beyond_window)
-        .min(old_count.saturating_sub(prefix))
-        .min(new_count.saturating_sub(prefix));
-    let old_middle = old_count.saturating_sub(prefix + suffix);
-    let new_middle = new_count.saturating_sub(prefix + suffix);
-
-    let mut table = EolTable::default();
-    table.line_endings.reserve(new_count);
-    for line in 0..new_count {
-        // The scanned terminator of the new text at this line: a replacement
-        // line without a newline is authoritative and never inherits one.
-        let scanned = if line < window_first {
-            old.get(line)
-        } else if line < window_first + new_lines.len() {
-            Some(line_ending_of(new_lines[line - window_first]))
-        } else {
-            old.get(old_count - (new_count - line))
-        };
-        if scanned == Some(crate::eol::LineEnding::None) {
-            table.line_endings.push(crate::eol::LineEnding::None);
-            continue;
-        }
-        let old_line = if line < prefix {
-            Some(line)
-        } else if line >= new_count - suffix {
-            Some(old_count - (new_count - line))
-        } else if old_middle == new_middle {
-            Some(line)
-        } else {
-            None
-        };
-        let ending = old_line
-            .and_then(|old_line| old.get(old_line))
-            .unwrap_or(dominant);
-        table.line_endings.push(ending);
-    }
-    // The reference's trailing flag comes from the whole-document scan: the
-    // last document line lies beyond the window (the old trailing state
-    // stands) or is the window's final new line.
-    table.has_trailing_newline = if tail_end < old_text.len() {
-        old.has_trailing_newline
-    } else {
-        new_lines
-            .last()
-            .is_some_and(|line| line_ending_of(line) != crate::eol::LineEnding::None)
-    };
-    table
-}
-
-/// The recorded ending of one split-inclusive line slice.
-fn line_ending_of(line: &str) -> crate::eol::LineEnding {
-    if line.ends_with("\r\n") {
-        crate::eol::LineEnding::Crlf
-    } else if line.ends_with('\n') {
-        crate::eol::LineEnding::Lf
-    } else {
-        crate::eol::LineEnding::None
-    }
-}
-
-/// The physical-EOL decoded layer for a normalized text plus its EOL table
-/// (pure form of [`EditorModel::decoded_text`]).
-#[must_use]
-pub fn decoded_layer(text: &str, table: &EolTable) -> String {
-    let mut out = String::with_capacity(text.len() + table.line_count());
-    let mut start = 0usize;
-    let breaks: Vec<usize> = if text.ends_with('\n') {
-        text.match_indices('\n').map(|(i, _)| i).collect()
-    } else {
-        let mut v: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
-        v.push(text.len());
-        v
-    };
-    for (i, &end) in breaks.iter().enumerate() {
-        out.push_str(&text[start..end]);
-        match table.line_endings.get(i) {
-            Some(crate::eol::LineEnding::Lf) => out.push('\n'),
-            Some(crate::eol::LineEnding::Crlf) => out.push_str("\r\n"),
-            // No recorded ending for this line (new/last): keep LF when
-            // the normalized text carries one, otherwise terminate none.
-            _ => {
-                if end < text.len() {
-                    out.push('\n');
-                }
-            }
-        }
-        start = if end < text.len() { end + 1 } else { end };
-    }
-    out
 }
 
 impl EditorModel {
@@ -370,28 +152,36 @@ impl EditorModel {
         } else {
             snapshot
         };
-        let text = snapshot.text().to_string();
-        let rope = Rope::from_str(&text);
-        let eol_table = EolTable::from_snapshot(&snapshot);
-        let source_format = snapshot.format().unwrap_or_default();
-        let format_stamp = FormatStamp::detected(source_format);
-
+        let version = Arc::new(VersionState::from_snapshot(&snapshot));
+        let base_hash = BaseHash::from_snapshot(&snapshot);
         Self {
             history_epoch: crate::history::HistoryEpoch::new(),
             history_movement: None,
             buffer_id: BufferId::new(),
-            text,
-            rope,
+            version,
+            cached_text: OnceCell::new(),
             selections: None,
-            undo_tree: UndoTree::new(snapshot.clone()),
-            eol_table,
-            source_format,
-            format_stamp,
+            undo_tree: UndoTree::new(snapshot),
             revision: Revision::INITIAL,
-            base_hash: Some(BaseHash::from_snapshot(&snapshot)),
+            base_hash: Some(base_hash),
             is_dirty: false,
             last_transition_ops: Vec::new(),
         }
+    }
+
+    /// Build a version from a snapshot, preserving the current descriptor
+    /// when the snapshot is a synthetic normalized view (no format).
+    fn version_from_snapshot_preserving_descriptor(
+        &self,
+        snapshot: &TextSnapshot,
+    ) -> Arc<VersionState> {
+        if snapshot.format().is_some() {
+            return Arc::new(VersionState::from_snapshot(snapshot));
+        }
+        let mut state = VersionState::from_snapshot(snapshot);
+        state.format = self.version.format;
+        state.stamp = self.version.stamp;
+        Arc::new(state)
     }
 
     /// Replace the document snapshot while preserving buffer identity and
@@ -434,13 +224,8 @@ impl EditorModel {
                 self.selections = Some(mapped);
             }
         }
-        self.rope = Rope::from_str(snapshot.text());
-        self.text = new_text;
-        self.eol_table = EolTable::from_snapshot(&snapshot);
-        if let Some(format) = snapshot.format() {
-            self.source_format = format;
-            self.format_stamp = FormatStamp::detected(format);
-        }
+        self.version = self.version_from_snapshot_preserving_descriptor(&snapshot);
+        self.cached_text.take();
         self.undo_tree = UndoTree::new(snapshot.clone());
         self.history_epoch = crate::history::HistoryEpoch::new();
         self.history_movement = None;
@@ -470,20 +255,22 @@ impl EditorModel {
 
     /// The authoritative save-format descriptor.
     #[must_use]
-    pub const fn source_format(&self) -> SourceFormat {
-        self.source_format
+    pub fn source_format(&self) -> SourceFormat {
+        self.version.format
     }
 
     /// Descriptor provenance (codec version, hint generation).
     #[must_use]
-    pub const fn format_stamp(&self) -> &FormatStamp {
-        &self.format_stamp
+    pub fn format_stamp(&self) -> &FormatStamp {
+        &self.version.stamp
     }
 
     /// Record hint-generation provenance without touching text or revision
     /// (used when the buffer was opened under a confirmed hint).
     pub fn set_format_stamp_generation(&mut self, hint_generation: Option<u64>) {
-        self.format_stamp.hint_generation = hint_generation;
+        let mut version = (*self.version).clone();
+        version.stamp.hint_generation = hint_generation;
+        self.version = Arc::new(version);
     }
 
     /// Get the buffer identity.
@@ -510,19 +297,37 @@ impl EditorModel {
         self.is_dirty
     }
 
-    /// Get the text content as a string slice.
+    /// Get the text content as a string slice. Materializes the full
+    /// document on first access after a mutation (user-paced; never called
+    /// on the keystroke path).
     #[must_use]
     pub fn text(&self) -> &str {
-        // The mirrored `text` field is the read path: `RopeSlice::as_str`
-        // returns `None` for any slice spanning more than one rope chunk,
-        // which silently presented every multi-chunk buffer as empty.
-        &self.text
+        self.cached_text
+            .get_or_init(|| self.version.materialize())
+            .as_str()
+    }
+
+    /// A cheap, shareable text view over the current root (O(1); never
+    /// materializes). Consumers hold this across revision boundaries; full
+    /// text is obtained with [`DocumentText::materialize`] on their own
+    /// threads (RFC-0011 D-10/D-11).
+    #[must_use]
+    pub fn document_text(&self) -> crate::chunks::DocumentText {
+        crate::chunks::DocumentText::new(Arc::clone(&self.version.root))
+    }
+
+    /// The immutable current version (chunk-tree root + EOL side state +
+    /// save descriptor). Cloning the `Arc` is O(1); used to stage
+    /// recovery/autosave work off the interactive turn.
+    #[must_use]
+    pub fn version_state(&self) -> &Arc<VersionState> {
+        &self.version
     }
 
     /// Get the text length in bytes.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.rope.len_bytes()
+        self.version.len()
     }
 
     /// Check if the buffer is empty.
@@ -534,33 +339,40 @@ impl EditorModel {
     /// Get a character at a position.
     #[must_use]
     pub fn char_at(&self, pos: TextByte) -> Option<char> {
-        self.rope.get_char(pos.0)
+        if pos.0 >= self.len() || !self.is_char_boundary(pos.0) {
+            return None;
+        }
+        self.version
+            .root
+            .slice(pos.0..(pos.0 + 4).min(self.len()))
+            .chars()
+            .next()
     }
 
-    /// Get a slice of text.
+    /// Get a slice of text (fresh allocation).
     #[must_use]
-    pub fn slice(&self, range: Span<TextByte>) -> RopeSlice<'_> {
-        self.rope.byte_slice(range.start.0..range.end.0)
+    pub fn slice(&self, range: Span<TextByte>) -> String {
+        self.version.root.slice(range.start.0..range.end.0)
     }
 
-    /// Get a slice of text as a string.
+    /// Get a slice of text as a string (materializes via the cache;
+    /// test/diagnostic use).
     #[must_use]
     pub fn slice_str(&self, range: Span<TextByte>) -> &str {
-        // Byte offsets always land on char boundaries (edits are char-safe),
-        // and the mirrored text is the read path — see [`Self::text`].
-        &self.text[range.start.0..range.end.0]
+        let text = self.text();
+        &text[range.start.0..range.end.0]
     }
 
     /// Get the line count.
     #[must_use]
     pub fn line_count(&self) -> usize {
-        self.rope.len_lines()
+        self.version.root.line_count()
     }
 
     /// Get the byte offset of a line.
     #[must_use]
     pub fn line_start(&self, line: usize) -> TextByte {
-        TextByte(self.rope.line_to_byte(line))
+        TextByte(self.version.root.line_start_of(line))
     }
 
     /// Get the byte offset just past the end of a line.
@@ -569,14 +381,14 @@ impl EditorModel {
         if line + 1 < self.line_count() {
             self.line_start(line + 1)
         } else {
-            TextByte(self.rope.len_bytes())
+            TextByte(self.len())
         }
     }
 
     /// Get the line at a byte offset.
     #[must_use]
     pub fn line_at(&self, pos: TextByte) -> usize {
-        self.rope.byte_to_line(pos.0)
+        self.version.root.line_index_of(pos.0)
     }
 
     /// Set the base hash.
@@ -593,8 +405,10 @@ impl EditorModel {
     pub fn clear(&mut self) {
         let old_len = self.len();
         let edit = EditOp::new(Span::new(TextByte(0), TextByte(old_len)), String::new());
-        self.apply_edit_op(edit);
-        self.eol_table = EolTable::default();
+        let state = self.apply_text_edit(&edit);
+        self.undo_tree.apply_version(edit, state);
+        self.revision = self.revision.next();
+        self.is_dirty = true;
     }
 
     /// Insert text at a position.
@@ -635,14 +449,11 @@ impl EditorModel {
 
     /// Apply an edit operation.
     ///
-    /// This is the core method that applies an edit, updates the rope,
-    /// handles undo history, and advances the revision.
+    /// This is the core method that applies an edit, updates the chunk-tree
+    /// root, handles undo history, and advances the revision.
     pub fn apply_edit_op(&mut self, edit: EditOp) -> Revision {
-        self.apply_text_edit(&edit);
-
-        // Apply to undo tree
-        let snapshot = self.snapshot();
-        self.undo_tree.apply(edit, snapshot);
+        let state = self.apply_text_edit(&edit);
+        self.undo_tree.apply_version(edit, state);
         let new_revision = self.revision.next();
 
         // Update revision
@@ -675,23 +486,16 @@ impl EditorModel {
         snapshot: TextSnapshot,
         journal: Option<crate::undo::JournalTag>,
     ) -> Revision {
-        let old_text = self.text();
+        let old_len = self.len();
         let new_text = snapshot.text().to_string();
-        let mut edit = EditOp::new(
-            Span::new(TextByte(0), TextByte(old_text.len())),
-            new_text.clone(),
-        );
+        let mut edit = EditOp::new(Span::new(TextByte(0), TextByte(old_len)), new_text.clone());
         if let Some(tag) = journal {
             edit = edit.with_journal(tag);
         }
-        self.rope = Rope::from_str(&new_text);
-        self.text = new_text;
-        self.eol_table = EolTable::from_snapshot(&snapshot);
-        if let Some(format) = snapshot.format() {
-            self.source_format = format;
-            self.format_stamp = FormatStamp::detected(format);
-        }
-        self.undo_tree.apply_boundary(edit, snapshot.clone());
+        let state = self.version_from_snapshot_preserving_descriptor(&snapshot);
+        self.version = state.clone();
+        self.cached_text.take();
+        self.undo_tree.apply_boundary_version(edit, state);
         let revision = self.revision.next();
         self.revision = revision;
         self.base_hash = Some(BaseHash::from_snapshot(&snapshot));
@@ -713,7 +517,7 @@ impl EditorModel {
         let decoded = self.decoded_text();
         codec_encode(
             &decoded,
-            self.source_format,
+            self.source_format(),
             &EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         )
@@ -724,7 +528,7 @@ impl EditorModel {
     /// source bytes; use [`EditorModel::try_to_source_bytes`] for those.
     #[must_use]
     pub fn decoded_text(&self) -> String {
-        decoded_layer(self.text(), &self.eol_table)
+        decoded_layer(self.text(), &self.version.eol_table())
     }
 
     /// Change the buffer's save format as one isolated, revision-advancing
@@ -751,13 +555,17 @@ impl EditorModel {
             &EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         )?;
-        self.source_format = target;
-        self.format_stamp = FormatStamp::detected(target);
-        // Isolated undo node: the node snapshot carries the NEW descriptor
+        // A new version with the new descriptor; the tree/EOL state are
+        // unchanged (O(1) Arc clone).
+        let mut version = (*self.version).clone();
+        version.format = target;
+        version.stamp = FormatStamp::detected(target);
+        let version = Arc::new(version);
+        self.version = version.clone();
+        // Isolated undo node: the node state carries the NEW descriptor
         // (its parent keeps the old one), so Redo lands the format change.
-        let snapshot = self.snapshot();
         let edit = EditOp::new(Span::new(TextByte(0), TextByte(0)), String::new());
-        self.undo_tree.apply_boundary(edit, snapshot);
+        self.undo_tree.apply_boundary_version(edit, version);
         self.revision = self.revision.next();
         self.is_dirty = true;
         Ok(self.revision)
@@ -790,17 +598,22 @@ impl EditorModel {
         edits: &[EditOp],
         journal: Option<crate::undo::JournalTag>,
     ) -> Revision {
+        // RFC-0008 S1 (FR-10): buffer-apply phase. `ops` and `doc_len` are
+        // plain integers — no formatting on the hot path.
+        let _model_apply =
+            tracing::info_span!("edit.model_apply", ops = edits.len(), doc_len = self.len())
+                .entered();
         if edits.is_empty() {
             return self.revision;
         }
-        let old_text = self.text();
+        let doc_len = self.len();
         let mut ordered = edits.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
         if ordered.iter().any(|edit| {
             edit.range.start.0 > edit.range.end.0
-                || edit.range.end.0 > old_text.len()
-                || !old_text.is_char_boundary(edit.range.start.0)
-                || !old_text.is_char_boundary(edit.range.end.0)
+                || edit.range.end.0 > doc_len
+                || !self.is_char_boundary(edit.range.start.0)
+                || !self.is_char_boundary(edit.range.end.0)
         }) {
             return self.revision;
         }
@@ -819,27 +632,47 @@ impl EditorModel {
         let mut replacement = String::new();
         let mut cursor = start;
         for edit in ordered {
-            replacement.push_str(&old_text[cursor..edit.range.start.0]);
+            replacement.push_str(&self.version.root.slice(cursor..edit.range.start.0));
             replacement.push_str(&edit.replacement);
             cursor = edit.range.end.0;
         }
-        replacement.push_str(&old_text[cursor..end]);
+        replacement.push_str(&self.version.root.slice(cursor..end));
         let mut combined = EditOp::new(Span::new(TextByte(start), TextByte(end)), replacement);
         let is_journal = journal.is_some() || edits.iter().any(|edit| edit.boundary);
         if let Some(tag) = journal {
             combined = combined.with_journal(tag);
         }
-        self.apply_text_edit(&combined);
-        let snapshot = self.snapshot();
+        let state = self.apply_text_edit(&combined);
         if is_journal {
-            self.undo_tree.apply_boundary(combined, snapshot)
+            // Journal/boundary installs are boundaries; the version root is
+            // the state (FR-5).
+            self.undo_tree.apply_boundary_version(combined, state)
         } else {
-            self.undo_tree.apply(combined, snapshot)
+            // Interactive typing: version root install (RFC-0011 D-02).
+            self.undo_tree.apply_version(combined, state)
         };
         let revision = self.revision.next();
         self.revision = revision;
         self.is_dirty = true;
         revision
+    }
+
+    /// Whether byte offset `pos` sits on a UTF-8 boundary. Exact for
+    /// well-formed UTF-8: a position is a boundary iff its byte is not a
+    /// continuation byte (0b10xxxxxx) — except the end of text. Probed via
+    /// a leaf-local byte read (O(chunk), no full-text materialization).
+    /// Whether byte offset `pos` sits on a UTF-8 boundary. Exact for
+    /// well-formed UTF-8: a position is a boundary iff its byte is not a
+    /// continuation byte (0b10xxxxxx) — except the end of text. Probed via
+    /// a leaf-local byte read (O(chunk), no full-text materialization).
+    fn is_char_boundary(&self, pos: usize) -> bool {
+        if pos >= self.len() {
+            return pos == self.len();
+        }
+        let Some((bytes, local)) = self.version.root.leaf_context_at(pos) else {
+            return false;
+        };
+        (bytes.as_bytes()[local] & 0xC0) != 0x80
     }
 
     /// Whether edits are non-overlapping ranges against this exact text
@@ -857,24 +690,24 @@ impl EditorModel {
         if edits.is_empty() {
             return Some(BatchError::Empty);
         }
-        let text = self.text();
+        let len = self.len();
         let mut ordered = edits.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
         for edit in &ordered {
             if edit.range.start.0 > edit.range.end.0 {
                 return Some(BatchError::OutOfBounds {
                     at: edit.range.start.0,
-                    len: text.len(),
+                    len,
                 });
             }
-            if edit.range.end.0 > text.len() {
+            if edit.range.end.0 > len {
                 return Some(BatchError::OutOfBounds {
                     at: edit.range.end.0,
-                    len: text.len(),
+                    len,
                 });
             }
-            if !text.is_char_boundary(edit.range.start.0)
-                || !text.is_char_boundary(edit.range.end.0)
+            if !self.is_char_boundary(edit.range.start.0)
+                || !self.is_char_boundary(edit.range.end.0)
             {
                 return Some(BatchError::CharBoundary {
                     at: edit.range.start.0,
@@ -895,12 +728,13 @@ impl EditorModel {
         None
     }
 
-    /// Prepare a batch candidate OFF the interactive turn (D-06/TD-7): all
-    /// validation, the combined edit and the after-state undo snapshot are
-    /// computed from the immutable current state, so the later install is
-    /// O(edit) and can never fail or partially apply. The after-state EOL
-    /// table is spliced (prefix/suffix/dominant), never reconstructed from
-    /// the whole document.
+    /// Prepare a batch candidate OFF the interactive turn (D-06/TD-7,
+    /// RFC-0008 S5): all validation, the combined edit and the after-state
+    /// geometry are computed from the immutable current state (no snapshot,
+    /// no encode, no `DecodeMap` — the serialization pipeline is reserved
+    /// for undo materialization and boundary installs), so the later install
+    /// is O(edit) and can never fail or partially apply. No full-document
+    /// text is built (RFC-0011 S2).
     ///
     /// # Errors
     ///
@@ -910,7 +744,7 @@ impl EditorModel {
         if let Some(error) = self.batch_error(edits) {
             return Err(error);
         }
-        let old_text = self.text();
+        let len = self.len();
         let mut ordered = edits.to_vec();
         ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
         let start = ordered[0].range.start.0;
@@ -918,39 +752,16 @@ impl EditorModel {
         let mut replacement = String::new();
         let mut cursor = start;
         for edit in &ordered {
-            replacement.push_str(&old_text[cursor..edit.range.start.0]);
+            replacement.push_str(&self.version.root.slice(cursor..edit.range.start.0));
             replacement.push_str(&edit.replacement);
             cursor = edit.range.end.0;
         }
-        replacement.push_str(&old_text[cursor..end]);
+        replacement.push_str(&self.version.root.slice(cursor..end));
         let combined = EditOp::new(Span::new(TextByte(start), TextByte(end)), replacement);
-        let after_text = combined.apply(old_text);
-        let after_table = spliced_eol_table(&self.eol_table, old_text, &after_text);
-        let decoded = decoded_layer(&after_text, &after_table);
-        let undo_snapshot = match codec_encode(
-            &decoded,
-            self.source_format,
-            &EncodeLimits::default(),
-            &flavite_encoding::NOT_CANCELLED,
-        ) {
-            Ok(source) => {
-                TextSnapshot::with_policy(&source, DecodePolicy::Explicit(self.source_format))
-                    .unwrap_or_else(|_| {
-                        TextSnapshot::from_normalized_with_descriptor(
-                            &after_text,
-                            self.source_format,
-                        )
-                    })
-            }
-            // A strict-ASCII-incompatible after-state still records the
-            // exact text/EOL/format intent so Undo/Redo restore it (§6.10).
-            Err(_) => {
-                TextSnapshot::from_normalized_with_descriptor(&after_text, self.source_format)
-            }
-        };
+        let after_len = start + combined.replacement.len() + (len - end);
         Ok(PreparedBatch {
             op: combined,
-            undo_snapshot,
+            after_len,
             spans: ordered
                 .iter()
                 .map(|edit| {
@@ -976,13 +787,13 @@ impl EditorModel {
         batch: PreparedBatch,
         context_origin: Option<u128>,
     ) -> Revision {
-        self.apply_text_edit(&batch.op);
+        let state = self.apply_text_edit(&batch.op);
         let policy = match context_origin {
             Some(origin) => crate::undo::UndoPolicy::Context { origin },
             None => crate::undo::UndoPolicy::Isolated,
         };
         self.undo_tree
-            .apply_batch(batch.op, batch.undo_snapshot, policy, &batch.spans);
+            .apply_batch_version(batch.op, state, policy, &batch.spans);
         let revision = self.revision.next();
         self.revision = revision;
         self.is_dirty = true;
@@ -1006,7 +817,7 @@ impl EditorModel {
             crate::undo::UndoPolicy::Context { origin } => {
                 let batch = self.prepare_batch(edits)?;
                 let projected = crate::budget::account_node(
-                    batch.undo_snapshot.text().len(),
+                    batch.after_len,
                     batch.op.replacement.len(),
                     &[],
                     &[],
@@ -1019,7 +830,7 @@ impl EditorModel {
             crate::undo::UndoPolicy::Isolated => {
                 let batch = self.prepare_batch(edits)?;
                 let projected = crate::budget::account_node(
-                    batch.undo_snapshot.text().len(),
+                    batch.after_len,
                     batch.op.replacement.len(),
                     &[],
                     &[],
@@ -1054,7 +865,7 @@ impl EditorModel {
     }
 
     /// The history bytes a batch would cost if installed as one new node:
-    /// after-snapshot text + combined replacement text + recorded selection
+    /// after-state length + combined replacement text + recorded selection
     /// sets + fixed metadata. Returns `None` for an invalid/empty batch.
     /// Used by Session for the app-wide admission check; the per-buffer
     /// reserve uses the prepared candidate when available.
@@ -1067,11 +878,11 @@ impl EditorModel {
         if edits.is_empty() {
             return None;
         }
-        let text = self.text();
+        let len = self.len();
         let mut ordered = edits.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|edit| (edit.range.start.0, edit.range.end.0));
         for edit in &ordered {
-            if edit.range.start.0 > edit.range.end.0 || edit.range.end.0 > text.len() {
+            if edit.range.start.0 > edit.range.end.0 || edit.range.end.0 > len {
                 return None;
             }
         }
@@ -1080,12 +891,12 @@ impl EditorModel {
         let mut replacement = String::new();
         let mut cursor = start;
         for edit in &ordered {
-            replacement.push_str(&text[cursor..edit.range.start.0]);
+            replacement.push_str(&self.version.root.slice(cursor..edit.range.start.0));
             replacement.push_str(&edit.replacement);
             cursor = edit.range.end.0;
         }
-        replacement.push_str(&text[cursor..end]);
-        let after_len = start + replacement.len() + (text.len() - end);
+        replacement.push_str(&self.version.root.slice(cursor..end));
+        let after_len = start + replacement.len() + (len - end);
         let (before, after) = match record {
             Some(record) => (&record.before[..], &record.after[..]),
             None => (&[][..], &[][..]),
@@ -1096,6 +907,56 @@ impl EditorModel {
         )
     }
 
+    /// Exact local grapheme-boundary probe on the current text (O(chunk +
+    /// window); ≤8-byte context each side, per RFC-0011 S2.
+    fn before_boundary_at(&self, p: usize) -> bool {
+        let len = self.len();
+        if p == 0 || p >= len {
+            return true;
+        }
+        if !self.is_char_boundary(p) {
+            return false;
+        }
+        let mut lo = p.saturating_sub(8);
+        while lo > 0 && !self.is_char_boundary(lo) {
+            lo -= 1;
+        }
+        let mut hi = (p + 8).min(len);
+        while hi < len && !self.is_char_boundary(hi) {
+            hi += 1;
+        }
+        let ctx = self.version.root.slice(lo..hi);
+        let at = p - lo;
+        let mut cursor = unicode_segmentation::GraphemeCursor::new(at, ctx.len(), true);
+        cursor.is_boundary(&ctx, 0).unwrap_or(true)
+    }
+
+    /// Boundary probe for the after-state (which is hypothetical): positions
+    /// in untouched regions map back to the current text; positions inside
+    /// the inserted bytes are judged against the replacement; positions at
+    /// or past the after-text end are accepted.
+    fn after_boundary_at(&self, op: &EditOp, after_len: usize, p: usize) -> bool {
+        let len = self.len();
+        if p == 0 || p >= after_len {
+            return true;
+        }
+        let s = op.range.start.0;
+        let e = op.range.end.0;
+        let rl = op.replacement.len();
+        if p < s {
+            return self.before_boundary_at(p);
+        }
+        if p < s + rl {
+            return op.replacement.is_char_boundary(p - s);
+        }
+        let delta = rl as i64 - (e as i64 - s as i64);
+        let old_p = p as i64 - delta;
+        if old_p >= len as i64 {
+            return true;
+        }
+        self.before_boundary_at(old_p.max(0) as usize)
+    }
+
     /// Validate the text and recorded selections before installing either.
     pub fn try_apply_recorded_batch(
         &mut self,
@@ -1103,11 +964,22 @@ impl EditorModel {
         policy: crate::undo::UndoPolicy,
         record: crate::history::EditorEdit,
     ) -> Result<Revision, RecordedBatchError> {
+        // RFC-0008 S1 (FR-10): the interactive recorded-batch apply phase.
+        let _model_apply =
+            tracing::info_span!("edit.model_apply", ops = edits.len(), doc_len = self.len())
+                .entered();
         let batch = self
             .prepare_batch(edits)
             .map_err(RecordedBatchError::from)?;
+        let before_len = self.len();
+        let after_len = batch.after_len;
         record
-            .validate(self.text(), batch.undo_snapshot.text())
+            .validate_windowed(
+                before_len,
+                after_len,
+                &|p| self.before_boundary_at(p),
+                &|p| self.after_boundary_at(&batch.op, after_len, p),
+            )
             .map_err(|e| RecordedBatchError::InvalidForm(e.to_string()))?;
         if let crate::undo::UndoPolicy::Context { origin } = policy
             && u128::from_str_radix(&record.origin, 16).ok() != Some(origin)
@@ -1117,7 +989,7 @@ impl EditorModel {
             ));
         }
         let projected = crate::budget::account_node(
-            batch.undo_snapshot.text().len(),
+            batch.after_len,
             batch.op.replacement.len(),
             &record.before,
             &record.after,
@@ -1129,9 +1001,9 @@ impl EditorModel {
             }
             Err(_) => unreachable!("prepare succeeded; only the limit refusal remains"),
         };
-        self.apply_text_edit(&batch.op);
+        let state = self.apply_text_edit(&batch.op);
         self.undo_tree
-            .apply_recorded(batch.op, batch.undo_snapshot, policy, record, &batch.spans);
+            .apply_recorded_version(batch.op, state, policy, record, &batch.spans);
         self.undo_tree.release(&lease);
         self.revision = self.revision.next();
         self.is_dirty = true;
@@ -1162,6 +1034,12 @@ impl EditorModel {
     #[must_use]
     pub fn history_accounted_bytes(&self) -> u64 {
         self.undo_tree.accounted_bytes()
+    }
+
+    /// Number of currently allocated undo-arena pages (diagnostic; FR-14).
+    #[must_use]
+    pub fn history_allocated_pages(&self) -> usize {
+        self.undo_tree.history_allocated_pages()
     }
 
     /// Retained history node count.
@@ -1197,7 +1075,7 @@ impl EditorModel {
         if target.epoch != self.history_epoch {
             return Err(crate::history::HistoryError::Expired);
         }
-        let snapshot = self.undo_tree.restore_snapshot(target)?;
+        let state = self.undo_tree.restore_snapshot(target)?;
         let target_node = self.undo_tree.get(target.node);
         let selections = target_node.and_then(|node| {
             if node.is_root() {
@@ -1227,18 +1105,11 @@ impl EditorModel {
         // Allocate all replacement state before moving the head. Nothing
         // below is fallible; the lease window remains the backstop even if
         // an unexpected panic interrupts the release.
-        let text = snapshot.text().to_owned();
-        let rope = Rope::from_str(&text);
-        let table = EolTable::from_snapshot(&snapshot);
         self.set_history_movement(spans, step_ends, truncated, selections, primary);
         self.undo_tree.restore_position(target.node);
-        self.text = text;
-        self.rope = rope;
-        self.eol_table = table;
-        if let Some(format) = snapshot.format() {
-            self.source_format = format;
-            self.format_stamp = FormatStamp::detected(format);
-        }
+        self.version = state;
+        self.cached_text.take();
+        let snapshot = self.snapshot();
         self.revision = self.revision.next();
         self.is_dirty = self.base_hash != Some(BaseHash::from_snapshot(&snapshot));
         self.undo_tree.unprotect(protection);
@@ -1302,14 +1173,12 @@ impl EditorModel {
             .map(|record| record.primary)
     }
 
-    /// The snapshot text of a retained history node (diagnostic/test).
+    /// The text of a retained history node (diagnostic/test); materializes
+    /// from the node's version root on demand (user-paced).
     #[must_use]
-    pub fn history_node_text(&self, id: u64) -> Option<String> {
-        self.undo_tree
-            .get(id)
-            .filter(|node| !node.evicted)
-            .and_then(|node| node.snapshot.as_ref())
-            .map(|snapshot| snapshot.text().to_string())
+    pub fn history_node_text(&mut self, id: u64) -> Option<String> {
+        let state = self.undo_tree.get(id)?.snapshot.clone()?;
+        Some(state.materialize())
     }
 
     /// Undo the last edit.
@@ -1327,21 +1196,13 @@ impl EditorModel {
         let transition = self.undo_tree.undo_edit();
         let result = self.undo_tree.undo();
 
-        if let Some((_node_rev, Some(snapshot))) = result {
+        if let Some((_node_rev, Some(state))) = result {
             let to = self.undo_tree.position_id();
             let (spans, step_ends, truncated) = self.undo_tree.transition_spans(from, to);
             self.set_history_movement(spans, step_ends, truncated, selections, primary);
-            let new_text = snapshot.text().to_string();
-            self.rope = Rope::from_str(&new_text);
-            self.text = new_text;
-            self.eol_table = EolTable::from_snapshot(&snapshot);
-            // Undo restores the recorded descriptor too, not just text/EOL
-            // (FR-25: format-only boundaries are ordinary isolated undo
-            // units over buffer state).
-            if let Some(format) = snapshot.format() {
-                self.source_format = format;
-                self.format_stamp = FormatStamp::detected(format);
-            }
+            self.version = state;
+            self.cached_text.take();
+            let snapshot = self.snapshot();
             self.revision = self.revision.next();
             self.is_dirty = self.base_hash != Some(BaseHash::from_snapshot(&snapshot));
             self.last_transition_ops = transition.into_iter().collect();
@@ -1360,7 +1221,7 @@ impl EditorModel {
         let from = self.undo_tree.position_id();
         let result = self.undo_tree.redo();
 
-        if let Some((_node_rev, Some(snapshot))) = result {
+        if let Some((_node_rev, Some(state))) = result {
             let to = self.undo_tree.position_id();
             let (spans, step_ends, truncated) = self.undo_tree.transition_spans(from, to);
             self.set_history_movement(
@@ -1370,14 +1231,9 @@ impl EditorModel {
                 self.undo_tree.position_selections(),
                 self.history_position_primary(),
             );
-            let new_text = snapshot.text().to_string();
-            self.rope = Rope::from_str(&new_text);
-            self.text = new_text;
-            self.eol_table = EolTable::from_snapshot(&snapshot);
-            if let Some(format) = snapshot.format() {
-                self.source_format = format;
-                self.format_stamp = FormatStamp::detected(format);
-            }
+            self.version = state;
+            self.cached_text.take();
+            let snapshot = self.snapshot();
             self.revision = self.revision.next();
             self.is_dirty = self.base_hash != Some(BaseHash::from_snapshot(&snapshot));
             self.last_transition_ops = transition.into_iter().collect();
@@ -1484,16 +1340,10 @@ impl EditorModel {
         self.set_primary_selection(0, self.len());
     }
 
-    /// Get the EOL table.
+    /// Get the EOL table (derived from the version; user-paced).
     #[must_use]
-    pub fn eol_table(&self) -> &EolTable {
-        &self.eol_table
-    }
-
-    /// Get the EOL table mutably.
-    #[must_use]
-    pub fn eol_table_mut(&mut self) -> &mut EolTable {
-        &mut self.eol_table
+    pub fn eol_table(&self) -> EolTable {
+        self.version.eol_table()
     }
 
     /// Internal content-identity bytes: the serialized source when the
@@ -1538,7 +1388,7 @@ impl EditorModel {
         let decoded = self.decoded_text();
         let encoded = codec_encode(
             &decoded,
-            self.source_format,
+            self.source_format(),
             &EncodeLimits::default(),
             &flavite_encoding::NOT_CANCELLED,
         );
@@ -1546,7 +1396,7 @@ impl EditorModel {
             let source: std::sync::Arc<[u8]> = source.into();
             if let Ok(map) = DecodeMap::build(
                 source.clone(),
-                self.source_format,
+                self.source_format(),
                 &DecodeLimits::default(),
                 &flavite_encoding::NOT_CANCELLED,
             ) {
@@ -1558,7 +1408,7 @@ impl EditorModel {
         // normalized view carrying the save-format intent. `source()` is the
         // decoded UTF-8, NOT serialized form; Undo/Redo still restore text,
         // EOL and format exactly and saving fails with `Unencodable` typed.
-        TextSnapshot::from_normalized_with_descriptor(self.text(), self.source_format)
+        TextSnapshot::from_normalized_with_descriptor(self.text(), self.source_format())
     }
 
     /// Get the content hash of the current buffer (serialized source when
@@ -1578,96 +1428,103 @@ impl EditorModel {
         self.content_hash() == hash
     }
 
-    /// Update text and its Rope index without rebuilding either document.
-    /// Ordinary character edits keep every line's EOL metadata unchanged;
-    /// newline-changing edits splice only the affected line range (S01).
-    fn apply_text_edit(&mut self, edit: &EditOp) {
-        let range = edit.range.start.0..edit.range.end.0;
+    /// Apply an edit to the chunk-tree root, updating the version's EOL
+    /// side state and invalidating the text cache. Returns the new version
+    /// state (O(log n + chunk + window); the window is empty for edits that
+    /// do not touch newlines).
+    fn apply_text_edit(&mut self, edit: &EditOp) -> Arc<VersionState> {
+        let start = edit.range.start.0;
+        let end = edit.range.end.0;
+        let new_root = self.version.root.edit(start..end, &edit.replacement);
         let changes_lines =
-            self.text[range.clone()].contains('\n') || edit.replacement.contains('\n');
-        // The bounded splice is computed off the pre-edit text and rope, so
-        // no whole-document copy is needed.
-        let spliced = changes_lines.then(|| self.affected_eol_splice(edit, &range));
-        let ended_with_lf = self.text.ends_with('\n');
-        let start = self.rope.byte_to_char(range.start);
-        let end = self.rope.byte_to_char(range.end);
-        self.rope.remove(start..end);
-        self.rope.insert(start, &edit.replacement);
-        self.text.replace_range(range, &edit.replacement);
-        if let Some(table) = spliced {
-            self.eol_table = table;
-        } else if ended_with_lf && !self.text.ends_with('\n') {
-            // Typing in the synthetic empty Rope line creates a real,
-            // unterminated source line; it inherits no terminator.
-            self.eol_table
-                .line_endings
-                .push(crate::eol::LineEnding::None);
-            self.eol_table.has_trailing_newline = false;
-        } else if !ended_with_lf && self.text.ends_with('\n') {
-            self.eol_table.line_endings.pop();
-            self.eol_table.has_trailing_newline = true;
-        }
-    }
-
-    /// The bounded affected-range EOL splice for one contiguous edit against
-    /// the current text/rope (§6.9, S01). The affected old-line window comes
-    /// from the rope's line index and only those entries are recomputed;
-    /// everything else is byte-identical to [`spliced_eol_table`], which
-    /// remains the reference path for prepared batches.
-    fn affected_eol_splice(&self, edit: &EditOp, range: &std::ops::Range<usize>) -> EolTable {
-        let (first_rope_line, tail_end) = if range.is_empty() {
-            // Pure insertion: the inserted lines join the line at the point.
-            let line = self.rope.byte_to_line(range.start);
-            (line, self.line_end_byte(line))
+            edit.replacement.contains('\n') || self.version.root.slice(start..end).contains('\n');
+        let old_table = self.version.eol_table();
+        let (eols, has_trailing_newline) = if changes_lines {
+            let line_count = self.version.root.line_count();
+            let (window_first, window_start, tail_end) = eol_window_for_edit(
+                &self.version.root,
+                start,
+                end,
+                &edit.replacement,
+                line_count,
+            );
+            let window_old = self.version.root.slice(window_start..tail_end);
+            let window_new = format!(
+                "{}{}{}",
+                &window_old[..start.saturating_sub(window_start)],
+                edit.replacement,
+                &window_old[end.saturating_sub(window_start)..],
+            );
+            let table = old_table.splice_window(
+                window_first,
+                &window_old,
+                &window_new,
+                tail_end == self.len(),
+            );
+            (Arc::from(table.line_endings), table.has_trailing_newline)
         } else {
-            let last = self.rope.byte_to_line(range.end - 1);
-            let tail_end = if edit.replacement.ends_with('\n') {
-                self.line_end_byte(last)
+            let old_trailing = self.version.has_trailing_newline;
+            let new_trailing = new_root.ends_with_newline();
+            if old_trailing && !new_trailing {
+                let mut eols = self.version.eols.to_vec();
+                eols.push(LineEnding::None);
+                (Arc::from(eols), false)
+            } else if !old_trailing && new_trailing {
+                let mut eols = self.version.eols.to_vec();
+                eols.pop();
+                (Arc::from(eols), true)
             } else {
-                // The replacement's tail merges the following old line when
-                // it lacks a trailing newline: the window runs to the next
-                // line boundary at or after the edit end.
-                match self.text[range.end..].find('\n') {
-                    Some(offset) => range.end + offset + 1,
-                    None => self.text.len(),
-                }
-            };
-            (self.rope.byte_to_line(range.start), tail_end)
+                (self.version.eols.clone(), old_trailing)
+            }
         };
-        // Rope line indices double as table indices, except the synthetic
-        // trailing line after a final newline (which has no table entry).
-        let window_first = first_rope_line.min(self.eol_table.line_count().saturating_sub(1));
-        let window_start = self.rope.line_to_byte(window_first);
-        let window_new = format!(
-            "{}{}{}",
-            &self.text[window_start..range.start],
-            edit.replacement,
-            &self.text[range.end..tail_end],
-        );
-        spliced_eol_table_in_window(
-            &self.eol_table,
-            &self.text,
-            window_start,
-            tail_end,
-            &window_new,
-            window_first,
-        )
-    }
-
-    /// Byte offset of the end of `line` (after its newline; the text end for
-    /// the final line).
-    fn line_end_byte(&self, line: usize) -> usize {
-        if line + 1 < self.rope.len_lines() {
-            self.rope.line_to_byte(line + 1)
-        } else {
-            self.text.len()
-        }
+        let version = Arc::new(VersionState {
+            root: Arc::new(new_root),
+            eols,
+            has_trailing_newline,
+            format: self.version.format,
+            stamp: self.version.stamp,
+        });
+        self.version = version.clone();
+        self.cached_text.take();
+        version
     }
 
     /// Set the coalesce window for the undo tree.
     pub fn set_coalesce_window(&mut self, window: Duration) {
         self.undo_tree.set_coalesce_window(window);
     }
+}
+
+/// The affected EOL window for one edit (RFC-0008 D6, now tree-based):
+/// the first affected line index, its byte start, and the pre-edit
+/// `tail_end` byte (line-aligned through the merge boundary). One shared
+/// derivation for the interactive text path and prepared batches. Queries
+/// are O(log n + chunk).
+fn eol_window_for_edit(
+    root: &crate::chunks::ChunkRoot,
+    start: usize,
+    end: usize,
+    replacement: &str,
+    line_count: usize,
+) -> (usize, usize, usize) {
+    let raw_first = root.line_index_of(start);
+    let window_first = raw_first.min(line_count.saturating_sub(1));
+    let window_start = root.line_start_of(window_first);
+    let tail_end = if start == end {
+        // Pure insertion: the inserted lines join the line at the point.
+        root.find_next_newline(start)
+            .map_or(root.len(), |at| at + 1)
+    } else if replacement.ends_with('\n') {
+        // The last replaced old line ends at its own line boundary: the
+        // window runs to the line end at or after the edit end.
+        root.find_next_newline(end).map_or(root.len(), |at| at + 1)
+    } else {
+        // The replacement's tail merges the following old line when it lacks
+        // a trailing newline: the window runs to the next line boundary at or
+        // after the edit end.
+        root.find_next_newline(end).map_or(root.len(), |at| at + 1)
+    };
+    (window_first, window_start, tail_end)
 }
 
 fn common_text_edges(old: &str, new: &str) -> (usize, usize) {
@@ -1711,12 +1568,35 @@ fn map_position(
     TextByte(crate::positions::snap_to_char_boundary(new_text, mapped))
 }
 
-fn logical_lines(text: &str) -> Vec<&str> {
-    if text.is_empty() {
-        vec![""]
+/// The physical-EOL decoded layer for a normalized text plus its EOL table
+/// (pure form of [`EditorModel::decoded_text`]).
+#[must_use]
+pub fn decoded_layer(text: &str, table: &EolTable) -> String {
+    let mut out = String::with_capacity(text.len() + table.line_count());
+    let mut start = 0usize;
+    let breaks: Vec<usize> = if text.ends_with('\n') {
+        text.match_indices('\n').map(|(i, _)| i).collect()
     } else {
-        text.split_inclusive('\n').collect()
+        let mut v: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
+        v.push(text.len());
+        v
+    };
+    for (i, &end) in breaks.iter().enumerate() {
+        out.push_str(&text[start..end]);
+        match table.line_endings.get(i) {
+            Some(LineEnding::Lf) => out.push('\n'),
+            Some(LineEnding::Crlf) => out.push_str("\r\n"),
+            // No recorded ending for this line (new/last): keep LF when
+            // the normalized text carries one, otherwise terminate none.
+            _ => {
+                if end < text.len() {
+                    out.push('\n');
+                }
+            }
+        }
+        start = if end < text.len() { end + 1 } else { end };
     }
+    out
 }
 
 /// Default coalesce window for EditorModel.
@@ -1802,22 +1682,16 @@ mod tests {
 
     #[test]
     fn text_reads_multi_chunk_documents() {
-        // Ropey splits its internal chunks well below this size; a text read
-        // through `RopeSlice::as_str` silently returns "" for any slice
-        // spanning more than one chunk, which once blanked every note over
-        // ~1KB (and serialized that emptiness on save).
         let text = "filler line for the chunk-boundary test\n".repeat(300);
-        let model = EditorModel::from_text(&text);
+        let mut model = EditorModel::from_text(&text);
         assert_eq!(model.text(), text);
         assert_eq!(model.len(), text.len());
 
-        // Reads stay correct across every path that rebuilds the rope.
-        let mut model = model;
+        // Reads stay correct across every path that rebuilds the tree.
         let replacement = "replaced\n".repeat(400);
         model.replace_snapshot(TextSnapshot::new(replacement.as_bytes()).unwrap());
         assert_eq!(model.text(), replacement);
 
-        let mut model = model;
         model.apply_edit_op(EditOp::new(
             Span::new(TextByte(0), TextByte(9)),
             "EDITED".into(),
@@ -1825,11 +1699,9 @@ mod tests {
         assert!(model.text().starts_with("EDITED"));
         assert!(model.text().contains("replaced"));
 
-        let mut model = model;
         model.undo();
         assert_eq!(model.text(), replacement);
 
-        let mut model = model;
         model.redo();
         assert!(model.text().starts_with("EDITED"));
 
@@ -1898,12 +1770,12 @@ mod tests {
         let mut model = EditorModel::from_snapshot(
             TextSnapshot::new("\u{feff}one\r\ntwo\n".as_bytes()).unwrap(),
         );
-        let initial = model.eol_table().clone();
+        let initial = model.eol_table();
         model.apply_edit_ops(&[EditOp::new(
             Span::new(TextByte(1), TextByte(2)),
             "🧑🏽‍💻".into(),
         )]);
-        assert_eq!(model.eol_table(), &initial);
+        assert_eq!(model.eol_table(), initial);
         assert_eq!(model.to_source_bytes(), "\u{feff}o🧑🏽‍💻e\r\ntwo\n".as_bytes());
         model.seal_undo_group();
         let end = model.len();
@@ -1920,12 +1792,12 @@ mod tests {
             Span::new(TextByte(end), TextByte(model.len())),
             String::new(),
         )]);
-        assert_eq!(model.eol_table(), &initial);
+        assert_eq!(model.eol_table(), initial);
         assert!(model.undo().is_some());
         assert!(model.text().ends_with('é'));
         assert_eq!(model.snapshot().source(), model.to_source_bytes());
         assert!(model.redo().is_some());
-        assert_eq!(model.eol_table(), &initial);
+        assert_eq!(model.eol_table(), initial);
     }
 
     #[test]
@@ -1951,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn edits_keep_the_rope_index_in_sync_across_chunks_and_unicode() {
+    fn edits_keep_the_chunk_index_in_sync_across_chunks_and_unicode() {
         let mut model = EditorModel::from_text(&"aé\n".repeat(3000));
         for line in [0, 300, 2000, 3000] {
             let at = model.line_start(line).0;
@@ -1961,59 +1833,8 @@ mod tests {
                 "🧑🏽‍💻".into(),
             )]);
             assert!(model.revision() > before);
-            assert_eq!(model.rope.to_string(), model.text());
             assert_eq!(model.snapshot().text(), model.text());
             assert_eq!(model.to_source_bytes(), model.text().as_bytes());
-        }
-    }
-
-    #[test]
-    fn bounded_eol_splice_matches_the_reference_splice_on_randomized_edits() {
-        // Deterministic LCG: repeated runs always cover the same corpus.
-        let mut state = 0x2545_F491_4F6C_DD1Du64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        // Lines carry mixed endings so dominant-vs-recorded divergences are
-        // exercised, plus empty units so the empty-text edges appear.
-        let units = ["a", "b\r", "\n", "c\r\n", "dd", "\r\n", "e\n", ""];
-        for iteration in 0..2_000 {
-            let text: String = (0..(next() % 9 + 1))
-                .map(|_| units[(next() as usize) % units.len()])
-                .collect();
-            let model = EditorModel::from_text(&text);
-            let old_text = model.text().to_string();
-            let old_table = model.eol_table().clone();
-            let start = (next() as usize) % (old_text.len() + 1);
-            let end = start + (next() as usize) % (old_text.len() + 1 - start);
-            // Frequently reproduce the replaced bytes so identity windows
-            // (equal-line prefix extension) are exercised too.
-            let replacement = if next() % 4 == 0 && end > start {
-                old_text[start..end].to_string()
-            } else {
-                (0..(next() % 4))
-                    .map(|_| units[(next() as usize) % units.len()])
-                    .collect()
-            };
-            // The reference: the whole-document splice prepare_batch uses.
-            let expected = spliced_eol_table(
-                &old_table,
-                &old_text,
-                &format!("{}{}{}", &old_text[..start], replacement, &old_text[end..]),
-            );
-            let mut edited = EditorModel::from_text(&text);
-            edited.apply_edit_ops(&[EditOp::new(
-                Span::new(TextByte(start), TextByte(end)),
-                replacement.clone(),
-            )]);
-            assert_eq!(
-                edited.eol_table(),
-                &expected,
-                "iteration {iteration}: {start}..{end} -> {replacement:?} on {old_text:?}"
-            );
         }
     }
 
@@ -2243,30 +2064,232 @@ mod tests {
 }
 
 #[cfg(test)]
-mod splice_debug {
+mod debug_tests {
     use super::*;
+    use crate::eol::logical_lines;
+
+    /// The EOL splice contract, verified against an independent whole-doc
+    /// oracle defined inline (the old reference oracle).
+    fn reference_eol_splice(old: &EolTable, old_text: &str, new_text: &str) -> EolTable {
+        let dominant = match old.dominant_eol() {
+            LineEnding::None => LineEnding::Lf,
+            ending => ending,
+        };
+        let mut new_table = EolTable::from_text(new_text);
+        let old_lines = logical_lines(old_text);
+        let new_lines = logical_lines(new_text);
+        let mut prefix = 0;
+        while prefix < old_lines.len()
+            && prefix < new_lines.len()
+            && old_lines[prefix] == new_lines[prefix]
+        {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < old_lines.len().saturating_sub(prefix)
+            && suffix < new_lines.len().saturating_sub(prefix)
+            && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        let old_middle = old_lines.len() - prefix - suffix;
+        let new_middle = new_lines.len() - prefix - suffix;
+        for (line, ending) in new_table.line_endings.iter_mut().enumerate() {
+            // A replacement line without a newline is authoritative: do not
+            // carry the old file's ending onto the new final unterminated line.
+            if *ending == LineEnding::None {
+                continue;
+            }
+            let old_line = if line < prefix {
+                Some(line)
+            } else if line >= prefix + new_middle {
+                Some(old_lines.len() - (new_lines.len() - line))
+            } else if old_middle == new_middle {
+                Some(line)
+            } else {
+                None
+            };
+            *ending = old_line
+                .and_then(|old_line| old.get(old_line))
+                .unwrap_or(dominant);
+        }
+        new_table
+    }
 
     #[test]
-    fn debug_case_iteration2() {
-        let text = "e\ne\nc\n";
-        let model = EditorModel::from_text(text);
-        eprintln!("old_text={:?} table={:?}", model.text(), model.eol_table());
-        let old_table = model.eol_table().clone();
-        let old_text = model.text().to_string();
-        let replacement = "\r\ne\n".to_string();
-        let new_text = format!("{}{}{}", &old_text[..0], replacement, &old_text[1..]);
-        eprintln!("new_text={:?}", new_text);
-        let expected = spliced_eol_table(&old_table, &old_text, &new_text);
-        eprintln!(
-            "spliced={:?} dominant={:?}",
-            expected,
-            old_table.dominant_eol()
+    fn bounded_eol_splice_matches_the_reference_splice_on_randomized_edits() {
+        // Deterministic LCG: repeated runs always cover the same corpus.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Lines carry mixed endings so dominant-vs-recorded divergences are
+        // exercised, plus empty units so the empty-text edges appear.
+        let units = ["a", "b\r", "\n", "c\r\n", "dd", "\r\n", "e\n", ""];
+        for iteration in 0..2_000 {
+            let text: String = (0..(next() % 9 + 1))
+                .map(|_| units[(next() as usize) % units.len()])
+                .collect();
+            let model = EditorModel::from_text(&text);
+            let old_text = model.text().to_string();
+            let old_table = model.eol_table();
+            let start = (next() as usize) % (old_text.len() + 1);
+            let end = start + (next() as usize) % (old_text.len() + 1 - start);
+            // Frequently reproduce the replaced bytes so identity windows
+            // (equal-line prefix extension) are exercised too.
+            let replacement = if next() % 4 == 0 && end > start {
+                old_text[start..end].to_string()
+            } else {
+                (0..(next() % 4))
+                    .map(|_| units[(next() as usize) % units.len()])
+                    .collect()
+            };
+            // The reference: the whole-document splice.
+            let expected = reference_eol_splice(
+                &old_table,
+                &old_text,
+                &format!("{}{}{}", &old_text[..start], replacement, &old_text[end..]),
+            );
+            let mut edited = EditorModel::from_text(&text);
+            edited.apply_edit_ops(&[EditOp::new(
+                Span::new(TextByte(start), TextByte(end)),
+                replacement.clone(),
+            )]);
+            assert_eq!(
+                edited.eol_table(),
+                expected,
+                "iteration {iteration}: {start}..{end} -> {replacement:?} on {old_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_composed_bounded_splice_matches_the_reference_oracle() {
+        // The prepared-batch path (isolated installs) recomputes the window
+        // over the COMPOSED batch edit; it must agree with the whole-document
+        // reference for multi-op batches with newline insert/delete/replace
+        // mixes.
+        let mut state = 0xD1B5_4E32_AB7F_9981u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let units = ["a", "b\r", "\n", "c\r\n", "dd", "\r\n", "e\n", ""];
+        for iteration in 0..1_000 {
+            let text: String = (0..(next() % 8 + 1))
+                .map(|_| units[(next() as usize) % units.len()])
+                .collect();
+            let model = EditorModel::from_text(&text);
+            let old_text = model.text().to_string();
+            let old_table = model.eol_table();
+            let op_count = next() % 3 + 2;
+            let mut edits = Vec::new();
+            let mut replacement = String::new();
+            let mut cursor = 0usize;
+            let mut start = 0usize;
+            let mut end = old_text.len();
+            for i in 0..op_count {
+                // Monotonic, non-overlapping ranges (gaps only INSIDE the
+                // combined span, matching prepare_batch).
+                let window = old_text.len() - cursor;
+                let s = cursor + (next() as usize) % (window + 1);
+                let e = (s + (next() as usize) % (old_text.len() - s + 1)).min(old_text.len());
+                let piece: String = (0..(next() % 3))
+                    .map(|_| units[(next() as usize) % units.len()])
+                    .collect();
+                if i == 0 {
+                    start = s;
+                }
+                if edits.is_empty() {
+                    cursor = start;
+                    replacement.clear();
+                }
+                replacement.push_str(&old_text[cursor..s]);
+                replacement.push_str(&piece);
+                edits.push(EditOp::new(Span::new(TextByte(s), TextByte(e)), piece));
+                cursor = e;
+                end = e;
+            }
+            replacement.push_str(&old_text[cursor..end]);
+            let after = format!("{}{}{}", &old_text[..start], replacement, &old_text[end..]);
+            let expected = reference_eol_splice(&old_table, &old_text, &after);
+            let mut edited = EditorModel::from_text(&text);
+            if !edited.edit_ops_valid(&edits) {
+                continue; // degenerate same-start-empty overlap: skip
+            }
+            edited
+                .try_apply_batch(&edits, crate::undo::UndoPolicy::Isolated)
+                .expect("batch installs");
+            assert_eq!(
+                edited.eol_table(),
+                expected,
+                "iteration {iteration}: batch {edits:?} on {old_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delta_nodes_account_identically_to_eager_snapshots() {
+        // The same edit installed as a typing delta and as an isolated
+        // materialized boundary accounts the same bytes.
+        let edit = |model: &mut EditorModel| {
+            let at = model.text().len();
+            let rec = crate::history::EditorEdit {
+                before_primary: 0,
+                origin: format!("{:032x}", 1),
+                kind: crate::history::EditKind::Typing,
+                before: vec![[0, at, at]],
+                after: vec![[0, at + 1, at + 1]],
+                primary: 0,
+            };
+            model
+                .try_apply_recorded_batch(
+                    &[EditOp::new(
+                        Span::new(TextByte(at), TextByte(at)),
+                        "x".into(),
+                    )],
+                    crate::undo::UndoPolicy::Typing,
+                    rec,
+                )
+                .expect("typing applies");
+        };
+        let mut typing = EditorModel::from_text("base");
+        for _ in 0..5 {
+            edit(&mut typing);
+        }
+        let mut isolated = EditorModel::from_text("base");
+        for _ in 0..5 {
+            let at = isolated.text().len();
+            let rec = crate::history::EditorEdit {
+                before_primary: 0,
+                origin: format!("{:032x}", 2),
+                kind: crate::history::EditKind::Typing,
+                before: vec![[0, at, at]],
+                after: vec![[0, at + 1, at + 1]],
+                primary: 0,
+            };
+            isolated
+                .try_apply_recorded_batch(
+                    &[EditOp::new(
+                        Span::new(TextByte(at), TextByte(at)),
+                        "x".into(),
+                    )],
+                    crate::undo::UndoPolicy::Isolated,
+                    rec,
+                )
+                .expect("isolated applies");
+        }
+        // Same content; accounting must match.
+        assert_eq!(typing.text(), isolated.text());
+        assert_eq!(typing.history_nodes(), isolated.history_nodes());
+        assert_eq!(
+            typing.history_accounted_bytes(),
+            isolated.history_accounted_bytes()
         );
-        let mut edited = EditorModel::from_text(text);
-        edited.apply_edit_ops(&[EditOp::new(
-            Span::new(TextByte(0), TextByte(1)),
-            replacement.clone(),
-        )]);
-        eprintln!("bounded={:?}", edited.eol_table());
     }
 }

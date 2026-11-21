@@ -1,20 +1,21 @@
-//! Device-local operation keys (RFC-0006 §6.9/§6.4).
+//! Vault-local operation keys (RFC-0006 §6.9/§6.4).
 //!
 //! Checksums detect corruption but do not authenticate a plan. Before the
 //! first applicable plan is sealed, the vault creates a random 256-bit
-//! device/vault operation key in the private OS data directory, OUTSIDE the
-//! vault. Keyed BLAKE3 authenticates the plan digest, selection revision,
-//! native root/vault binding, engine version and every log record's
-//! sequence/previous authenticator. The key never appears in vault
-//! metadata, logs, worker IPC or default exports; a lost/corrupt key for
-//! unresolved local jobs produces a quarantine, never silent regeneration.
+//! vault operation key in the vault's private `.flavite/operations/`
+//! directory — inside the vault, never in OS data dirs. Keyed BLAKE3
+//! authenticates the plan digest, selection revision, native root/vault
+//! binding, engine version and every log record's sequence/previous
+//! authenticator. The key never appears in vault metadata, logs, worker
+//! IPC or default exports; a lost/corrupt key for unresolved local jobs
+//! produces a quarantine, never silent regeneration.
 
 use std::path::{Path, PathBuf};
 
 /// Authenticator length (32 bytes).
 pub const TAG_LEN: usize = 32;
 
-/// The private key file name under `<data>/flavite/vaults/<uuid>/operations`.
+/// The private key file name under `.<vault>/.flavite/operations`.
 const KEY_FILE: &str = "key.bin";
 
 /// Devices the domain-separated authenticator tag domain.
@@ -73,29 +74,44 @@ impl std::fmt::Display for KeyStoreError {
 
 impl std::error::Error for KeyStoreError {}
 
-/// The private key directory for one vault.
-fn key_dir(data_dir: &Path, vault_uuid: &uuid::Uuid) -> PathBuf {
-    data_dir
-        .join("flavite")
-        .join("vaults")
-        .join(vault_uuid.to_string())
-        .join("operations")
+/// The private key directory for one vault: `<vault>/.flavite/operations`
+/// (OS-temp backing for virtual test vaults).
+fn key_dir(vault_root: &Path, uuid: &uuid::Uuid) -> PathBuf {
+    crate::identity::vault_private_backing_dir(vault_root, *uuid, "operations")
 }
 
-/// Load the operation key, creating it atomically (no-clobber) when absent.
-pub fn load_or_create_key(
-    data_dir: &Path,
+/// Load the vault operation key, creating it atomically (no-clobber) when
+/// absent. The key lives inside the vault (`.flavite/operations/key.bin`),
+/// so the vault is self-contained and portable. When two processes race to
+/// create the same key (shared backing for virtual test vaults), the loser
+/// reloads the winner's key instead of failing.
+pub fn load_or_create_key_at_vault(
+    vault_root: &Path,
     vault_uuid: &uuid::Uuid,
 ) -> Result<OperationKey, KeyStoreError> {
-    let dir = key_dir(data_dir, vault_uuid);
-    std::fs::create_dir_all(&dir).map_err(|e| KeyStoreError::Io(e.to_string()))?;
+    let dir = key_dir(vault_root, vault_uuid);
     let path = dir.join(KEY_FILE);
     match std::fs::read(&path) {
         Ok(bytes) => {
             let raw: [u8; 32] = bytes.try_into().map_err(|_| KeyStoreError::Corrupt)?;
             Ok(OperationKey { raw })
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_new_key(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match create_new_key(&path) {
+                Ok(key) => Ok(key),
+                Err(KeyStoreError::Io(message)) => {
+                    // The exclusive create raced another writer: reload the
+                    // winner's key if it is valid, else report the conflict.
+                    std::fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                        .map(|raw| OperationKey { raw })
+                        .ok_or(KeyStoreError::Conflict)
+                        .map_err(|_| KeyStoreError::Io(message))
+                }
+                Err(error) => Err(error),
+            }
+        }
         Err(error) => Err(KeyStoreError::Io(error.to_string())),
     }
 }
@@ -179,31 +195,32 @@ mod tests {
 
     #[test]
     fn key_is_created_atomically_and_roundtrips() {
-        let dir = std::env::temp_dir().join(format!("flavite-opkey-test-{}", uuid::Uuid::now_v7()));
+        let vault_root =
+            std::env::temp_dir().join(format!("flavite-opkey-test-{}", uuid::Uuid::now_v7()));
         let vault = uuid::Uuid::now_v7();
-        let key = load_or_create_key(&dir, &vault).expect("create");
+        let key = load_or_create_key_at_vault(&vault_root, &vault).expect("create");
         assert!(!is_degenerate(&key));
-        let again = load_or_create_key(&dir, &vault).expect("load");
+        let again = load_or_create_key_at_vault(&vault_root, &vault).expect("load");
         assert_eq!(key.raw, again.raw);
         let tag = key.tag(b"domain", b"payload");
         assert_eq!(tag, again.tag(b"domain", b"payload"));
         assert_ne!(tag, key.tag(b"other", b"payload"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&vault_root);
     }
 
     #[test]
     fn corrupt_key_is_not_guessed() {
-        let dir =
+        let vault_root =
             std::env::temp_dir().join(format!("flavite-opkey-corrupt-{}", uuid::Uuid::now_v7()));
         let vault = uuid::Uuid::now_v7();
-        let key_dir_path = key_dir(&dir, &vault);
+        let key_dir_path = key_dir(&vault_root, &vault);
         std::fs::create_dir_all(&key_dir_path).unwrap();
         std::fs::write(key_dir_path.join(KEY_FILE), b"short").unwrap();
         assert!(matches!(
-            load_or_create_key(&dir, &vault),
+            load_or_create_key_at_vault(&vault_root, &vault),
             Err(KeyStoreError::Corrupt)
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&vault_root);
     }
 
     #[test]

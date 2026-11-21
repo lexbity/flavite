@@ -140,6 +140,13 @@ pub fn project(app: &App) -> Projection {
             let row_title = match search.kind {
                 crate::host::selection_search::ApplyKind::Select => "Select matches…",
                 crate::host::selection_search::ApplyKind::Split => "Split on matches…",
+                crate::host::selection_search::ApplyKind::Keep { keep } => {
+                    if keep {
+                        "Keep matching…"
+                    } else {
+                        "Drop non-matching…"
+                    }
+                }
             };
             let query_id = node_id("selection-search-query", tab.raw());
             let mut query = Node::new(Role::MultilineTextInput);

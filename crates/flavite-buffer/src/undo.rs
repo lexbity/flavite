@@ -7,14 +7,26 @@
 //!
 //! Every edit, undo, redo, reload, and journal patch advances the revision
 //! even if text returns to previous bytes (§4.5.2).
+//!
+//! Node text is held as immutable version roots (RFC-0011 D-02): each node
+//! stores the post-edit `Arc<VersionState>` (chunk-tree root + EOL state +
+//! descriptor), so undo/redo/branch are O(1) pointer swaps, materialization
+//! happens only at user-paced APIs, and the every-64 retention floor /
+//! delta-replay machinery is gone. Node storage is a paged arena (D-09):
+//! `id == global index` via arithmetic, tombstones bounded at one
+//! partially-live page per buffer, and accounting is delta-maintained
+//! (D-09/T6).
 use crate::budget::{Budget, EvictionReport, LimitExceeded, RESERVATION_LEASE_MS, Reservation};
+use crate::chunks::ChunkRoot;
 use crate::history::{
     EditKind, EditorEdit, HistoryCursor, HistoryEntry, HistoryError, HistoryPage, HistoryTarget,
     PAGE_LIMIT, TRAIL_LIMIT,
 };
 use crate::revision::Revision;
 use crate::selection::SpanEdit;
+use flavite_encoding::{FormatStamp, SourceFormat};
 use flavite_syntax::text::{Span, TextByte, TextSnapshot};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) fn wall_clock_ms() -> u64 {
@@ -34,11 +46,72 @@ fn shift_usize(position: usize, delta: isize) -> usize {
     }
 }
 
+/// Immutable post-edit document state held by an undo node (RFC-0011
+/// D-02/D-04): the chunk-tree root plus the EOL side state and the save
+/// descriptor. `None` on an undo node means evicted (tombstone) — unchanged
+/// semantics.
+#[derive(Debug, Clone)]
+pub struct VersionState {
+    /// The chunk-tree root (the document bytes).
+    pub root: Arc<ChunkRoot>,
+    /// Per-line physical endings (one per line).
+    pub eols: Arc<[crate::eol::LineEnding]>,
+    /// Whether the source ends with a trailing newline.
+    pub has_trailing_newline: bool,
+    /// Authoritative save-format descriptor.
+    pub format: SourceFormat,
+    /// Codec/hint provenance for the descriptor.
+    pub stamp: FormatStamp,
+}
+
+impl VersionState {
+    /// Build from a snapshot (legacy facades / recovery).
+    #[must_use]
+    pub fn from_snapshot(snapshot: &TextSnapshot) -> Self {
+        let table = crate::eol::EolTable::from_snapshot(snapshot);
+        let format = snapshot.format().unwrap_or_default();
+        Self {
+            root: Arc::new(ChunkRoot::from_text(snapshot.text())),
+            eols: Arc::from(table.line_endings),
+            has_trailing_newline: table.has_trailing_newline,
+            format,
+            stamp: FormatStamp::detected(format),
+        }
+    }
+
+    /// The EOL table view.
+    #[must_use]
+    pub fn eol_table(&self) -> crate::eol::EolTable {
+        crate::eol::EolTable {
+            line_endings: self.eols.to_vec(),
+            has_trailing_newline: self.has_trailing_newline,
+        }
+    }
+
+    /// Document length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.root.len()
+    }
+
+    /// Whether the document is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.root.is_empty()
+    }
+
+    /// Materialize the full text (user-paced only).
+    #[must_use]
+    pub fn materialize(&self) -> String {
+        self.root.materialize()
+    }
+}
+
 /// The accounted bytes of one retained node (budget.rs `account_node` over
-/// the node's own state; shared by `reaccount` and the reservation
+/// the node's own state; shared by the delta accounting and the reservation
 /// feasibility plan).
 fn node_accounted_bytes(node: &UndoNode) -> u64 {
-    let snapshot_len = node.snapshot.as_ref().map_or(0, |s| s.text().len());
+    let snapshot_len = node.snapshot.as_ref().map_or(0, |state| state.len());
     let replacement_len = node.edit.as_ref().map_or(0, |e| e.replacement.len());
     let (before, after) = match &node.editor {
         Some(record) => (&record.before[..], &record.after[..]),
@@ -52,6 +125,7 @@ fn node_accounted_bytes(node: &UndoNode) -> u64 {
             .map(|s| s.capacity() as u64 * std::mem::size_of::<SpanEdit>() as u64)
             .sum::<u64>()
 }
+
 /// Default time window for coalescing consecutive edits into a single undo group.
 ///
 /// Edits within this window of the previous edit are coalesced.
@@ -140,9 +214,10 @@ impl EditOp {
     /// replacement over the `min..max` span cannot be derived by
     /// concatenation — sequential application leaves displaced original
     /// bytes inside the span that concatenation silently drops. (The live
-    /// undo tree recomputes its merged edit from before/after snapshots and
-    /// does not rely on this predicate for text correctness; `coalesce`
-    /// does, which is why adjacency is the whole contract.)
+    /// undo tree merges coalesced edits with the coordinate mapping of
+    /// RFC-0008 §5.3.2 (D4) — [`merge_mapped`] — and does not rely on this
+    /// predicate for text correctness; `coalesce` does, which is why
+    /// adjacency is the whole contract.)
     #[must_use]
     pub fn can_coalesce(&self, other: &EditOp) -> bool {
         if self.boundary || other.boundary || self.journal.is_some() || other.journal.is_some() {
@@ -177,6 +252,211 @@ impl EditOp {
         ))
     }
 }
+
+/// Map one post-`prev` coordinate into pre-`prev` coordinates (RFC-0008
+/// §5.3.2, D4):
+///
+/// | point x (post) | mapped x (pre) |
+/// |---|---|
+/// | x < s | x |
+/// | s ≤ x ≤ s+p | s |
+/// | x > s+p | x − d |
+///
+/// where `prev = [s, e) -> P`, `p = |P|`, `d = p − (e − s)`.
+fn map_post_to_pre(x: usize, s: usize, _e: usize, p: usize, d: isize) -> isize {
+    let x = x as isize;
+    if x < s as isize {
+        x
+    } else if x <= (s + p) as isize {
+        s as isize
+    } else {
+        x - d
+    }
+}
+
+/// Local-window coordinate of a post-`prev` point (RFC-0008 §5.3.2): the
+/// virtual window is `[start, s) + P + [e, end)` laid out linearly.
+fn map_post_to_local(x: usize, s: usize, start: usize, z1: usize, p: usize) -> isize {
+    let x = x as isize;
+    if x < s as isize {
+        x - start as isize
+    } else if x <= (s + p) as isize {
+        z1 as isize + (x - s as isize)
+    } else {
+        z1 as isize + p as isize + (x - (s + p) as isize)
+    }
+}
+
+/// The original-text source for [`merge_mapped_with_source`]: the full
+/// parent text, or a window of it with a base offset (RFC-0011 S2 uses the
+/// window form to keep continuous gap-spanning merges O(gap) instead of
+/// O(document)).
+#[derive(Debug, Clone, Copy)]
+pub enum SourceSlice<'a> {
+    /// The full parent text.
+    Full(&'a str),
+    /// A window `[base, base + text.len())` of the parent text.
+    Window { base: usize, text: &'a str },
+}
+
+impl SourceSlice<'_> {
+    fn push_range(&self, out: &mut String, from: usize, to: usize) -> bool {
+        if from >= to {
+            return true;
+        }
+        match *self {
+            SourceSlice::Full(text) => {
+                if to > text.len() {
+                    return false;
+                }
+                out.push_str(&text[from..to]);
+                true
+            }
+            SourceSlice::Window { base, text } => {
+                if from < base || to > base + text.len() {
+                    return false;
+                }
+                out.push_str(&text[from - base..to - base]);
+                true
+            }
+        }
+    }
+}
+
+/// Merge `next` (coordinates in the text AFTER `prev` was applied) into
+/// `prev`, producing one edit in `prev`'s pre-coordinates (RFC-0008 D4,
+/// §5.3.2). Returns `None` when the composition would require original text
+/// bytes the caller did not supply (gap-spanning continuous merges) or when
+/// the inputs violate the coalescing preconditions.
+///
+/// `source` is the original text slice covering the merged window; it is
+/// needed exactly when the merged replacement must carry bytes untouched by
+/// both edits (a gap between `prev`'s span and `next`'s range). With
+/// `source == None` those cases return `None`; adjacent/contained cases are
+/// composed from the two replacements alone.
+#[must_use]
+pub fn merge_mapped_with_source(
+    prev: &EditOp,
+    next: &EditOp,
+    source: Option<SourceSlice<'_>>,
+) -> Option<EditOp> {
+    if prev.boundary || next.boundary || prev.journal.is_some() || next.journal.is_some() {
+        return None;
+    }
+    let s = prev.range.start.0;
+    let e = prev.range.end.0;
+    let p = prev.replacement.len();
+    let d = p as isize - (e - s) as isize;
+    let a = next.range.start.0;
+    let b = next.range.end.0;
+    if a > b {
+        return None;
+    }
+
+    let a_pre = map_post_to_pre(a, s, e, p, d);
+    let b_pre = map_post_to_pre(b, s, e, p, d);
+    let start = (s as isize).min(a_pre).max(0) as usize;
+    let end = (e as isize).max(b_pre).max(0) as usize;
+
+    let z1 = s - start; // original bytes before the span
+    let z3 = end - e; // original bytes after the span
+    let la = map_post_to_local(a, s, start, z1, p)
+        .max(0)
+        .min((z1 + p + z3) as isize) as usize;
+    let lb = map_post_to_local(b, s, start, z1, p)
+        .max(0)
+        .min((z1 + p + z3) as isize) as usize;
+
+    // Push an original-text slice (zone-local offsets, unambiguous). Empty
+    // slices are free; non-empty ones require the source.
+    let push_orig = |out: &mut String, from: usize, to: usize| -> bool {
+        if from >= to {
+            return true;
+        }
+        let Some(text) = source else {
+            return false;
+        };
+        text.push_range(out, from, to)
+    };
+
+    let mut out = String::with_capacity(p + next.replacement.len() + z1 + z3);
+
+    // Zone 1: original bytes [start, s), local [0, z1). Insertion at
+    // `la` sits before the span when la < z1.
+    if z1 > 0 {
+        if la < z1 {
+            if !push_orig(&mut out, start, start + la) {
+                return None;
+            }
+            out.push_str(&next.replacement);
+            if !push_orig(&mut out, start + lb.min(z1), s) {
+                return None;
+            }
+        } else if !push_orig(&mut out, start, s) {
+            return None;
+        }
+    }
+
+    // Zone 2: prev's replacement P, local [z1, z1+p). The zone owns the
+    // insertion at the exact span end (la == z1+p) so the replacement
+    // survives when zone 3 is empty; zone 3's condition is strictly-after.
+    {
+        let p_lo = z1;
+        let p_hi = z1 + p;
+        let del_s = la.max(p_lo).min(p_hi) - p_lo;
+        let del_e = lb.max(p_lo).min(p_hi) - p_lo;
+        if del_s > del_e {
+            return None;
+        }
+        if la >= p_lo && la <= p_hi {
+            out.push_str(&prev.replacement[..la - p_lo]);
+            out.push_str(&next.replacement);
+            out.push_str(&prev.replacement[del_e..]);
+        } else {
+            out.push_str(&prev.replacement[..del_s]);
+            out.push_str(&prev.replacement[del_e..]);
+        }
+    }
+
+    // Zone 3: original bytes [e, end), local [z1+p, z1+p+z3).
+    if z3 > 0 {
+        let base = z1 + p;
+        if la > base {
+            let off = la - base;
+            if !push_orig(&mut out, e, e + off) {
+                return None;
+            }
+            out.push_str(&next.replacement);
+            let del_end = lb.min(base + z3);
+            if !push_orig(&mut out, e + (del_end - base), end) {
+                return None;
+            }
+        } else {
+            let del_s = la.max(base).min(base + z3) - base;
+            let del_e = lb.max(base).min(base + z3) - base;
+            if del_s > del_e {
+                return None;
+            }
+            if !push_orig(&mut out, e, e + del_s) {
+                return None;
+            }
+            if !push_orig(&mut out, e + del_e, end) {
+                return None;
+            }
+        }
+    }
+
+    Some(EditOp::new(Span::new(TextByte(start), TextByte(end)), out))
+}
+
+/// [`merge_mapped_with_source`] without a source: exact for every composition
+/// that needs no original gap bytes; `None` otherwise (caller installs a new
+/// node — RFC-0008 D4).
+#[must_use]
+pub fn merge_mapped(prev: &EditOp, next: &EditOp) -> Option<EditOp> {
+    merge_mapped_with_source(prev, next, None)
+}
+
 /// A node in the undo tree.
 ///
 /// Each node represents a state of the buffer and can have:
@@ -197,17 +477,17 @@ pub struct UndoNode {
     /// Unique identifier for this node.
     pub id: u64,
     /// Whether this node was evicted to satisfy a history budget. Evicted
-    /// nodes keep their structural links (id/`/children) so surviving
-    /// chains stay traversable, but their heavy state (snapshot, editor
-    /// record, edit, children) is dropped and they are invisible to
-    /// history pages, accounting, undo/redo and restore (FEUX-0002 X01).
+    /// nodes drop their heavy state (state, editor record, edit, children)
+    /// and are invisible to history pages, accounting, undo/redo and
+    /// restore (FEUX-0002 X01).
     pub evicted: bool,
     /// The revision at this node.
     pub revision: Revision,
     /// The edit that led to this state (None for the root).
     pub edit: Option<EditOp>,
-    /// The text snapshot at this node (for leaf nodes, can be reconstructed).
-    pub snapshot: Option<TextSnapshot>,
+    /// The immutable version state at this node (RFC-0011 D-02); `None`
+    /// once evicted.
+    pub snapshot: Option<Arc<VersionState>>,
     /// The time when this edit was applied.
     pub timestamp: Instant,
     /// Parent node ID.
@@ -216,9 +496,9 @@ pub struct UndoNode {
     pub children: Vec<u64>,
 }
 impl UndoNode {
-    /// Create a new root node.
+    /// Create a new root node (always materialized).
     #[must_use]
-    pub fn root(revision: Revision, snapshot: TextSnapshot) -> Self {
+    pub fn root(revision: Revision, state: VersionState) -> Self {
         Self {
             changed_at_unix_ms: wall_clock_ms(),
             segment: None,
@@ -231,20 +511,20 @@ impl UndoNode {
             evicted: false,
             revision,
             edit: None,
-            snapshot: Some(snapshot),
+            snapshot: Some(Arc::new(state)),
             timestamp: Instant::now(),
             parent_id: None,
             children: Vec::new(),
         }
     }
-    /// Create a new node from an edit with a snapshot.
+    /// Create a new node from an edit with its version state.
     #[must_use]
     pub fn new(
         id: u64,
         revision: Revision,
         edit: EditOp,
         parent_id: u64,
-        snapshot: TextSnapshot,
+        state: VersionState,
     ) -> Self {
         Self {
             changed_at_unix_ms: wall_clock_ms(),
@@ -262,7 +542,7 @@ impl UndoNode {
             evicted: false,
             revision,
             edit: Some(edit),
-            snapshot: Some(snapshot),
+            snapshot: Some(Arc::new(state)),
             timestamp: Instant::now(),
             parent_id: Some(parent_id),
             children: Vec::new(),
@@ -280,6 +560,156 @@ impl UndoNode {
         self.children.is_empty()
     }
 }
+
+// ----------------------------------------------------------------------
+// Paged arena (D-09)
+// ----------------------------------------------------------------------
+
+const PAGE_SLOTS: usize = 512;
+
+#[derive(Debug)]
+struct Page<T> {
+    slots: Box<[Option<T>]>,
+    /// Number of slots ever used in this page (ids are never reused).
+    count: usize,
+    /// Number of live (non-evicted) entries.
+    survivors: usize,
+}
+
+impl<T> Page<T> {
+    fn new() -> Self {
+        Self {
+            slots: std::iter::repeat_with(|| None)
+                .take(PAGE_SLOTS)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            count: 0,
+            survivors: 0,
+        }
+    }
+
+    fn append(&mut self, value: T) -> Option<usize> {
+        if self.count >= PAGE_SLOTS {
+            return None;
+        }
+        let slot = self.count;
+        self.count += 1;
+        self.slots[slot] = Some(value);
+        self.survivors += 1;
+        Some(slot)
+    }
+
+    fn get(&self, slot: usize) -> Option<&T> {
+        self.slots.get(slot)?.as_ref()
+    }
+
+    fn get_mut(&mut self, slot: usize) -> Option<&mut T> {
+        self.slots.get_mut(slot)?.as_mut()
+    }
+
+    /// Mark a slot dead; returns true when the page is now fully dead.
+    fn remove(&mut self, slot: usize) -> bool {
+        if self.slots.get_mut(slot).and_then(Option::take).is_some() {
+            self.survivors = self.survivors.saturating_sub(1);
+        }
+        self.survivors == 0
+    }
+}
+
+/// An arena with stable ids (`id == global index`) whose backing memory is
+/// freed page-by-page once every slot in a page is dead.
+#[derive(Debug)]
+pub(crate) struct PageArena<T> {
+    pages: Vec<Option<Page<T>>>,
+}
+
+impl<T> PageArena<T> {
+    fn new() -> Self {
+        Self {
+            pages: vec![Some(Page::new())],
+        }
+    }
+
+    fn push(&mut self, value: T) -> u64 {
+        if let Some(page) = self.pages.last_mut().and_then(|p| p.as_mut())
+            && page.count < PAGE_SLOTS
+        {
+            let slot = page.append(value).expect("free slot");
+            return ((self.pages.len() - 1) * PAGE_SLOTS + slot) as u64;
+        }
+        self.pages.push(Some(Page::new()));
+        let idx = self.pages.len() - 1;
+        let page = self.pages[idx].as_mut().expect("fresh page");
+        let slot = page.append(value).expect("fresh page has a free slot");
+        (idx * PAGE_SLOTS + slot) as u64
+    }
+
+    fn get(&self, id: u64) -> Option<&T> {
+        let page = (id as usize) / PAGE_SLOTS;
+        let slot = (id as usize) % PAGE_SLOTS;
+        self.pages.get(page)?.as_ref()?.get(slot)
+    }
+
+    fn get_mut(&mut self, id: u64) -> Option<&mut T> {
+        let page = (id as usize) / PAGE_SLOTS;
+        let slot = (id as usize) % PAGE_SLOTS;
+        self.pages.get_mut(page)?.as_mut()?.get_mut(slot)
+    }
+
+    /// Remove a slot (mark dead); frees the page when fully dead.
+    fn remove(&mut self, id: u64) {
+        let page_idx = (id as usize) / PAGE_SLOTS;
+        let slot = (id as usize) % PAGE_SLOTS;
+        let Some(page) = self.pages.get_mut(page_idx).and_then(|p| p.as_mut()) else {
+            return;
+        };
+        if page.remove(slot) {
+            self.pages[page_idx] = None;
+        }
+    }
+
+    /// Reset to a single fresh page.
+    fn clear(&mut self) {
+        self.pages = vec![Some(Page::new())];
+    }
+
+    /// Live (non-freed) entries, ascending id order.
+    fn iter_all(&self) -> impl Iterator<Item = (u64, &T)> + '_ {
+        self.pages.iter().enumerate().flat_map(|(pi, page)| {
+            page.as_ref().into_iter().flat_map(move |p| {
+                p.slots[..p.count]
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(slot, v)| {
+                        v.as_ref()
+                            .map(move |v| ((pi * PAGE_SLOTS + slot) as u64, v))
+                    })
+            })
+        })
+    }
+
+    /// Live (non-freed) entries, descending id order.
+    fn iter_all_rev(&self) -> impl Iterator<Item = (u64, &T)> + '_ {
+        self.pages.iter().enumerate().rev().flat_map(|(pi, page)| {
+            page.as_ref().into_iter().flat_map(move |p| {
+                p.slots[..p.count]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter_map(move |(slot, v)| {
+                        v.as_ref()
+                            .map(move |v| ((pi * PAGE_SLOTS + slot) as u64, v))
+                    })
+            })
+        })
+    }
+
+    /// Number of currently allocated pages (test/diagnostic).
+    fn allocated_pages(&self) -> usize {
+        self.pages.iter().filter(|p| p.is_some()).count()
+    }
+}
+
 /// The undo tree structure.
 ///
 /// Stores the complete history of edits with branching support.
@@ -288,9 +718,9 @@ pub struct UndoTree {
     generation: u64,
     /// A continuous run can only coalesce edits from its own editor view.
     context_origin: Option<u128>,
-    /// All nodes in the tree. Evicted nodes remain in place (structural
-    /// tombstone) so `id == index` holds and surviving chains traverse.
-    nodes: Vec<UndoNode>,
+    /// All nodes in the tree, paged. Evicted nodes are dropped from their
+    /// slot (tombstone); `id == global index` holds via arithmetic.
+    nodes: PageArena<UndoNode>,
     /// Preferred redo continuation; edits always start at `position_id`.
     preferred_tip: u64,
     /// The node we're currently at in the tree (for undo/redo).
@@ -301,9 +731,10 @@ pub struct UndoTree {
     next_id: u64,
     /// Retained-history budget (byte and node ceilings, FEUX-0002 X01).
     budget: Budget,
-    /// Total accounted retained bytes (recomputed on every structural
-    /// change by walking retained nodes, E-12).
+    /// Total accounted retained bytes (delta-maintained, E-12).
     accounted_bytes: u64,
+    /// Number of surviving (retained) nodes.
+    survivor_count: usize,
     /// Issued reservations: byte leases for prospective nodes and restore
     /// target protections. Both expire after the lease window.
     reservations: Vec<Reservation>,
@@ -318,25 +749,29 @@ impl UndoTree {
     /// Create a new undo tree with a root node.
     #[must_use]
     pub fn new(snapshot: TextSnapshot) -> Self {
-        let root = UndoNode::root(Revision::INITIAL, snapshot);
+        let root = UndoNode::root(Revision::INITIAL, VersionState::from_snapshot(&snapshot));
         let mut tree = Self {
             generation: 1,
             context_origin: None,
-            nodes: vec![root],
+            nodes: PageArena::new(),
             preferred_tip: 0,
             position_id: 0,
             coalesce_window: DEFAULT_COALESCE_WINDOW,
             next_id: 1,
             budget: Budget::default(),
             accounted_bytes: 0,
+            survivor_count: 0,
             reservations: Vec::new(),
             lease_nonce: 0,
             evicted_total: 0,
             retained_watermark: 0,
         };
+        tree.nodes.push(root);
+        tree.survivor_count = 1;
         tree.reaccount();
         tree
     }
+
     /// Create a new undo tree with a custom coalesce window.
     #[must_use]
     pub fn with_coalesce_window(snapshot: TextSnapshot, window: Duration) -> Self {
@@ -344,6 +779,7 @@ impl UndoTree {
         tree.coalesce_window = window;
         tree
     }
+
     /// Create a new undo tree with a custom history budget.
     #[must_use]
     pub fn with_budget(snapshot: TextSnapshot, budget: Budget) -> Self {
@@ -351,37 +787,48 @@ impl UndoTree {
         tree.budget = budget;
         tree
     }
+
     /// Get the preferred redo tip.
     #[must_use]
     pub fn current(&self) -> Option<&UndoNode> {
-        self.nodes.get(self.preferred_tip as usize)
+        self.get(self.preferred_tip)
     }
+
     /// Get the preferred redo tip mutably.
     #[must_use]
     pub fn current_mut(&mut self) -> Option<&mut UndoNode> {
-        self.nodes.get_mut(self.preferred_tip as usize)
+        self.get_mut(self.preferred_tip)
     }
+
     /// Get a node by ID.
     #[must_use]
     pub fn get(&self, id: u64) -> Option<&UndoNode> {
-        self.nodes.get(usize::try_from(id).ok()?)
+        self.nodes.get(id)
     }
+
+    fn get_mut(&mut self, id: u64) -> Option<&mut UndoNode> {
+        self.nodes.get_mut(id)
+    }
+
     /// Get the position node.
     #[must_use]
     pub fn position(&self) -> Option<&UndoNode> {
-        self.nodes.get(self.position_id as usize)
+        self.get(self.position_id)
     }
+
     /// Edit represented by the next undo transition.
     #[must_use]
     pub fn undo_edit(&self) -> Option<EditOp> {
         self.position()?.edit.clone()
     }
+
     /// Edit represented by the next redo transition.
     #[must_use]
     pub fn redo_edit(&self) -> Option<EditOp> {
         let target_id = self.redo_target()?;
         self.get(target_id)?.edit.clone()
     }
+
     fn redo_target(&self) -> Option<u64> {
         let mut child = self.preferred_tip;
         while let Some(node) = self.get(child) {
@@ -510,20 +957,27 @@ impl UndoTree {
         (spans, step_ends, false)
     }
 
-    /// Apply an edit and advance the tree.
-    ///
-    /// If the edit can be coalesced with the current node's edit, it is merged.
-    /// Otherwise, a new node is created.
-    ///
-    /// Returns the new revision.
+    /// Apply an edit and advance the tree (eager snapshot representation —
+    /// legacy facade, recovery, and tests; not the keystroke path).
     pub fn apply(&mut self, edit: EditOp, snapshot: TextSnapshot) -> Revision {
         if self.context_origin.is_some() || self.position().is_some_and(|n| n.editor.is_some()) {
             self.seal_current();
         }
-        self.apply_with_coalescing(edit, snapshot, true, false)
+        let state = VersionState::from_snapshot(&snapshot);
+        self.apply_with_coalescing(edit, Arc::new(state), true, false)
     }
 
-    /// One explicit typing run, independent of the ordinary idle timer.
+    /// Apply an edit on the interactive typing path with a version root
+    /// (RFC-0011 D-02): the model passes the post-edit state.
+    pub(crate) fn apply_version(&mut self, edit: EditOp, state: Arc<VersionState>) -> Revision {
+        if self.context_origin.is_some() || self.position().is_some_and(|n| n.editor.is_some()) {
+            self.seal_current();
+        }
+        self.apply_with_coalescing(edit, state, true, false)
+    }
+
+    /// One explicit typing run, independent of the ordinary idle timer
+    /// (eager snapshot representation; tests/legacy).
     pub fn apply_context(
         &mut self,
         edit: EditOp,
@@ -535,20 +989,21 @@ impl UndoTree {
         if self.position().is_some_and(|node| node.editor.is_some()) {
             self.seal_current();
         }
-        self.apply_context_inner(edit, snapshot, origin)
+        let state = VersionState::from_snapshot(&snapshot);
+        self.apply_context_inner(edit, Arc::new(state), origin)
     }
 
     fn apply_context_inner(
         &mut self,
         edit: EditOp,
-        snapshot: TextSnapshot,
+        state: Arc<VersionState>,
         origin: u128,
     ) -> Revision {
         if self.context_origin != Some(origin) {
             self.seal_current();
         }
         self.context_origin = Some(origin);
-        self.apply_with_coalescing(edit, snapshot, true, true)
+        self.apply_with_coalescing(edit, state, true, true)
     }
 
     /// Apply a distinct operation that must start a new undo-tree node.
@@ -557,13 +1012,25 @@ impl UndoTree {
     pub fn apply_boundary(&mut self, mut edit: EditOp, snapshot: TextSnapshot) -> Revision {
         edit.boundary = true;
         self.context_origin = None;
-        self.apply_with_coalescing(edit, snapshot, false, false)
+        let state = VersionState::from_snapshot(&snapshot);
+        self.apply_with_coalescing(edit, Arc::new(state), false, false)
+    }
+
+    /// Version-root boundary install (RFC-0011 D-02): O(1), no snapshot.
+    pub(crate) fn apply_boundary_version(
+        &mut self,
+        mut edit: EditOp,
+        state: Arc<VersionState>,
+    ) -> Revision {
+        edit.boundary = true;
+        self.context_origin = None;
+        self.apply_with_coalescing(edit, state, false, false)
     }
 
     fn apply_with_coalescing(
         &mut self,
         edit: EditOp,
-        snapshot: TextSnapshot,
+        state: Arc<VersionState>,
         allow_coalescing: bool,
         continuous: bool,
     ) -> Revision {
@@ -574,7 +1041,7 @@ impl UndoTree {
         // First, check if we should coalesce
         let should_coalesce = allow_coalescing
             && !branched
-            && if let Some(current) = self.nodes.get(position_id as usize) {
+            && if let Some(current) = self.get(position_id) {
                 if let Some(current_edit) = &current.edit {
                     !current_edit.boundary
                         && !edit.boundary
@@ -587,46 +1054,33 @@ impl UndoTree {
             } else {
                 false
             };
+        // RFC-0008 S1 (FR-10): the undo-coalescing decision/merge phase. The
+        // `coalesced` field records which branch ran (merge vs new-node).
+        let _undo_coalesce =
+            tracing::info_span!("edit.undo_coalesce", coalesced = should_coalesce,).entered();
         if should_coalesce {
-            let parent_text = self
-                .get(position_id)
-                .and_then(|node| node.parent_id)
-                .and_then(|id| self.get(id))
-                .and_then(|node| node.snapshot.as_ref())
-                .map(TextSnapshot::text);
-            if let Some(before) = parent_text {
-                let after = snapshot.text();
-                let mut prefix = before
-                    .bytes()
-                    .zip(after.bytes())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                while prefix > 0
-                    && (!before.is_char_boundary(prefix) || !after.is_char_boundary(prefix))
-                {
-                    prefix -= 1;
+            // RFC-0008 S4 (D4): merge by coordinate mapping — no snapshot diff.
+            // The pure table handles adjacent/contained compositions; a
+            // gap-spanning continuous merge borrows only the gap slice from
+            // the parent root (O(gap), never an O(document) scan).
+            let coalesced = {
+                let current = self.get(position_id).expect("position node").edit.clone();
+                let Some(current) = current else {
+                    return self.get(position_id).expect("position node").revision;
+                };
+                if let Some(op) = merge_mapped(&current, &edit) {
+                    Some(op)
+                } else {
+                    self.merge_with_parent_gap(position_id, &current, &edit)
                 }
-                let mut suffix = before.as_bytes()[prefix..]
-                    .iter()
-                    .rev()
-                    .zip(after.as_bytes()[prefix..].iter().rev())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                while suffix > 0
-                    && (!before.is_char_boundary(before.len() - suffix)
-                        || !after.is_char_boundary(after.len() - suffix))
+            };
+            if let Some(coalesced) = coalesced {
+                let old_accounted = {
+                    let node = self.get(position_id).expect("position node");
+                    node_accounted_bytes(node)
+                };
                 {
-                    suffix -= 1;
-                }
-                let coalesced = EditOp::new(
-                    Span::new(TextByte(prefix), TextByte(before.len() - suffix)),
-                    after[prefix..after.len() - suffix].into(),
-                );
-                {
-                    let node = self
-                        .nodes
-                        .get_mut(position_id as usize)
-                        .expect("position node exists");
+                    let node = self.get_mut(position_id).expect("position node exists");
                     node.changed_at_unix_ms = wall_clock_ms();
                     node.version += 1;
                     if !node.movement_truncated {
@@ -640,42 +1094,81 @@ impl UndoTree {
                         }
                     }
                     node.edit = Some(coalesced);
-                    node.snapshot = Some(snapshot);
+                    node.snapshot = Some(state);
                     node.timestamp = Instant::now();
                 }
-                self.reaccount();
+                let new_accounted = {
+                    let node = self.get(position_id).expect("position node");
+                    node_accounted_bytes(node)
+                };
+                self.accounted_bytes = self.accounted_bytes - old_accounted + new_accounted;
                 self.auto_evict_if_over_budget(wall_clock_ms());
-                return self.nodes[position_id as usize].revision;
+                return self.get(position_id).expect("position node").revision;
             }
         }
-        let current_node = self
-            .nodes
-            .get(position_id as usize)
-            .expect("current node must exist");
+        let current_node = self.get(position_id).expect("current node must exist");
         let parent_id = current_node.id;
+        let new_revision = current_node.revision.next();
+        let segment = current_node.segment;
         let new_id = self.next_id;
         self.next_id += 1;
-        let new_revision = current_node.revision.next();
-        let mut new_node = UndoNode::new(new_id, new_revision, edit, parent_id, snapshot);
+        let mut new_node = UndoNode::new(new_id, new_revision, edit, parent_id, (*state).clone());
         if new_node.segment.is_none() {
-            new_node.segment = current_node.segment;
+            new_node.segment = segment;
         }
         // Add to parent's children
-        if let Some(node) = self.nodes.get_mut(parent_id as usize) {
+        if let Some(node) = self.get_mut(parent_id) {
             node.children.push(new_id);
         }
         // Add the new node
         self.nodes.push(new_node);
         self.preferred_tip = new_id;
         self.position_id = new_id;
-        self.reaccount();
+        self.survivor_count += 1;
+        let accounted = node_accounted_bytes(self.get(new_id).expect("fresh node"));
+        self.accounted_bytes += accounted;
         self.auto_evict_if_over_budget(wall_clock_ms());
         new_revision
     }
+
+    /// Merge `edit` into the coalescing node using the parent root's gap
+    /// slice (O(gap)); `None` when the parent is unavailable/evicted or the
+    /// composition needs bytes outside the window.
+    fn merge_with_parent_gap(
+        &self,
+        position_id: u64,
+        current: &EditOp,
+        edit: &EditOp,
+    ) -> Option<EditOp> {
+        let parent_id = self.get(position_id)?.parent_id?;
+        let parent_state = self.get(parent_id)?.snapshot.as_ref()?;
+        // The merged window bounds (same geometry as merge_mapped_with_source).
+        let s = current.range.start.0;
+        let e = current.range.end.0;
+        let p = current.replacement.len();
+        let d = p as isize - (e - s) as isize;
+        let a_pre = map_post_to_pre(edit.range.start.0, s, e, p, d);
+        let b_pre = map_post_to_pre(edit.range.end.0, s, e, p, d);
+        let start = (s as isize).min(a_pre).max(0) as usize;
+        let end = (e as isize).max(b_pre).max(0) as usize;
+        if end > parent_state.len() {
+            return None;
+        }
+        let window = parent_state.root.slice(start..end);
+        merge_mapped_with_source(
+            current,
+            edit,
+            Some(SourceSlice::Window {
+                base: start,
+                text: &window,
+            }),
+        )
+    }
+
     /// Preserve a save/semantic boundary without adding a document edit.
     pub fn seal_current(&mut self) {
         self.context_origin = None;
-        if let Some(node) = self.nodes.get_mut(self.position_id as usize)
+        if let Some(node) = self.get_mut(self.position_id)
             && let Some(edit) = &mut node.edit
         {
             edit.boundary = true;
@@ -686,36 +1179,38 @@ impl UndoTree {
     ///
     /// Moves the position back to the nearest surviving parent node
     /// (evicted chain links are skipped). Returns the parent's revision and
-    /// snapshot. The caller (model) is responsible for advancing the
+    /// version state. The caller (model) is responsible for advancing the
     /// revision (§4.5.2).
-    pub fn undo(&mut self) -> Option<(Revision, Option<TextSnapshot>)> {
+    pub fn undo(&mut self) -> Option<(Revision, Option<Arc<VersionState>>)> {
         self.seal_current();
         let current = self.position()?;
         current.parent_id?;
         let parent_id = self.nearest_surviving_ancestor(current.id)?;
-        let (parent_revision, snapshot) = {
-            let parent = self.survivor(parent_id)?;
-            (parent.revision, parent.snapshot.clone()?)
-        };
+        let state = self.get(parent_id)?.snapshot.clone();
+        let parent_revision = self.survivor(parent_id)?.revision;
         self.position_id = parent_id;
         self.generation += 1;
-        Some((parent_revision, Some(snapshot)))
+        Some((parent_revision, state))
     }
+
     /// Redo the last undone edit.
     ///
     /// Moves the position forward to the current node if we've undone.
     /// For branching, moves to the appropriate child.
     ///
-    /// Returns the target's revision and snapshot.
+    /// Returns the target's revision and version state.
     /// The caller (model) is responsible for advancing the revision (§4.5.2).
-    pub fn redo(&mut self) -> Option<(Revision, Option<TextSnapshot>)> {
+    pub fn redo(&mut self) -> Option<(Revision, Option<Arc<VersionState>>)> {
         self.seal_current();
-        let child = self.get(self.redo_target()?)?;
-        let result = (child.revision, Some(child.snapshot.clone()?));
-        self.position_id = child.id;
+        let child_id = self.redo_target()?;
+        let child = self.get(child_id)?;
+        let revision = child.revision;
+        let state = child.snapshot.clone();
+        self.position_id = child_id;
         self.generation += 1;
-        Some(result)
+        Some((revision, state))
     }
+
     /// Move to a specific node.
     fn goto(&mut self, id: u64) -> bool {
         if self.survivor(id).is_some() {
@@ -750,10 +1245,10 @@ impl UndoTree {
     /// `spans` is the original batch geometry (E-13); it rides only a fresh
     /// node — a coalesced install recomputed its edit from the before/after
     /// diff, which is already exact.
-    pub fn apply_recorded(
+    pub(crate) fn apply_recorded_version(
         &mut self,
         edit: EditOp,
-        snapshot: TextSnapshot,
+        state: Arc<VersionState>,
         policy: UndoPolicy,
         record: EditorEdit,
         spans: &[SpanEdit],
@@ -766,17 +1261,17 @@ impl UndoTree {
             self.seal_current();
         }
         let revision = match policy {
-            UndoPolicy::Isolated => self.apply_boundary(edit, snapshot),
-            UndoPolicy::Context { origin } => self.apply_context_inner(edit, snapshot, origin),
+            UndoPolicy::Isolated => self.apply_boundary_version(edit, state),
+            UndoPolicy::Context { origin } => self.apply_context_inner(edit, state, origin),
             UndoPolicy::Typing => {
                 if self.context_origin.is_some() {
                     self.seal_current();
                 }
-                self.apply_with_coalescing(edit, snapshot, true, false)
+                self.apply_with_coalescing(edit, state, true, false)
             }
         };
         self.install_batch_geometry(spans);
-        let node = &mut self.nodes[self.position_id as usize];
+        let node = self.get_mut(self.position_id).expect("position node");
         if let Some(previous) = &mut node.editor {
             previous.after = record.after;
             previous.primary = record.primary;
@@ -784,35 +1279,34 @@ impl UndoTree {
             node.kind = record.kind;
             node.editor = Some(record);
         }
-        self.reaccount();
         self.auto_evict_if_over_budget(wall_clock_ms());
         revision
     }
 
     /// Install one prepared batch under `policy`, retaining the original
     /// per-op geometry for each step, including coalesced steps (E-13).
-    pub fn apply_batch(
+    pub(crate) fn apply_batch_version(
         &mut self,
         edit: EditOp,
-        snapshot: TextSnapshot,
+        state: Arc<VersionState>,
         policy: UndoPolicy,
         spans: &[SpanEdit],
     ) -> Revision {
         let revision = match policy {
-            UndoPolicy::Isolated => self.apply_boundary(edit, snapshot),
+            UndoPolicy::Isolated => self.apply_boundary_version(edit, state),
             UndoPolicy::Context { origin } => {
                 // Unannotated batches cannot extend a recorded editor
                 // operation (same guard as `apply_context`).
                 if self.position().is_some_and(|node| node.editor.is_some()) {
                     self.seal_current();
                 }
-                self.apply_context_inner(edit, snapshot, origin)
+                self.apply_context_inner(edit, state, origin)
             }
             UndoPolicy::Typing => {
                 if self.context_origin.is_some() {
                     self.seal_current();
                 }
-                self.apply_with_coalescing(edit, snapshot, true, false)
+                self.apply_with_coalescing(edit, state, true, false)
             }
         };
         self.install_batch_geometry(spans);
@@ -822,7 +1316,11 @@ impl UndoTree {
     /// Replace the just-installed step's contiguous text diff with its exact
     /// disjoint geometry. Earlier coalesced steps retain their own frames.
     fn install_batch_geometry(&mut self, spans: &[SpanEdit]) {
-        if let Some(node) = self.nodes.get_mut(self.position_id as usize) {
+        let old_accounted = {
+            let node = self.get(self.position_id).expect("position node");
+            node_accounted_bytes(node)
+        };
+        if let Some(node) = self.get_mut(self.position_id) {
             if node.movement_truncated {
                 return;
             }
@@ -836,7 +1334,11 @@ impl UndoTree {
                 node.movement_truncated = true;
             }
         }
-        self.reaccount();
+        let new_accounted = {
+            let node = self.get(self.position_id).expect("position node");
+            node_accounted_bytes(node)
+        };
+        self.accounted_bytes = self.accounted_bytes - old_accounted + new_accounted;
     }
 
     fn segment(&self, id: u64) -> Option<u64> {
@@ -898,11 +1400,10 @@ impl UndoTree {
         }
         let mut entries: Vec<_> = self
             .nodes
-            .iter()
-            .rev()
-            .filter(|n| n.id < before && !n.evicted)
+            .iter_all_rev()
+            .filter(|(id, n)| *id < before && !n.evicted)
             .take(limit + 1)
-            .filter_map(|n| self.entry(n.id, epoch, ancestors.contains(&n.id)))
+            .filter_map(|(id, _)| self.entry(id, epoch, ancestors.contains(&id)))
             .collect();
         let next = (entries.len() > limit).then(|| HistoryCursor {
             epoch,
@@ -944,7 +1445,10 @@ impl UndoTree {
 
     /// Prepare before changing the head. Tagged filesystem obligations may
     /// only be crossed by the Session's existing single-step Undo/Redo path.
-    pub fn restore_snapshot(&self, target: HistoryTarget) -> Result<TextSnapshot, HistoryError> {
+    pub fn restore_snapshot(
+        &self,
+        target: HistoryTarget,
+    ) -> Result<Arc<VersionState>, HistoryError> {
         let node = self.survivor(target.node).ok_or(HistoryError::Expired)?;
         if node.version != target.version {
             return Err(HistoryError::Expired);
@@ -982,6 +1486,7 @@ impl UndoTree {
     pub fn position_id(&self) -> u64 {
         self.position_id
     }
+
     /// Get the preferred redo tip's revision, not the live buffer revision.
     #[must_use]
     pub fn current_revision(&self) -> Revision {
@@ -989,6 +1494,7 @@ impl UndoTree {
             .map(|n| n.revision)
             .unwrap_or(Revision::INITIAL)
     }
+
     /// Get the current position's revision.
     #[must_use]
     pub fn position_revision(&self) -> Revision {
@@ -996,13 +1502,14 @@ impl UndoTree {
             .map(|n| n.revision)
             .unwrap_or(Revision::INITIAL)
     }
+
     /// Get the path from the root to the preferred redo tip (evicted chain
     /// links are skipped).
     #[must_use]
     pub fn history(&self) -> Vec<&UndoNode> {
         let mut path = Vec::new();
         let mut preferred_tip = self.preferred_tip;
-        while let Some(node) = self.nodes.get(preferred_tip as usize) {
+        while let Some(node) = self.get(preferred_tip) {
             if node.evicted {
                 preferred_tip = match node.parent_id {
                     Some(id) => id,
@@ -1018,31 +1525,39 @@ impl UndoTree {
         }
         path.into_iter().rev().collect()
     }
+
     /// Set the coalesce window.
     pub fn set_coalesce_window(&mut self, window: Duration) {
         self.coalesce_window = window;
     }
+
     /// Get the coalesce window.
     #[must_use]
     pub fn coalesce_window(&self) -> Duration {
         self.coalesce_window
     }
+
     /// Clear all history except the root.
     pub fn clear(&mut self) {
         self.context_origin = None;
-        if !self.nodes.is_empty() {
-            let root = self.nodes[0].clone();
-            self.nodes = vec![root];
-            self.preferred_tip = 0;
-            self.position_id = 0;
-            self.next_id = 1;
-            self.reservations.clear();
-            self.lease_nonce = 0;
-            self.evicted_total = 0;
-            self.retained_watermark = 0;
-            self.reaccount();
+        let root = self.get(0).cloned();
+        self.nodes.clear();
+        self.survivor_count = 0;
+        self.accounted_bytes = 0;
+        if let Some(root) = root {
+            self.nodes.push(root);
+            self.survivor_count = 1;
         }
+        self.preferred_tip = 0;
+        self.position_id = 0;
+        self.next_id = 1;
+        self.reservations.clear();
+        self.lease_nonce = 0;
+        self.evicted_total = 0;
+        self.retained_watermark = 0;
+        self.reaccount();
     }
+
     /// Get the depth from the root to the preferred redo tip (evicted
     /// chain links do not count).
     #[must_use]
@@ -1082,57 +1597,70 @@ impl UndoTree {
     pub fn budget(&self) -> Budget {
         self.budget
     }
+
     /// Replace the history budget and re-account immediately.
     pub fn set_budget(&mut self, budget: Budget) {
         self.budget = budget;
         self.reaccount();
     }
+
     /// Total accounted retained history bytes.
     #[must_use]
     pub fn accounted_bytes(&self) -> u64 {
         self.accounted_bytes
     }
+
     /// Current accounted usage.
     #[must_use]
     pub fn account(&self) -> crate::budget::HistoryAccount {
         crate::budget::HistoryAccount {
             bytes: self.accounted_bytes,
-            nodes: self.survivor_count() as u64,
+            nodes: self.survivor_count as u64,
         }
     }
+
     /// Total nodes evicted since the tree started (or was last cleared).
     #[must_use]
     pub fn evicted_total(&self) -> u64 {
         self.evicted_total
     }
+
+    /// Number of currently allocated arena pages (diagnostic; FR-14 page
+    /// reclamation observability).
+    #[must_use]
+    pub fn history_allocated_pages(&self) -> usize {
+        self.nodes.allocated_pages()
+    }
+
     /// Smallest surviving node id; every smaller id was evicted.
     #[must_use]
     pub fn retained_watermark(&self) -> u64 {
         self.retained_watermark
     }
+
     /// The surviving node with this id, if any.
     #[must_use]
     fn survivor(&self, id: u64) -> Option<&UndoNode> {
         self.get(id).filter(|node| !node.evicted)
     }
-    fn survivor_count(&self) -> usize {
-        self.nodes.iter().filter(|node| !node.evicted).count()
-    }
+
     /// Number of surviving (retained) nodes.
     #[must_use]
     pub fn retained_node_count(&self) -> usize {
-        self.survivor_count()
+        self.survivor_count
     }
+
     /// Ids of all surviving (retained) nodes, ascending. Test/diagnostic
     /// surface for the accounting mirror.
     #[must_use]
     pub fn survivor_ids(&self) -> Vec<u64> {
         self.nodes
-            .iter()
-            .filter(|node| !node.evicted)
-            .map(|node| node.id)
+            .iter_all()
+            .filter(|(_, node)| !node.evicted)
+            .map(|(id, _)| id)
             .collect()
     }
+
     /// The nearest surviving ancestor of `from` (skips evicted links).
     fn nearest_surviving_ancestor(&self, from: u64) -> Option<u64> {
         let mut id = from;
@@ -1146,18 +1674,23 @@ impl UndoTree {
     }
 
     /// Walk retained nodes and recount bytes (unique retained text
-    /// allocations + recorded selection sets + fixed metadata).
+    /// allocations + recorded selection sets + fixed metadata). Legacy full
+    /// recompute for budget replacement and tests; the production path is
+    /// delta accounting.
     fn reaccount(&mut self) {
         let mut bytes = 0u64;
         let mut watermark = u64::MAX;
-        for node in &self.nodes {
+        let mut survivors = 0usize;
+        for (id, node) in self.nodes.iter_all() {
             if node.evicted {
                 continue;
             }
-            watermark = watermark.min(node.id);
+            watermark = watermark.min(id);
             bytes += node_accounted_bytes(node);
+            survivors += 1;
         }
         self.accounted_bytes = bytes;
+        self.survivor_count = survivors;
         self.retained_watermark = if watermark == u64::MAX {
             self.next_id
         } else {
@@ -1171,7 +1704,7 @@ impl UndoTree {
     fn auto_evict_if_over_budget(&mut self, now_ms: u64) {
         let pending: u64 = self.reservations.iter().map(|r| r.projected).sum();
         let over = self.accounted_bytes + pending > self.budget.max_bytes
-            || self.survivor_count() as u64 > self.budget.max_nodes;
+            || self.survivor_count as u64 > self.budget.max_nodes;
         if over {
             self.evict_to_fit(0, now_ms);
         }
@@ -1188,7 +1721,7 @@ impl UndoTree {
         let fits = |tree: &Self| {
             let pending: u64 = tree.reservations.iter().map(|r| r.projected).sum();
             tree.accounted_bytes + pending + projected <= tree.budget.max_bytes
-                && (tree.survivor_count() as u64) < tree.budget.max_nodes
+                && (tree.survivor_count as u64) < tree.budget.max_nodes
         };
         if !fits(self) && !self.reservation_feasible(projected, now_ms) {
             return Err(LimitExceeded {
@@ -1225,33 +1758,28 @@ impl UndoTree {
         let pending: u64 = self.reservations.iter().map(|r| r.projected).sum();
         let mut floor_bytes = 0u64;
         let mut floor_nodes = 0u64;
-        for node in &self.nodes {
+        for (id, node) in self.nodes.iter_all() {
             if node.evicted {
                 continue;
             }
-            let protected = node.id == self.position_id
+            let protected = id == self.position_id
                 || self
                     .reservations
                     .iter()
-                    .any(|r| r.lease_until_ms > now_ms && r.target == Some(node.id));
+                    .any(|r| r.lease_until_ms > now_ms && r.target == Some(id));
             if protected {
                 floor_nodes += 1;
                 floor_bytes += node_accounted_bytes(node);
             }
         }
         let freeable_bytes = self.accounted_bytes.saturating_sub(floor_bytes);
-        let removable_nodes = u64::try_from(self.survivor_count())
-            .unwrap_or(u64::MAX)
-            .saturating_sub(floor_nodes);
+        let removable_nodes = (self.survivor_count as u64).saturating_sub(floor_nodes);
         self.accounted_bytes
             .saturating_sub(freeable_bytes)
             .saturating_add(pending)
             .saturating_add(projected)
             <= self.budget.max_bytes
-            && u64::try_from(self.survivor_count())
-                .unwrap_or(u64::MAX)
-                .saturating_sub(removable_nodes)
-                < self.budget.max_nodes
+            && (self.survivor_count as u64).saturating_sub(removable_nodes) < self.budget.max_nodes
     }
 
     /// Release a byte reservation after its install completed.
@@ -1295,7 +1823,7 @@ impl UndoTree {
         loop {
             let pending: u64 = self.reservations.iter().map(|r| r.projected).sum();
             let fits = self.accounted_bytes + pending + projected <= self.budget.max_bytes
-                && (self.survivor_count() as u64) < self.budget.max_nodes;
+                && (self.survivor_count as u64) < self.budget.max_nodes;
             if fits {
                 break;
             }
@@ -1307,7 +1835,6 @@ impl UndoTree {
             self.evicted_total += 1;
             self.generation += 1;
             report.evicted.push(id);
-            self.reaccount();
             report.freed_bytes += before.saturating_sub(self.accounted_bytes);
         }
         report
@@ -1329,74 +1856,77 @@ impl UndoTree {
             on_path.insert(node.id);
             id = node.parent_id;
         }
-        let eligible = |node: &UndoNode| {
-            !node.evicted && !on_path.contains(&node.id) && !protected.contains(&node.id)
+        let eligible = |id: u64, node: &UndoNode| {
+            !node.evicted && !on_path.contains(&id) && !protected.contains(&id)
         };
-        // Pass 1: off-path tips (leaves), oldest first.
-        if let Some(id) = self
+        let all: Vec<(u64, &UndoNode)> = self
             .nodes
+            .iter_all()
+            .filter(|(id, node)| eligible(*id, node))
+            .collect();
+        // Pass 1: off-path tips (leaves), oldest first.
+        if let Some(&(id, _)) = all
             .iter()
-            .filter(|n| eligible(n))
-            .filter(|n| n.is_leaf())
-            .map(|n| n.id)
-            .min()
+            .filter(|(_, n)| n.is_leaf())
+            .min_by_key(|(id, _)| *id)
         {
             return Some(id);
         }
         // Pass 2: off-path subtree roots (parent on path or none), oldest
         // first. Removing the whole subtree never orphans survivors.
-        if let Some(id) = self
-            .nodes
+        if let Some(&(id, _)) = all
             .iter()
-            .filter(|n| eligible(n))
-            .filter(|n| match n.parent_id {
+            .filter(|(_, n)| match n.parent_id {
                 None => true,
                 Some(parent) => on_path.contains(&parent),
             })
-            .map(|n| n.id)
-            .min()
+            .min_by_key(|(id, _)| *id)
         {
             return Some(id);
         }
         // Pass 3: oldest checkpointable prefix of the current path — never
         // the current node, never protected.
         self.nodes
-            .iter()
-            .filter(|n| !n.evicted && !protected.contains(&n.id))
-            .filter(|n| on_path.contains(&n.id) && n.id < self.position_id)
-            .map(|n| n.id)
+            .iter_all()
+            .filter(|(id, n)| !n.evicted && !protected.contains(id))
+            .filter(|(id, _)| on_path.contains(id) && *id < self.position_id)
+            .map(|(id, _)| id)
             .min()
     }
 
     /// Evict one node: detach from its parent, re-parent surviving children
     /// onto its parent (keeping surviving chains connected), and drop its
-    /// heavy state. The tombstone stays in place so id-index stability and
-    /// structural traversal survive.
+    /// heavy state. The slot becomes a tombstone (freed with its page when
+    /// the page is fully dead) so id-index stability survives.
     fn remove_node(&mut self, id: u64) {
         let Some(node) = self.get(id) else {
             return;
         };
         let parent_id = node.parent_id;
         if let Some(parent) = parent_id
-            && let Some(node) = self.nodes.get_mut(parent as usize)
+            && let Some(node) = self.get_mut(parent)
         {
             node.children.retain(|&child| child != id);
         }
-        let children = self.nodes[id as usize].children.clone();
+        let children = self.get(id).map(|n| n.children.clone()).unwrap_or_default();
         for child in children {
-            if let Some(child_node) = self.nodes.get_mut(child as usize) {
+            if let Some(child_node) = self.get_mut(child) {
+                let old_accounted = node_accounted_bytes(child_node);
                 child_node.parent_id = parent_id;
                 child_node.movement_steps = Vec::new();
                 child_node.movement_truncated = true;
+                let new_accounted = node_accounted_bytes(child_node);
+                self.accounted_bytes = self.accounted_bytes - old_accounted + new_accounted;
                 if let Some(parent) = parent_id
-                    && let Some(parent_node) = self.nodes.get_mut(parent as usize)
+                    && let Some(parent_node) = self.get_mut(parent)
                     && !parent_node.children.contains(&child)
                 {
                     parent_node.children.push(child);
                 }
             }
         }
-        if let Some(node) = self.nodes.get_mut(id as usize) {
+        let accounted = node_accounted_bytes(self.get(id).expect("node exists"));
+        if let Some(node) = self.get_mut(id) {
             node.evicted = true;
             node.snapshot = None;
             node.editor = None;
@@ -1404,6 +1934,19 @@ impl UndoTree {
             node.movement_steps = Vec::new();
             node.movement_truncated = true;
             node.children.clear();
+        }
+        self.nodes.remove(id);
+        self.accounted_bytes = self.accounted_bytes.saturating_sub(accounted);
+        self.survivor_count = self.survivor_count.saturating_sub(1);
+        if id == self.retained_watermark {
+            // Advance the watermark to the next survivor (amortized linear).
+            let mut next = u64::MAX;
+            for (nid, node) in self.nodes.iter_all() {
+                if !node.evicted {
+                    next = next.min(nid);
+                }
+            }
+            self.retained_watermark = if next == u64::MAX { self.next_id } else { next };
         }
     }
 }
@@ -1439,12 +1982,18 @@ mod tests {
         tree.seal_current();
         assert_eq!(tree.history().len(), 3, "sealing creates no document edit");
         tree.apply_context(edit(10, "C"), snap("Acafé雪BC"), 2);
-        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "Acafé雪B");
-        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "Acafé雪");
-        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "café");
-        assert_eq!(tree.redo().unwrap().1.unwrap().text(), "Acafé雪");
+        let state = |tree: &UndoTree| {
+            tree.position()
+                .and_then(|n| n.snapshot.clone())
+                .expect("state")
+        };
+        assert_eq!(state(&tree).materialize(), "Acafé雪BC");
+        assert_eq!(tree.undo().unwrap().1.unwrap().materialize(), "Acafé雪B");
+        assert_eq!(tree.undo().unwrap().1.unwrap().materialize(), "Acafé雪");
+        assert_eq!(tree.undo().unwrap().1.unwrap().materialize(), "café");
+        assert_eq!(tree.redo().unwrap().1.unwrap().materialize(), "Acafé雪");
         tree.apply_context(edit(9, "branch"), snap("Acafé雪branch"), 1);
-        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "Acafé雪");
+        assert_eq!(tree.undo().unwrap().1.unwrap().materialize(), "Acafé雪");
     }
 
     #[test]
@@ -1460,9 +2009,9 @@ mod tests {
         let id = tree.current().unwrap().id;
         assert!(tree.goto(id));
         tree.apply_context(edit(3, "D"), snap("ABCD"), 1);
-        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "ABC");
-        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "AB");
-        assert_eq!(tree.undo().unwrap().1.unwrap().text(), "A");
+        assert_eq!(tree.undo().unwrap().1.unwrap().materialize(), "ABC");
+        assert_eq!(tree.undo().unwrap().1.unwrap().materialize(), "AB");
+        assert_eq!(tree.undo().unwrap().1.unwrap().materialize(), "A");
     }
 
     proptest::proptest! {
@@ -1483,22 +2032,24 @@ mod tests {
                 origin = Some(view);
                 text = next;
                 proptest::prop_assert_eq!(tree.depth(), states.len() - 1);
-                let current = tree.current().unwrap();
-                let parent = tree.get(current.parent_id.unwrap()).unwrap().snapshot.as_ref().unwrap().text();
-                proptest::prop_assert_eq!(current.edit.as_ref().unwrap().apply(parent), text.clone());
+                let current_edit = tree.current().unwrap().edit.clone().unwrap();
+                let parent_id = tree.current().unwrap().parent_id.unwrap();
+                let parent_text = tree.get(parent_id).unwrap().snapshot.as_ref().unwrap().materialize();
+                proptest::prop_assert_eq!(current_edit.apply(&parent_text), text.clone());
             }
             for expected in states[..states.len()-1].iter().rev() {
                 let snapshot = tree.undo().unwrap().1.unwrap();
-                proptest::prop_assert_eq!(snapshot.text(), expected);
+                proptest::prop_assert_eq!(snapshot.materialize(), expected.as_str());
             }
             proptest::prop_assert!(tree.undo().is_none());
             for expected in &states[1..] {
                 let snapshot = tree.redo().unwrap().1.unwrap();
-                proptest::prop_assert_eq!(snapshot.text(), expected);
+                proptest::prop_assert_eq!(snapshot.materialize(), expected.as_str());
             }
             proptest::prop_assert!(tree.redo().is_none());
         }
     }
+
     #[test]
     fn edit_op_apply() {
         let op = EditOp::new(Span::new(TextByte(6), TextByte(11)), "world".to_string());
@@ -1518,6 +2069,7 @@ mod tests {
         assert!(!tagged.can_coalesce(&adjacent));
         assert!(!adjacent.can_coalesce(&tagged));
     }
+
     #[test]
     fn edit_op_coalesce_adjacent() {
         let op1 = EditOp::new(Span::new(TextByte(5), TextByte(5)), "a".to_string());
@@ -1533,6 +2085,187 @@ mod tests {
         assert!(!right.can_coalesce(&left));
         assert_eq!(left.coalesce(&right), None);
     }
+
+    /// The S4 oracle: the pre-S4 coalesce implementation (parent-snapshot
+    /// byte diff). Kept under `#[cfg(test)]` to prove `merge_mapped` ≡
+    /// recompute-from-snapshots (RFC-0008 D4, AC-3).
+    fn coalesce_by_snapshot_diff(_prev: &EditOp, before: &str, after: &str) -> EditOp {
+        let before_bytes = before.as_bytes();
+        let after_bytes = after.as_bytes();
+        let mut prefix = before_bytes
+            .iter()
+            .zip(after_bytes.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while prefix > 0 && (!before.is_char_boundary(prefix) || !after.is_char_boundary(prefix)) {
+            prefix -= 1;
+        }
+        let mut suffix = before_bytes[prefix..]
+            .iter()
+            .rev()
+            .zip(after_bytes[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while suffix > 0
+            && (!before.is_char_boundary(before.len() - suffix)
+                || !after.is_char_boundary(after.len() - suffix))
+        {
+            suffix -= 1;
+        }
+        EditOp::new(
+            Span::new(TextByte(prefix), TextByte(before.len() - suffix)),
+            after[prefix..after.len() - suffix].into(),
+        )
+    }
+
+    #[test]
+    fn merge_mapped_corner_cases_from_the_table() {
+        // S4-T3: the exact §5.3.2 corner cases.
+        let parent = "abc";
+        // Insert at span start: prev [1,1)->"X", next insert at post 1.
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(1)), "X".into());
+        let next = EditOp::new(Span::new(TextByte(1), TextByte(1)), "Y".into());
+        let merged = merge_mapped(&prev, &next).expect("insert-at-span-start merges");
+        assert_eq!(merged.range, Span::new(TextByte(1), TextByte(1)));
+        assert_eq!(merged.replacement, "YX");
+        assert_eq!(merged.apply(parent), "aYXbc");
+
+        // Insert at span end: next insert at post 2 (just after "X").
+        let next = EditOp::new(Span::new(TextByte(2), TextByte(2)), "Y".into());
+        let merged = merge_mapped(&prev, &next).expect("insert-at-span-end merges");
+        assert_eq!(merged.replacement, "XY");
+        assert_eq!(merged.apply(parent), "aXYbc");
+
+        // Backspace into the typed run: prev inserts "XYZ", delete middle.
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(1)), "XYZ".into());
+        let next = EditOp::new(Span::new(TextByte(2), TextByte(3)), "".into());
+        let merged = merge_mapped(&prev, &next).expect("backspace-into-run merges");
+        assert_eq!(merged.replacement, "XZ");
+        assert_eq!(merged.apply(parent), "aXZbc");
+
+        // Whole-span replacement (crossing both sides): prev [1,3)->"X".
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(3)), "X".into());
+        let next = EditOp::new(Span::new(TextByte(0), TextByte(4)), "Z".into());
+        let merged = merge_mapped_with_source(&prev, &next, Some(SourceSlice::Full("abcde")))
+            .expect("crossing replace merges with source");
+        assert_eq!(merged.range, Span::new(TextByte(0), TextByte(5)));
+        assert_eq!(merged.replacement, "Z");
+        assert_eq!(merged.apply("abcde"), "Z");
+        // The crossing replace consumes the whole span/gap, so it is also
+        // exact without a source.
+        let merged_no_source = merge_mapped(&prev, &next).expect("crossing replace is source-free");
+        assert_eq!(merged_no_source, merged);
+
+        // Continuous distant insert: prev [1,1)->"X", next insert at post 4
+        // (end of "aXbc").
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(1)), "X".into());
+        let next = EditOp::new(Span::new(TextByte(4), TextByte(4)), "Y".into());
+        assert_eq!(merge_mapped(&prev, &next), None, "gap needs source");
+        let merged = merge_mapped_with_source(&prev, &next, Some(SourceSlice::Full(parent)))
+            .expect("distant insert merges with source");
+        assert_eq!(merged.apply(parent), "aXbcY");
+        assert_eq!(merged.replacement, "XbcY");
+        // The windowed source form (RFC-0011 S2) yields the same result.
+        let merged_window = merge_mapped_with_source(
+            &prev,
+            &next,
+            Some(SourceSlice::Window {
+                base: 0,
+                text: parent,
+            }),
+        )
+        .expect("distant insert merges with windowed source");
+        assert_eq!(merged_window, merged);
+    }
+
+    #[test]
+    fn merge_mapped_rejects_boundary_and_journal_ops() {
+        let prev = EditOp::new(Span::new(TextByte(1), TextByte(1)), "X".into());
+        let mut boundary = EditOp::new(Span::new(TextByte(2), TextByte(2)), "Y".into());
+        boundary.boundary = true;
+        assert_eq!(merge_mapped(&prev, &boundary), None);
+        assert_eq!(merge_mapped(&boundary, &prev), None);
+        let mut journal = EditOp::new(Span::new(TextByte(2), TextByte(2)), "Y".into());
+        journal.journal = Some(JournalTag {
+            txn_id: "t".into(),
+            item_id: 1,
+        });
+        assert_eq!(merge_mapped(&prev, &journal), None);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 128, ..proptest::test_runner::Config::default()
+        })]
+
+        /// S4-T1 (AC-3): `merge_mapped` (with the parent source when gap bytes
+        /// are needed) equals the old recompute-from-snapshots oracle on
+        /// randomized edit sequences — byte-for-byte, including replacement
+        /// content — and applying it equals sequential application.
+        #[test]
+        fn merge_mapped_equals_the_snapshot_diff_oracle(
+            base in "[a-zA-Z0-9 .,!?]{0,24}",
+            steps in proptest::collection::vec(
+                (".{0,12}", 0usize..64, 0usize..64, proptest::bool::ANY),
+                1..60,
+            ),
+        ) {
+            let mut parent = base.clone(); // text at the node owning `prev`
+            let mut prev: Option<EditOp> = None;
+            for (repl, x, y, coalesce) in steps {
+                let current = prev
+                    .as_ref()
+                    .map(|op| op.apply(&parent))
+                    .unwrap_or_else(|| parent.clone());
+                let len = current.len();
+                let mut a = x % (len + 1);
+                while !current.is_char_boundary(a) {
+                    a -= 1;
+                }
+                let mut b = (a + y % (len + 1 - a)).min(len);
+                while b < len && !current.is_char_boundary(b) {
+                    b += 1;
+                }
+                let next_op = EditOp::new(Span::new(TextByte(a), TextByte(b)), repl);
+
+                match (prev.take(), coalesce) {
+                    (Some(p), true) => {
+                        let after = next_op.apply(&p.apply(&parent));
+                        let oracle = coalesce_by_snapshot_diff(&p, &parent, &after);
+                        if let Some(merged) = merge_mapped_with_source(
+                            &p,
+                            &next_op,
+                            Some(SourceSlice::Full(&parent)),
+                        ) {
+                            // Application equivalence is the correctness
+                            // contract: the oracle may trim boundary bytes
+                            // identical to the untouched context (and thus
+                            // shift its range), so literal op equality is
+                            // not required — both must yield the exact
+                            // final text.
+                            proptest::prop_assert_eq!(&merged.apply(&parent), &after);
+                            proptest::prop_assert_eq!(&oracle.apply(&parent), &after);
+                            if let Some(no_source) = merge_mapped(&p, &next_op) {
+                                proptest::prop_assert_eq!(&no_source.apply(&parent), &after);
+                            }
+                            prev = Some(merged);
+                        } else {
+                            parent = p.apply(&parent);
+                            prev = Some(next_op);
+                        }
+                    }
+                    (Some(p), false) => {
+                        parent = p.apply(&parent);
+                        prev = Some(next_op);
+                    }
+                    (None, _) => {
+                        prev = Some(next_op);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn undo_tree_basic() {
         let snapshot = TextSnapshot::new(b"hello").unwrap();
@@ -1543,6 +2276,7 @@ mod tests {
         let current_rev = tree.current_revision();
         assert_eq!(current_rev, Revision::new(1));
     }
+
     #[test]
     fn undo_tree_undo_redo() {
         let snapshot = TextSnapshot::new(b"hello").unwrap();
@@ -1582,6 +2316,28 @@ mod tests {
         assert_eq!(tree.history().len(), 1);
         assert_eq!(tree.current_revision(), Revision::INITIAL);
         assert!(UndoTree::default().current().unwrap().is_root());
+    }
+
+    /// The page-arena reclamation contract (FR-14): evicting every node in
+    /// a page frees its backing allocation.
+    #[test]
+    fn page_arena_frees_fully_dead_pages() {
+        let mut arena: PageArena<u64> = PageArena::new();
+        let ids: Vec<u64> = (0..PAGE_SLOTS as u64 + 3).map(|_| arena.push(7)).collect();
+        assert_eq!(arena.allocated_pages(), 2);
+        // Kill the first page entirely (indices 0..512).
+        for &id in &ids[..PAGE_SLOTS] {
+            arena.remove(id);
+        }
+        assert_eq!(arena.allocated_pages(), 1, "fully-dead page freed");
+        assert!(arena.get(ids[0]).is_none());
+        assert_eq!(*arena.get(ids[PAGE_SLOTS]).unwrap(), 7);
+        // Partial kills keep the page allocated (one live page remains).
+        let id = arena.push(9);
+        arena.remove(id);
+        assert_eq!(arena.allocated_pages(), 1);
+        // The surviving entries are still addressable by id.
+        assert_eq!(*arena.get(ids[PAGE_SLOTS + 1]).unwrap(), 7);
     }
 
     mod coalesce_properties {

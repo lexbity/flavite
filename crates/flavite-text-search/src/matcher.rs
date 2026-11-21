@@ -72,6 +72,21 @@ impl MatchOptions {
     }
 }
 
+/// Compute a digest for a list of scope spans (FEUX-0006 §5.4).
+/// Empty spans = whole source, which is the same as no scope.
+#[must_use]
+pub fn scope_spans_digest(spans: &[(usize, usize)]) -> u64 {
+    if spans.is_empty() {
+        return 0;
+    }
+    let mut hash = fnv1a_start();
+    for &(start, end) in spans {
+        hash = fnv1a(hash, &start.to_le_bytes());
+        hash = fnv1a(hash, &end.to_le_bytes());
+    }
+    hash
+}
+
 /// Per-operation match-count bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchLimits {
@@ -383,6 +398,54 @@ impl Matcher {
         self.iter_matches(text, scope)?.collect()
     }
 
+    /// Find all matches fully contained in any of the provided `spans`,
+    /// ascending and non-overlapping. Matches are filtered by full containment
+    /// after matching against the FULL text (so whole-word boundaries and
+    /// multiline anchors use the whole-text semantics). Empty spans means
+    /// the whole source (equivalent to `find`).
+    ///
+    /// # Errors
+    ///
+    /// [`MatchError::LimitExceeded`] and [`MatchError::InvalidScope`] for
+    /// any span endpoint.
+    pub fn find_in_spans(
+        &self,
+        text: &str,
+        spans: &[(usize, usize)],
+    ) -> Result<Vec<Match>, MatchError> {
+        if spans.is_empty() {
+            return self.find(text);
+        }
+        // Validate all spans first
+        for &(start, end) in spans {
+            if end < start
+                || end > text.len()
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+            {
+                return Err(MatchError::InvalidScope {
+                    offset: start.min(end),
+                });
+            }
+        }
+        // Collect all matches from the full text
+        let all_matches = self.find(text)?;
+        // Filter to only those fully contained in any span
+        let mut result = Vec::new();
+        for hit in all_matches {
+            let start = hit.span.start.0;
+            let end = hit.span.end.0;
+            // Check if this match is fully contained in any span
+            let contained = spans
+                .iter()
+                .any(|&(s_start, s_end)| s_start <= start && end <= s_end);
+            if contained {
+                result.push(hit);
+            }
+        }
+        Ok(result)
+    }
+
     /// Streaming match iterator with a monotonic source cursor (§6.2).
     /// The helper and the collect-all [`Matcher::find_in`] consume this one
     /// semantic path: the literal walk, simple-fold case matching, UAX #29
@@ -435,6 +498,42 @@ impl Matcher {
             done: false,
         })
     }
+
+    /// Streaming match iterator with span filtering. Matches are generated
+    /// from the full text and filtered to only those fully contained in any
+    /// of the provided spans. This preserves whole-text semantics for
+    /// word boundaries and anchors.
+    ///
+    /// # Errors
+    ///
+    /// [`MatchError::InvalidScope`] if any span endpoint is out of bounds,
+    /// reversed, or mid-scalar.
+    pub fn iter_matches_spans<'t>(
+        &'t self,
+        text: &'t str,
+        spans: &'t [(usize, usize)],
+    ) -> Result<MatchIterSpans<'t>, MatchError> {
+        if spans.is_empty() {
+            // Empty spans = whole source, use the regular iterator
+            return Ok(MatchIterSpans::All(self.iter_matches(text, None)?));
+        }
+        // Validate all spans
+        for &(start, end) in spans {
+            if end < start
+                || end > text.len()
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+            {
+                return Err(MatchError::InvalidScope {
+                    offset: start.min(end),
+                });
+            }
+        }
+        Ok(MatchIterSpans::Filtered {
+            inner: self.iter_matches(text, None)?,
+            spans,
+        })
+    }
 }
 
 enum InnerIter<'t> {
@@ -466,6 +565,17 @@ pub struct MatchIter<'t> {
     inner: InnerIter<'t>,
     emitted: usize,
     done: bool,
+}
+
+/// Streaming match iterator with span filtering support.
+pub enum MatchIterSpans<'t> {
+    /// All matches from the full text (no filtering).
+    All(MatchIter<'t>),
+    /// Matches filtered to be fully contained in the provided spans.
+    Filtered {
+        inner: MatchIter<'t>,
+        spans: &'t [(usize, usize)],
+    },
 }
 
 impl Iterator for MatchIter<'_> {
@@ -543,6 +653,36 @@ impl Iterator for MatchIter<'_> {
             }
             self.emitted += 1;
             return Some(Ok(hit));
+        }
+    }
+}
+
+impl Iterator for MatchIterSpans<'_> {
+    type Item = Result<Match, MatchError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            MatchIterSpans::All(inner) => inner.next(),
+            MatchIterSpans::Filtered { inner, spans } => {
+                loop {
+                    match inner.next() {
+                        None => return None,
+                        Some(Err(e)) => return Some(Err(e)),
+                        Some(Ok(hit)) => {
+                            let start = hit.span.start.0;
+                            let end = hit.span.end.0;
+                            // Check if this match is fully contained in any span
+                            let contained = spans
+                                .iter()
+                                .any(|&(s_start, s_end)| s_start <= start && end <= s_end);
+                            if contained {
+                                return Some(Ok(hit));
+                            }
+                            // Match not in any span, continue
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -887,5 +1027,99 @@ mod tests {
         let err = Matcher::new(&long, MatchOptions::default(), MatchLimits::default())
             .expect_err("pattern too long");
         assert!(matches!(err, MatchError::PatternTooLong { .. }));
+    }
+
+    #[test]
+    fn find_in_spans_empty_equals_find() {
+        // Empty spans = whole source, same as find()
+        let matcher = literal("ab");
+        let text = "ababab";
+        let find_result = matcher.find(text).unwrap();
+        let spans_result = matcher.find_in_spans(text, &[]).unwrap();
+        assert_eq!(find_result, spans_result);
+    }
+
+    #[test]
+    fn find_in_spans_filters_correctly() {
+        let matcher = literal("ab");
+        let text = "ababab";
+        // Span covers only the middle "ab"
+        let spans = [(2, 4)];
+        let result = matcher.find_in_spans(text, &spans).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].span.start.0, 2);
+        assert_eq!(result[0].span.end.0, 4);
+    }
+
+    #[test]
+    fn find_in_spans_multiple_spans() {
+        let matcher = literal("a");
+        let text = "a b a b a";
+        // Two spans: positions 0-1 and 4-5
+        let spans = [(0, 1), (4, 5)];
+        let result = matcher.find_in_spans(text, &spans).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].span.start.0, 0);
+        assert_eq!(result[1].span.start.0, 4);
+    }
+
+    #[test]
+    fn find_in_spans_excludes_straddlers() {
+        let matcher = literal("ba");
+        let text = "ababab";
+        // Span boundaries that would straddle a match
+        let spans = [(0, 2), (4, 6)];
+        let result = matcher.find_in_spans(text, &spans).unwrap();
+        // "ba" at position 1-3 straddles the first span boundary
+        // "ba" at position 3-5 straddles the second span boundary
+        // So no matches should be found
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn iter_matches_spans_empty_equals_iter_matches() {
+        // Empty spans = whole source
+        let matcher = literal("a");
+        let text = "ababab";
+        let iter_result: Vec<_> = matcher
+            .iter_matches_spans(text, &[])
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let expected = matcher.find(text).unwrap();
+        assert_eq!(iter_result, expected);
+    }
+
+    #[test]
+    fn iter_matches_spans_filters_correctly() {
+        let matcher = literal("ab");
+        let text = "ababab";
+        let spans = [(2, 6)];
+        let result: Vec<_> = matcher
+            .iter_matches_spans(text, &spans)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].span.start.0, 2);
+        assert_eq!(result[1].span.start.0, 4);
+    }
+
+    #[test]
+    fn scope_spans_digest_empty_is_zero() {
+        use crate::matcher::scope_spans_digest;
+        assert_eq!(scope_spans_digest(&[]), 0);
+    }
+
+    #[test]
+    fn scope_spans_digest_deterministic() {
+        use crate::matcher::scope_spans_digest;
+        let spans = [(10, 20), (30, 40)];
+        let d1 = scope_spans_digest(&spans);
+        let d2 = scope_spans_digest(&spans);
+        assert_eq!(d1, d2);
+        let spans2 = [(10, 20), (31, 40)];
+        let d3 = scope_spans_digest(&spans2);
+        assert_ne!(d1, d3);
     }
 }

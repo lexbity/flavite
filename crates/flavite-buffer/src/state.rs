@@ -20,6 +20,7 @@ use flavite_encoding::{DecodePolicy, SourceFormat};
 use flavite_syntax::text::{TextError, TextSnapshot};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::model::EditorModel;
 use crate::revision::{BaseHash, BufferId, Revision};
@@ -139,7 +140,9 @@ pub struct Buffer {
     /// The base hash of the content when last loaded or saved.
     base_hash: Option<BaseHash>,
     /// Exact bytes corresponding to `base_hash`, retained as the merge base.
-    base_bytes: Vec<u8>,
+    /// Stored behind an `Arc` so staging captures (recovery/autosave) clone
+    /// it in O(1) under the buffer-manager lock (RFC-0011 S7).
+    base_bytes: Arc<[u8]>,
     /// Descriptor the base bytes were encoded under (§6.10: merge decodes
     /// base/mine/theirs under their own captured descriptors, never a
     /// current guess).
@@ -178,7 +181,7 @@ impl Buffer {
             model,
             state: BufferState::Clean,
             base_hash: Some(hash),
-            base_bytes: snapshot.source().to_vec(),
+            base_bytes: Arc::from(snapshot.source()),
             base_format,
             disk_hash: Some(hash),
             save_requires_completion: false,
@@ -226,7 +229,15 @@ impl Buffer {
     /// Exact source bytes for the current merge base.
     #[must_use]
     pub fn base_bytes(&self) -> &[u8] {
-        &self.base_bytes
+        self.base_bytes.as_ref()
+    }
+
+    /// O(1) shared clone of the merge-base bytes. Recovery/autosave staging
+    /// captures this under the buffer-manager lock; serialization happens
+    /// on the worker (RFC-0011 S7).
+    #[must_use]
+    pub fn base_bytes_shared(&self) -> Arc<[u8]> {
+        Arc::clone(&self.base_bytes)
     }
 
     /// Descriptor the current merge base bytes were encoded under.
@@ -240,7 +251,7 @@ impl Buffer {
         let hash = BaseHash::from_bytes(*blake3::hash(&bytes).as_bytes());
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
-        self.base_bytes = bytes;
+        self.base_bytes = Arc::from(bytes);
         // The base carries the buffer's authoritative descriptor.
         self.base_format = Some(self.model.source_format());
     }
@@ -476,7 +487,7 @@ impl Buffer {
                 self.model.replace_snapshot(new_snapshot.clone());
                 self.save_requires_completion = false;
                 self.base_hash = Some(new_disk_hash);
-                self.base_bytes = new_disk_bytes.to_vec();
+                self.base_bytes = Arc::from(new_disk_bytes);
                 self.base_format = new_snapshot.format();
                 BufferState::Clean
             }
@@ -588,7 +599,7 @@ impl Buffer {
             self.save_requires_completion = false;
             self.disk_hash = Some(new_hash);
             self.base_hash = Some(new_hash);
-            self.base_bytes = disk_bytes.to_vec();
+            self.base_bytes = Arc::from(disk_bytes);
             self.base_format = Some(self.model.source_format());
             self.state = BufferState::Clean;
 
@@ -627,7 +638,7 @@ impl Buffer {
         self.save_requires_completion = false;
         self.base_hash = Some(disk_hash);
         self.disk_hash = Some(disk_hash);
-        self.base_bytes = disk_bytes.to_vec();
+        self.base_bytes = Arc::from(disk_bytes);
         self.base_format = disk.format();
         self.state = if recovered_hash == disk_hash {
             BufferState::Clean
@@ -659,7 +670,7 @@ impl Buffer {
         self.save_requires_completion = false;
         self.base_hash = self.model.base_hash();
         self.disk_hash = self.base_hash;
-        self.base_bytes = disk_bytes.to_vec();
+        self.base_bytes = Arc::from(disk_bytes);
         self.base_format = Some(self.model.source_format());
         self.state = BufferState::Clean;
         StateTransition::new(old_state, BufferState::Clean, TransitionReason::Reopened)
@@ -678,7 +689,7 @@ impl Buffer {
         let hash = BaseHash::from_snapshot(&snapshot);
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
-        self.base_bytes = disk_bytes.to_vec();
+        self.base_bytes = Arc::from(disk_bytes);
         self.base_format = snapshot.format();
         self.save_requires_completion = false;
         self.state = BufferState::Dirty;
@@ -711,7 +722,7 @@ impl Buffer {
         let disk = TextSnapshot::with_policy(disk_bytes, disk_policy).ok()?;
         self.base_hash = Some(BaseHash::from_snapshot(&disk));
         self.disk_hash = self.base_hash;
-        self.base_bytes = disk_bytes.to_vec();
+        self.base_bytes = Arc::from(disk_bytes);
         self.base_format = disk.format();
         let revision = self.model.apply_snapshot_boundary(merged);
         self.save_requires_completion = false;
@@ -756,7 +767,7 @@ impl Buffer {
             self.save_requires_completion = false;
             self.base_hash = Some(new_hash);
             self.disk_hash = Some(new_hash);
-            self.base_bytes = bytes.to_vec();
+            self.base_bytes = Arc::from(bytes);
             self.base_format = format;
             self.state = BufferState::Clean;
 
@@ -791,7 +802,7 @@ impl Buffer {
 
         // Update base hash to match current content
         self.base_hash = Some(self.content_hash());
-        self.base_bytes = self.model.source_bytes_for_hash();
+        self.base_bytes = Arc::from(self.model.source_bytes_for_hash());
         self.base_format = Some(self.model.source_format());
         // Disk hash now matches base hash
         self.disk_hash = self.base_hash;
@@ -822,7 +833,7 @@ impl Buffer {
         let hash = BaseHash::from_bytes(*blake3::hash(saved_bytes).as_bytes());
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
-        self.base_bytes = saved_bytes.to_vec();
+        self.base_bytes = Arc::from(saved_bytes);
         self.base_format = Some(self.model.source_format());
 
         self.save_requires_completion = false;
@@ -845,7 +856,7 @@ impl Buffer {
         self.require_save_completion();
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
-        self.base_bytes = self.model.source_bytes_for_hash();
+        self.base_bytes = Arc::from(self.model.source_bytes_for_hash());
         self.base_format = Some(self.model.source_format());
     }
 
@@ -856,7 +867,7 @@ impl Buffer {
         let hash = BaseHash::from_bytes(*blake3::hash(bytes).as_bytes());
         self.base_hash = Some(hash);
         self.disk_hash = Some(hash);
-        self.base_bytes = bytes.to_vec();
+        self.base_bytes = Arc::from(bytes);
         self.base_format = Some(self.model.source_format());
     }
 

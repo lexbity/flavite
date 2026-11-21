@@ -129,6 +129,31 @@ impl EditorEdit {
         validate_selections(before, &self.before)?;
         validate_selections(after, &self.after)
     }
+
+    /// Windowed variant (RFC-0011 S2): validates against document lengths and
+    /// caller-provided boundary predicates. Same rejection semantics,
+    /// O(|selections|) cost.
+    pub fn validate_windowed(
+        &self,
+        before_len: usize,
+        after_len: usize,
+        before_boundary: &dyn Fn(usize) -> bool,
+        after_boundary: &dyn Fn(usize) -> bool,
+    ) -> Result<(), HistoryError> {
+        if self.origin.len() != 32
+            || !self
+                .origin
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(HistoryError::InvalidSelections);
+        }
+        if self.primary >= self.after.len() || self.before_primary >= self.before.len() {
+            return Err(HistoryError::InvalidSelections);
+        }
+        validate_selections_windowed(before_len, before_boundary, &self.before)?;
+        validate_selections_windowed(after_len, after_boundary, &self.after)
+    }
 }
 
 pub fn validate_selections(text: &str, selections: &[[usize; 3]]) -> Result<(), HistoryError> {
@@ -143,6 +168,55 @@ pub fn validate_selections(text: &str, selections: &[[usize; 3]]) -> Result<(), 
         })
         .collect::<Result<Vec<_>, HistoryError>>()?;
     let (set, _) = crate::selection::SelectionSet::normalize(text, candidates, None)
+        .map_err(|_| HistoryError::InvalidSelections)?;
+    if set.to_triples() != selections {
+        return Err(HistoryError::InvalidSelections);
+    }
+    Ok(())
+}
+
+/// Validate recorded selections against a document length and a boundary
+/// predicate (RFC-0011 S2): bounds, boundary checks via the caller-provided
+/// predicate (which may use local window context), and canonical form via
+/// the geometry-only canonicalizer. No full-text normalization runs, so
+/// this is O(|selections|) regardless of document size.
+pub fn validate_selections_windowed(
+    len: usize,
+    boundary: &dyn Fn(usize) -> bool,
+    selections: &[[usize; 3]],
+) -> Result<(), HistoryError> {
+    if selections.len() > RECORDED_SELECTION_LIMIT {
+        return Err(HistoryError::InvalidSelections);
+    }
+    let mut seen = std::collections::HashSet::with_capacity(selections.len());
+    for &[id, anchor, head] in selections {
+        if !seen.insert(id) {
+            return Err(HistoryError::InvalidSelections);
+        }
+        if anchor > len || head > len {
+            return Err(HistoryError::InvalidSelections);
+        }
+        for p in [anchor, head] {
+            if !boundary(p) {
+                return Err(HistoryError::InvalidSelections);
+            }
+        }
+    }
+    let mut ids_ok = true;
+    let candidates: Vec<(u32, usize, usize)> = selections
+        .iter()
+        .map(|&[id, anchor, head]| {
+            let Ok(id) = u32::try_from(id) else {
+                ids_ok = false;
+                return (0, anchor, head);
+            };
+            (id, anchor, head)
+        })
+        .collect();
+    if !ids_ok {
+        return Err(HistoryError::InvalidSelections);
+    }
+    let (set, _) = crate::selection::SelectionSet::canonicalize_members(candidates, None)
         .map_err(|_| HistoryError::InvalidSelections)?;
     if set.to_triples() != selections {
         return Err(HistoryError::InvalidSelections);

@@ -69,7 +69,7 @@ fn selection_scope_uses_the_pre_find_selection_and_does_not_widen() {
     // Select the final occurrence before Find takes focus. The find
     // selection shown afterward must not become a new scope authority.
     app.workspace
-        .set_display_selection(tab, 12, 15, view.revision, &view.text)
+        .set_display_selection(tab, 12, 15, view.revision, &view.text.materialize())
         .unwrap();
     let _ = app.update(Message::NoteSearch(NoteSearchMessage::FindOpen(tab)));
     let _ = app.update(Message::NoteSearch(

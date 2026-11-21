@@ -33,6 +33,8 @@ struct Harness {
     fs: MemFs,
     root: PathBuf,
     #[allow(dead_code)]
+    root_dir: tempfile::TempDir,
+    #[allow(dead_code)]
     db_dir: tempfile::TempDir,
     #[allow(dead_code)]
     data_dir: tempfile::TempDir,
@@ -40,7 +42,10 @@ struct Harness {
 
 fn harness() -> Harness {
     let fs = MemFs::new();
-    let root = PathBuf::from("/test/vault");
+    // Real vault root: `.flavite/` (operation key, recovery, hints) is
+    // OS-addressable; note content flows through MemFs.
+    let root_dir = tempfile::tempdir().expect("vault root");
+    let root = root_dir.path().to_path_buf();
     fs.create_dir_all(&root).expect("vault root");
     let db_dir = tempfile::tempdir().expect("index dir");
     let db = db_dir.path().join("index.sqlite3");
@@ -73,6 +78,7 @@ fn harness() -> Harness {
         session,
         fs,
         root,
+        root_dir,
         db_dir,
         data_dir,
     }
@@ -199,11 +205,11 @@ fn applied_job_id(result: &SessionResult) -> u128 {
     }
 }
 
-fn open(session: &Session, relative: &str) -> (u64, u64) {
+fn open(h: &Harness, relative: &str) -> (u64, u64) {
     let result = wait_terminal(
-        session,
-        session.execute(SessionCommand::OpenNote {
-            path: PathBuf::from(format!("/test/vault/{relative}")),
+        &h.session,
+        h.session.execute(SessionCommand::OpenNote {
+            path: h.root.join(relative),
             policy: OpenPolicy::ExistingOnly,
         }),
     );
@@ -235,6 +241,7 @@ fn edit(session: &Session, buffer_id: u64, revision: u64, ops: Vec<flavite_buffe
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         }),
     );
     match expect_success(result, "edit") {
@@ -287,7 +294,7 @@ fn text_find(session: &Session, buffer_id: u64, revision: u64, query: &str) -> u
                 mode: flavite_text_search::matcher::MatchMode::Literal,
                 case_sensitive: false,
                 whole_word: false,
-                scope: None,
+                scope_spans: vec![],
                 offset: 0,
             },
         }),
@@ -382,7 +389,7 @@ fn revert_skips_notes_changed_by_external_write() {
 fn draft_revert_restores_before_text_with_lineage_guard() {
     let h = harness();
     seed_note(&h, "notes/a.md", b"alpha\n");
-    let (buffer_id, rev0) = open(&h.session, "notes/a.md");
+    let (buffer_id, rev0) = open(&h, "notes/a.md");
     let rev1 = edit(
         &h.session,
         buffer_id,
@@ -456,7 +463,7 @@ fn draft_revert_restores_before_text_with_lineage_guard() {
 fn draft_revert_conservatively_skips_later_typing_even_if_text_identical() {
     let h = harness();
     seed_note(&h, "notes/a.md", b"alpha\n");
-    let (buffer_id, rev0) = open(&h.session, "notes/a.md");
+    let (buffer_id, rev0) = open(&h, "notes/a.md");
     let rev1 = edit(
         &h.session,
         buffer_id,

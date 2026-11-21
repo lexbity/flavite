@@ -279,7 +279,9 @@ pub fn observe(app: &mut App, outcome: &QueryOutcome) -> bool {
                     .note_editor_view(tab)
                     .filter(|v| v.buffer_id == buffer_id && v.revision == revision)
                 {
-                    let _ = app.workspace.set_content_anchor(tab, byte, &view.text);
+                    let _ = app
+                        .workspace
+                        .set_content_anchor(tab, byte, &view.text.materialize());
                     app.reading.pending_anchor.insert(tab, byte);
                 } else {
                     app.status = "Anchor source changed; open the link again".into();

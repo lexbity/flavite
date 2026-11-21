@@ -181,12 +181,22 @@ impl TextMask {
     }
 }
 
+/// Bounds the forward scan for an unclosed display-math opener
+/// (`$$` … no closer). A `$` at the start of a document with no closer
+/// previously scanned to EOF — O(n) per unclosed `$$` prefix, O(n²)
+/// worst case on pathological documents. The bound matches pulldown's own
+/// recovery semantics (pulldown without a math extension recognizes no
+/// `$$` spans at all, so a missed far-away closer is no worse than the
+/// reference parser) and makes the scan O(1) amortized per opener.
+/// RFC-0011 S5 (A7).
+const MATH_FORWARD_LIMIT: usize = 64 * 1024;
+
 /// Finds math spans in `content`, ignoring `excluded` byte ranges.
 ///
-/// This is a deterministic, dependency-free heuristic shared by *both* parse
-/// paths — the tree-sitter Markdown grammar has no math node and pulldown's
-/// math extension is not enabled, so both glues apply this masker instead of
-/// each inventing their own rules. That is what keeps AC-5 parity exact.
+/// This is a deterministic, dependency-free heuristic shared by the
+/// whole-document bridge and the segment cache (pulldown's math extension is
+/// not enabled, so both produce math exclusions from this one masker instead
+/// of inventing per-path rules). That is what keeps AC-5 parity exact.
 ///
 /// Rules (`content` is the note body relative to which `excluded` is indexed):
 /// * `$$` … `$$` is a display span; a closing `$$` must exist on a later line.
@@ -195,6 +205,11 @@ impl TextMask {
 ///   not cross a blank line.
 /// * A `$` adjacent to an alphanumeric character (e.g. `5$` or `$5`) is
 ///   currency text, not a delimiter.
+///
+/// `excluded` must be sorted by start (construction order in
+/// [`crate::pulldown_glue`] guarantees this); the ranges are queried by
+/// binary search, so the total cost is O(n log m) instead of O(n·m)
+/// (RFC-0011 S5 A7).
 #[must_use]
 pub fn math_ranges(content: &str, excluded: &[Range<usize>]) -> Vec<Range<usize>> {
     let bytes = content.as_bytes();
@@ -213,9 +228,11 @@ pub fn math_ranges(content: &str, excluded: &[Range<usize>]) -> Vec<Range<usize>
             continue;
         }
         if bytes.get(i + 1) == Some(&b'$') {
-            // Display span: find a closing `$$` on a later line.
+            // Display span: find a closing `$$` on a later line, bounded by
+            // [`MATH_FORWARD_LIMIT`] (A7).
             let mut j = i + 2;
-            while j + 1 < bytes.len() {
+            let limit = (i + 2 + MATH_FORWARD_LIMIT).min(bytes.len());
+            while j + 1 < limit {
                 if bytes[j] == b'$' && bytes[j + 1] == b'$' && !is_within(excluded, j) {
                     out.push(i..j + 2);
                     i = j + 2;
@@ -252,9 +269,33 @@ pub fn math_ranges(content: &str, excluded: &[Range<usize>]) -> Vec<Range<usize>
     out
 }
 
-/// `true` when `pos` lies inside one of `ranges`.
+/// Find the closing `---` or `...` delimiter for frontmatter that opened at
+/// the very first line (the `---\n` prefix is the caller's check).
+///
+/// This is the single, shared frontmatter-boundary rule used by the
+/// whole-document bridge and the segment cache so AC-5 parity cannot drift on
+/// YAML delimiters.
+pub(crate) fn find_frontmatter_close(text: &str) -> Option<usize> {
+    let after_open = 3; // Skip initial "---"
+    let rest = &text[after_open..];
+
+    let mut line_start = 0usize;
+    for line in rest.lines() {
+        let trimmed = line.trim();
+        if trimmed == "---" || trimmed == "..." {
+            return Some(after_open + line_start + line.len());
+        }
+        line_start += line.len() + 1;
+    }
+    None
+}
+
+/// `true` when `pos` lies inside one of `ranges`. `ranges` must be sorted
+/// by start; the lookup is a binary search (RFC-0011 S5 A7) — O(log m)
+/// instead of the previous O(m) linear scan.
 fn is_within(ranges: &[Range<usize>], pos: usize) -> bool {
-    ranges.iter().any(|r| r.start <= pos && pos < r.end)
+    let i = ranges.partition_point(|r| r.start <= pos);
+    i.checked_sub(1).is_some_and(|i| pos < ranges[i].end)
 }
 
 /// Character immediately before byte offset `pos`, if any.

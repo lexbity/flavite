@@ -49,42 +49,43 @@ pub enum LinkResolution {
     NotApplicable,
 }
 
-/// Scan all non-code, non-HTML, non-math regions with the shared grammar.
-/// This follows the indexer's `parse_note` mask and therefore cannot invent an
-/// editor-only interpretation of link syntax.
+/// Convert a pulldown parse into the widget's span views. The widget routes
+/// through the segment cache (RFC-0011 S5); this converter exists for the
+/// parity tests and diagnostics, and delegates to
+/// [`spans_from_canonical`].
 #[must_use]
-pub fn scan_links(text: &str) -> Vec<LinkSpan> {
-    scan_note(text).0
+pub fn spans_from_pulldown(
+    parsed: flavite_syntax::pulldown_glue::ParsedNote,
+) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
+    spans_from_canonical(parsed.links, parsed.tags, parsed.block_ids)
 }
 
-/// Scan links and decorations in one pass. The two views share the same
-/// canonical parse; running [`scan_links`] and [`scan_decorations`]
-/// separately parsed every keystroke's revision twice on the UI thread.
+/// Convert canonical link/tag/block-ID spans (whole-document parse or the
+/// segment cache) into the widget's link and decoration views. The canonical
+/// parse already scanned every prose window; reusing its tag/block spans
+/// avoids scanning the full note a second time and allocating duplicate link
+/// payloads that drawing never uses.
 #[must_use]
-pub fn scan_note(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
-    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
-        return (Vec::new(), Vec::new());
-    };
-    // The canonical parse already scanned every prose window. Reusing its
-    // tag/block spans avoids scanning the full note a second time and
-    // allocating duplicate link payloads that drawing never uses.
-    let mut decorations: Vec<_> = parsed
-        .tags
+pub fn spans_from_canonical(
+    links: Vec<flavite_syntax::pulldown_glue::Link>,
+    tags: Vec<flavite_syntax::text::Span<flavite_syntax::text::TextByte>>,
+    block_ids: Vec<flavite_syntax::text::Span<flavite_syntax::text::TextByte>>,
+) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
+    let mut decorations: Vec<_> = tags
         .into_iter()
         .map(|span| ScannedSpan {
             span,
             kind: SpanKind::Tag,
             payload: None,
         })
-        .chain(parsed.block_ids.into_iter().map(|span| ScannedSpan {
+        .chain(block_ids.into_iter().map(|span| ScannedSpan {
             span,
             kind: SpanKind::BlockId,
             payload: None,
         }))
         .collect();
     decorations.sort_unstable_by_key(|span| span.span.start.0);
-    let links = parsed
-        .links
+    let links = links
         .into_iter()
         .map(|link| LinkSpan {
             span: link.span.start.0..link.span.end.0,
@@ -113,13 +114,6 @@ pub fn resolve_link(span: &LinkSpan, verdict: Option<LinkResolution>) -> LinkRes
         return LinkResolution::NotApplicable;
     }
     verdict.unwrap_or(LinkResolution::Unresolved)
-}
-
-/// Canonical tag/block-ID decorations; links are supplied by [`scan_links`].
-/// Code, math, HTML, and frontmatter are excluded by the shared parser.
-#[must_use]
-pub fn scan_decorations(text: &str) -> Vec<ScannedSpan> {
-    scan_note(text).1
 }
 
 /// Rank a bounded in-memory candidate list by subsequence match. The host
@@ -180,7 +174,7 @@ mod tests {
     fn decorations_match_canonical_structure_without_rescanning_links() {
         let text = "---\ntitle: '#hidden'\n---\n# Heading\n\n[[a*b*|label]] #visible ^block\n\n`#code`\n\n$#math$\n\n<div>#html</div>\n";
         let parsed = flavite_syntax::pulldown_glue::parse_normalized(text).unwrap();
-        let (links, decorations) = scan_note(text);
+        let (links, decorations) = spans_from_pulldown(parsed.clone());
         assert_eq!(links.len(), parsed.links.len());
         let tags: Vec<_> = decorations
             .iter()
@@ -216,13 +210,19 @@ mod tests {
     }
 
     #[test]
-    fn scan_note_matches_the_individual_scans() {
-        // The combined pass exists so a keystroke parses the document once;
-        // it must return exactly what the two single-purpose scans return.
+    fn segment_cache_matches_pulldown_conversion() {
+        // The segment cache (the widget's structure producer, RFC-0011 S5)
+        // and the pulldown converter must yield the same spans — the single
+        // producer's parity contract (AC-5).
         let text = "[[Ideas]] `[[code]]`\n\n```md\n[[fence]]\n```\n\n$[[math]]$ ![[diagram.png]] #topic ^block\n\n*emphasis* and **strong** with [[Another]]".repeat(20);
-        let (links, decorations) = scan_note(&text);
-        assert_eq!(links, scan_links(&text));
-        assert_eq!(decorations, scan_decorations(&text));
+        let mut index = flavite_syntax::segment::SegmentIndex::new();
+        index.sync(&text, None);
+        let (links, decorations) =
+            spans_from_canonical(index.spans().0, index.spans().1, index.spans().2);
+        let parsed = flavite_syntax::pulldown_glue::parse_normalized(&text).unwrap();
+        let (p_links, p_decorations) = spans_from_pulldown(parsed);
+        assert_eq!(links, p_links);
+        assert_eq!(decorations, p_decorations);
         assert!(!links.is_empty());
         assert!(!decorations.is_empty());
     }
@@ -232,7 +232,11 @@ mod tests {
         // A closed wikilink whose target has no indexed note still scans as
         // a link (the graph's grey node and the create-from-link flow both
         // key off this payload); spaces in the target are legal.
-        let links = scan_links("# Alpha\n\nalpha body\n[[zz test]]");
+        let parsed = flavite_syntax::pulldown_glue::parse_normalized(
+            "# Alpha\n\nalpha body\n[[zz test]]",
+        )
+        .unwrap();
+        let links = spans_from_pulldown(parsed).0;
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].payload.target_raw, "zz test");
         assert!(!links[0].embed);
@@ -241,13 +245,13 @@ mod tests {
     #[test]
     fn links_and_decorations_use_shared_scanner_and_exclusions() {
         let text = "[[Ideas]] `[[code]]`\n\n```md\n[[fence]]\n```\n\n$[[math]]$ ![[diagram.png]] #topic ^block";
-        let links = scan_links(text);
+        let parsed = flavite_syntax::pulldown_glue::parse_normalized(text).unwrap();
+        let (links, decorations) = spans_from_pulldown(parsed);
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].payload.target_raw, "Ideas");
         assert!(!links[0].embed);
         assert_eq!(links[1].payload.target_raw, "diagram.png");
         assert!(links[1].embed);
-        let decorations = scan_decorations(text);
         assert_eq!(
             decorations
                 .iter()

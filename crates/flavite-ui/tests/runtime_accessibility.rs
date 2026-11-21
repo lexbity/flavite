@@ -121,10 +121,10 @@ fn running_shell_program_publishes_the_workspace_and_routes_actions() {
     // Actual native text-selection actions enter the same controlled editor
     // acknowledgement path as pointer input, with exact revision/run guards.
     let view = app.note_editor_view(tab).unwrap();
-    let caret = view.text.find("body").unwrap();
+    let caret = view.text.materialize().find("body").unwrap();
     let selection = accesskit::TextSelection {
-        anchor: tree::text_position(&app, tab, &view.text, caret),
-        focus: tree::text_position(&app, tab, &view.text, caret),
+        anchor: tree::text_position(&app, tab, &view.text.materialize(), caret),
+        focus: tree::text_position(&app, tab, &view.text.materialize(), caret),
     };
     let native = || accesskit::ActionRequest {
         action: accesskit::Action::SetTextSelection,
@@ -198,6 +198,7 @@ fn running_shell_program_publishes_the_workspace_and_routes_actions() {
         app.note_editor_view(tab)
             .unwrap()
             .text
+            .materialize()
             .contains("native-markerbody")
     );
     let invalid = accesskit::TextSelection {

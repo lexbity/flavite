@@ -214,7 +214,7 @@ fn replace_request<'a>(source: &'a str, pattern: &'a str, template: &'a str) -> 
         mode: MatchMode::Regex,
         case_sensitive: false,
         whole_word: false,
-        scope: None,
+        scope_spans: vec![],
         max_matches: 1_000_000,
         report_matches: usize::MAX,
         skip_matches: 0,
@@ -238,6 +238,120 @@ fn run(
     request: &HelperRequest<'_>,
 ) -> Result<flavite_vault::text_worker::HelperRun, TextWorkerError> {
     run_match(request, &AtomicBool::new(false))
+}
+
+#[test]
+fn replace_plan_regex_computes_ops_through_the_helper() {
+    // FEUX-0006 E-5: `text.replace_plan`'s worker computation runs regex
+    // through the isolated helper and expands `$1` per match.
+    let _lock = acquire_sibling_lock();
+    install_helper();
+    let plan = flavite_vault::text_edit::prepare_replace_plan(
+        "one two one",
+        &flavite_vault::text_edit::ReplacePlanRequest {
+            buffer_id: flavite_buffer::revision::BufferId::from(1),
+            revision: flavite_buffer::revision::Revision::new(1),
+            query: "(o)(n)".to_owned(),
+            replacement: "<$2$1>".to_owned(),
+            case_sensitive: false,
+            whole_word: false,
+            mode: MatchMode::Regex,
+            scope_spans: vec![],
+        },
+    )
+    .expect("regex plan");
+    assert_eq!(plan.match_count, 2);
+    assert_eq!(plan.ops[0].replacement, "<no>");
+    assert_eq!(plan.ops[1].replacement, "<no>");
+    assert_eq!(plan.ops[0].range.start.0, 0);
+    assert_eq!(plan.ops[1].range.start.0, 8);
+    assert_eq!(plan.output_len, 11 - 4 + 8, "11 - 2*2 span + 2*4 expansion");
+}
+
+#[test]
+fn match_collection_regex_uses_helper_and_proves_totals() {
+    // FEUX-0006 E-3/E-8: regex collection runs through the isolated helper
+    // and honors scope spans; whole-source and scoped results both return
+    // proven totals.
+    let _lock = acquire_sibling_lock();
+    install_helper();
+    let cancelled = AtomicBool::new(false);
+    let request = flavite_vault::text_select::SelectMatchesRequest {
+        buffer_id: flavite_buffer::revision::BufferId::from(1),
+        revision: flavite_buffer::revision::Revision::new(1),
+        query: "TODO".to_owned(),
+        mode: MatchMode::Regex,
+        case_sensitive: false,
+        whole_word: false,
+        scope_spans: vec![],
+    };
+    let outcome =
+        flavite_vault::text_select::collect_matches("TODO one\nTODO two\n", &request, &cancelled)
+            .expect("collect");
+    assert_eq!(outcome.spans, vec![(0, 4), (9, 13)]);
+    assert_eq!(outcome.total_matches, 2);
+    assert_eq!(outcome.zero_width_count, 0);
+
+    // Scoped: only matches fully inside the span are reported.
+    let mut scoped = request;
+    scoped.scope_spans = vec![(0, 8)];
+    let outcome =
+        flavite_vault::text_select::collect_matches("TODO one\nTODO two\n", &scoped, &cancelled)
+            .expect("collect");
+    assert_eq!(outcome.spans, vec![(0, 4)]);
+    assert_eq!(outcome.total_matches, 1);
+}
+
+#[test]
+fn keep_collection_regex_zero_width_counts_and_filters_members() {
+    // FEUX-0006 E-4/E-11: keep-matching runs regex through the isolated
+    // helper (never in-process) and counts zero-width matches as contained —
+    // `^` (multi_line) keeps every member whose span contains a line start.
+    let _lock = acquire_sibling_lock();
+    install_helper();
+    let cancelled = AtomicBool::new(false);
+    // "aa\nbb\ncc\n": line starts at 0, 3, and 6 (multi_line `^`).
+    // Containment is inclusive on both ends (E-2: s.start ≤ start ∧ end ≤
+    // s.end), so a zero-width match exactly at a member boundary counts.
+    // Member [1,2) contains no line start; member [3,5) contains (3,3).
+    let family =
+        |keep: bool, spans: Vec<(usize, usize)>| flavite_vault::text_select::KeepMatchingRequest {
+            buffer_id: flavite_buffer::revision::BufferId::from(1),
+            revision: flavite_buffer::revision::Revision::new(1),
+            query: "^".to_owned(),
+            mode: MatchMode::Regex,
+            case_sensitive: false,
+            keep,
+            scope_spans: spans,
+        };
+    let outcome = flavite_vault::text_select::collect_keep_matches(
+        "aa\nbb\ncc\n",
+        &family(true, vec![(1, 2), (3, 5)]),
+        &cancelled,
+    )
+    .expect("keep");
+    assert_eq!(outcome.selection_indices, vec![1]);
+    assert_eq!(outcome.match_count, 1);
+    // The complement keeps the non-matching member.
+    let outcome = flavite_vault::text_select::collect_keep_matches(
+        "aa\nbb\ncc\n",
+        &family(false, vec![(1, 2), (3, 5)]),
+        &cancelled,
+    )
+    .expect("keep");
+    assert_eq!(outcome.selection_indices, vec![0]);
+    assert_eq!(outcome.match_count, 1);
+
+    // A zero-width match exactly at a member's start is contained: both
+    // members keep `^` (line starts 0 and 3 are each at a member start).
+    let outcome = flavite_vault::text_select::collect_keep_matches(
+        "aa\nbb\n",
+        &family(true, vec![(0, 2), (3, 5)]),
+        &cancelled,
+    )
+    .expect("keep");
+    assert_eq!(outcome.selection_indices, vec![0, 1]);
+    assert_eq!(outcome.match_count, 2);
 }
 
 #[test]
@@ -308,14 +422,14 @@ fn scoped_regex_find_uses_whole_text_boundaries_and_freezes_the_range() {
     request.whole_word = true;
     // Frozen scope covering "world" inside "helloworld": whole-word
     // filtering consults the FULL text, so this match is not whole-word.
-    request.scope = Some((5, 10));
+    request.scope_spans = vec![(5, 10)];
     let scoped_run = run(&request).expect("scoped run");
     assert_eq!(scoped_run.total_matches, 0, "inside a larger word");
     // The second "world" is a real whole word; the scope excludes it.
-    request.scope = Some((1, 12));
+    request.scope_spans = vec![(1, 12)];
     let first_scope_run = run(&request).expect("first-scope run");
     assert_eq!(first_scope_run.total_matches, 0);
-    request.scope = Some((15, 20));
+    request.scope_spans = vec![(15, 20)];
     let second_scope_run = run(&request).expect("second-scope run");
     assert_eq!(second_scope_run.total_matches, 1);
     assert_eq!(
@@ -522,7 +636,7 @@ fn stale_scope_is_refused_locally_before_the_helper_sees_it() {
     let _lock = acquire_sibling_lock();
     install_helper();
     let mut request = find_request("abc", "b");
-    request.scope = Some((2, 1)); // reversed: not a legal frozen range
+    request.scope_spans = vec![(2, 1)]; // reversed: not a legal frozen range
     let error = run(&request).expect_err("reversed scope");
     assert_eq!(
         error,
@@ -530,7 +644,7 @@ fn stale_scope_is_refused_locally_before_the_helper_sees_it() {
     );
     // A mid-scalar endpoint is refused the same way (é starts at 0 here).
     let mut request = find_request("é", ".");
-    request.scope = Some((1, 1));
+    request.scope_spans = vec![(1, 1)];
     let error = run(&request).expect_err("mid-scalar scope start");
     assert_eq!(
         error,

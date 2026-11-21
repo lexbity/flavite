@@ -459,7 +459,7 @@ fn helper_request<'a>(
         mode: request.mode,
         case_sensitive: request.case_sensitive,
         whole_word: request.whole_word,
-        scope: None,
+        scope_spans: Vec::new(),
         max_matches,
         report_matches: usize::MAX,
         skip_matches: 0,

@@ -62,7 +62,10 @@ fn undo_restores_primary_after_an_edit_merges_members() {
         let target = EditorTarget::capture(app, tab).unwrap();
         let _ = app.update(Message::ContextMode(ContextMessage::Run(target, command)));
     }
-    assert_eq!(&*app.note_editor_view(tab).unwrap().text, "ab");
+    assert_eq!(
+        &*app.note_editor_view(tab).unwrap().text.materialize(),
+        "ab"
+    );
     let restored = EditorTarget::capture(app, tab).unwrap();
     assert_eq!(restored.selections, vec![(0, 0), (1, 1)]);
     assert_eq!(

@@ -121,14 +121,20 @@ fn implicit_preview_and_copy_preserve_committed_state_and_cut_uses_the_same_rang
             .len(),
         history.unwrap().entries.len()
     );
-    let effect = flavite_edit_context::effect::plan(&text.text, (4, 4), Command::Cut).unwrap();
+    let effect =
+        flavite_edit_context::effect::plan(&text.text.materialize(), (4, 4), Command::Cut).unwrap();
     run(&mut f.app, tab, Command::Cut);
     // Clipboard ordering (§5.5): the scheduled clipboard write does not
     // delete the source. The deletion happens only after the write
     // completes and the seam revalidates the source (FEUX-0002 E-16).
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.as_ref(),
-        text.text.as_ref(),
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
+        text.text.materialize().as_ref(),
         "the cut must not delete before the clipboard write completed"
     );
     let _ = f.app.update(Message::EditorClipboard(
@@ -138,11 +144,11 @@ fn implicit_preview_and_copy_preserve_committed_state_and_cut_uses_the_same_rang
         },
     ));
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         &format!(
             "{}{}",
-            &text.text[..effect.range.start],
-            &text.text[effect.range.end..]
+            &text.text.materialize()[..effect.range.start],
+            &text.text.materialize()[effect.range.end..]
         )
     );
     assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
@@ -185,11 +191,13 @@ fn preview_ownership_rejects_stale_sources_and_old_hover_exits() {
     assert_eq!(preview_command(&f.app, tab), Some(Command::Delete));
     assert!(effect_caption(&f.app, tab).is_none());
     let view = f.app.note_editor_view(tab).unwrap();
-    let effect = flavite_edit_context::effect::plan(&view.text, (9, 9), Command::Delete).unwrap();
+    let effect =
+        flavite_edit_context::effect::plan(&view.text.materialize(), (9, 9), Command::Delete)
+            .unwrap();
     assert_eq!(effect.range, 7..9);
     run(&mut f.app, tab, Command::Delete);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one caf\nsecond line\n"
     );
     run(&mut f.app, tab, Command::History);
@@ -218,7 +226,7 @@ fn enter_delete_undo_exit_preserves_source_identity_and_selection() {
     );
     run(&mut f.app, tab, Command::Delete);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one \nsecond line\n"
     );
     run(&mut f.app, tab, Command::Undo);
@@ -248,12 +256,12 @@ fn typing_survives_reposition_and_toolbar_actions_with_separate_undo_groups() {
     assert_eq!(f.app.context_mode.mode(tab), ContextMode::Command);
     run(&mut f.app, tab, Command::Undo);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "ABone café\nsecond line\n"
     );
     run(&mut f.app, tab, Command::Undo);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one café\nsecond line\n"
     );
 }
@@ -267,12 +275,12 @@ fn change_and_open_line_include_subsequent_typing_in_one_undo() {
     type_text(&mut f.app, tab, "tea");
     run(&mut f.app, tab, Command::Escape);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one tea\nsecond line\n"
     );
     run(&mut f.app, tab, Command::Undo);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one café\nsecond line\n"
     );
     selection(&mut f.app, tab, 0, 0);
@@ -280,12 +288,12 @@ fn change_and_open_line_include_subsequent_typing_in_one_undo() {
     type_text(&mut f.app, tab, "new");
     run(&mut f.app, tab, Command::Escape);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "new\none café\nsecond line\n"
     );
     run(&mut f.app, tab, Command::Undo);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one café\nsecond line\n"
     );
 }
@@ -530,6 +538,7 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
             .note_editor_view(tab)
             .unwrap()
             .text
+            .materialize()
             .starts_with("Zone")
     );
     send(
@@ -538,13 +547,21 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
     );
     // Conversely, a key captured from TYPING is a command after Escape.
     send(&mut f.app, key(5, Code::KeyD, "d"));
-    assert!(f.app.note_editor_view(tab).unwrap().text.starts_with("Zne"));
+    assert!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .starts_with("Zne")
+    );
     send(&mut f.app, key(6, Code::KeyU, "u"));
     assert!(
         f.app
             .note_editor_view(tab)
             .unwrap()
             .text
+            .materialize()
             .starts_with("Zone")
     );
     let before = f.app.note_editor_view(tab).unwrap();
@@ -565,6 +582,7 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
             .note_editor_view(tab)
             .unwrap()
             .text
+            .materialize()
             .starts_with("Zdone"),
         "after Exit a stale command frame must type normally"
     );
@@ -611,7 +629,7 @@ fn undersized_pane_suspends_edits_without_losing_mode_or_selection() {
     assert!(!flavite_ui::host::context_mode::too_narrow(&f.app, tab));
     run(&mut f.app, tab, Command::Delete);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one \nsecond line\n"
     );
 }
@@ -677,6 +695,7 @@ fn composition_commit_acknowledges_caret_and_joins_the_explicit_typing_group() {
             .note_editor_view(tab)
             .unwrap()
             .text
+            .materialize()
             .starts_with("日本語雪one")
     );
     assert_eq!(
@@ -918,7 +937,7 @@ fn history_maps_passive_split_selections_and_scroll_without_adopting_or_focusing
         let _ = f.app.update(Message::Pump);
         std::thread::sleep(Duration::from_millis(2));
     }
-    let text = f.app.note_editor_view(passive).unwrap().text;
+    let text = f.app.note_editor_view(passive).unwrap().text.materialize();
     let mut interaction = f.app.workspace.tab(&passive).unwrap().interaction().clone();
     interaction.selections = vec![CommittedSelection::new(15, 11)];
     interaction.viewport_anchor = 10;
@@ -1018,7 +1037,7 @@ fn accessible_history_restores_through_the_real_handler_and_masks_background_act
     .expect("history button publishes a real restore target");
     let _ = f.app.update(message);
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one café\nsecond line\n"
     );
     assert_eq!(
@@ -1139,6 +1158,7 @@ fn a_new_capture_is_admitted_while_its_duplicate_is_refused() {
             .note_editor_view(tab)
             .unwrap()
             .text
+            .materialize()
             .starts_with("Xone"),
         "the next capture acts"
     );
@@ -1167,6 +1187,167 @@ fn context_toggle_preserves_a_manually_maximized_pane() {
     assert_eq!(fixture.app.maximized_group(), Some(group));
     run(&mut fixture.app, tab, Command::Exit);
     assert_eq!(fixture.app.maximized_group(), Some(group));
+}
+
+/// Press one physical key through the acknowledged ContextNative path.
+/// `seq` is a strictly increasing request sequence owned by the test (the
+/// host's lease rejects reused sequence numbers as replays).
+fn press_key(
+    app: &mut App,
+    tab: TabId,
+    code: iced::keyboard::key::Code,
+    text: &str,
+    seq: &mut u64,
+) {
+    use flavite_editor::context::{ContextEvent, ContextKey, ContextRequest};
+    use iced::keyboard::Modifiers;
+    let source = EditorTarget::capture(app, tab).unwrap();
+    *seq += 1;
+    let sequence = *seq;
+    let key = ContextKey {
+        code: native_code(code),
+        modifiers: native_modifiers(Modifiers::empty()),
+        repeat: false,
+        input: CapturedInput {
+            buffer: source.buffer,
+            observed_revision: source.revision,
+            sequence,
+            action: KeyAction::Insert,
+            text: text.into(),
+            extend: false,
+            document_boundary: false,
+            vertical: None,
+            preferred_x: Vec::new(),
+            clipboard_acquired: false,
+        },
+    };
+    let _ = app.update(Message::ContextNative {
+        tab,
+        incarnation: source.incarnation,
+        request: ContextRequest {
+            buffer: source.buffer,
+            revision: source.revision,
+            selection: source.selection,
+            selections: vec![source.selection],
+            sequence,
+            event: ContextEvent::Key(key),
+        },
+    });
+}
+
+fn pending_count(app: &App) -> Option<u32> {
+    app.context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.count())
+}
+
+#[test]
+fn count_motion_multiplies_and_consumes_the_count() {
+    use iced::keyboard::key::Code;
+    let (mut f, tab) = fixture(3122);
+    // Body: "one café\nsecond line\n" — line 2 starts at byte 10.
+    selection(&mut f.app, tab, 0, 0);
+    run(&mut f.app, tab, Command::Toggle);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Command);
+
+    let mut seq = f.app.workspace.tab(&tab).unwrap().interaction().sequence;
+    press_key(&mut f.app, tab, Code::Digit3, "3", &mut seq);
+    assert_eq!(pending_count(&f.app), Some(3));
+
+    // A counted line-down consumes the count and moves a full 3-row visual
+    // step (clamped to the document end in this two-line fixture).
+    press_key(&mut f.app, tab, Code::KeyJ, "j", &mut seq);
+    assert_eq!(
+        pending_count(&f.app),
+        None,
+        "motion dispatch consumes the count"
+    );
+    let snapshot = f.app.editor_interaction_snapshot(tab).unwrap();
+    assert_eq!(
+        snapshot.selection,
+        (22, 22),
+        "counted motion clamps at document end"
+    );
+
+    // The count is gone, so a plain `j` is a single motion (already at the
+    // last position: stays put, no multiplication).
+    press_key(&mut f.app, tab, Code::KeyJ, "j", &mut seq);
+    let snapshot = f.app.editor_interaction_snapshot(tab).unwrap();
+    assert_eq!(snapshot.selection, (22, 22));
+}
+
+#[test]
+fn unbound_key_clears_a_pending_count() {
+    use iced::keyboard::key::Code;
+    let (mut f, tab) = fixture(3123);
+    selection(&mut f.app, tab, 0, 0);
+    run(&mut f.app, tab, Command::Toggle);
+    let mut seq = f.app.workspace.tab(&tab).unwrap().interaction().sequence;
+    press_key(&mut f.app, tab, Code::Digit5, "5", &mut seq);
+    assert_eq!(pending_count(&f.app), Some(5));
+    // `Q` is root-free (FEUX-0004 §6): an unbound key clears the count.
+    press_key(&mut f.app, tab, Code::KeyQ, "q", &mut seq);
+    assert_eq!(pending_count(&f.app), None);
+}
+
+#[test]
+fn repeat_replays_change_with_typed_text() {
+    use iced::keyboard::key::Code;
+    let (mut f, tab) = fixture(3124);
+    // "one café\nsecond line\n"
+    selection(&mut f.app, tab, 0, 0);
+    run(&mut f.app, tab, Command::Toggle);
+
+    // Change the first word and type a replacement run.
+    selection(&mut f.app, tab, 4, 9); // "café"
+    run(&mut f.app, tab, Command::Change);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Typing);
+    type_text(&mut f.app, tab, "XYZ");
+    run(&mut f.app, tab, Command::Escape);
+    assert_eq!(f.app.context_mode.mode(tab), ContextMode::Command);
+
+    // The register holds the change record with its run text.
+    let record = f
+        .app
+        .context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.repeat_last().cloned())
+        .expect("change recorded");
+    assert_eq!(record.command_id, "editor.change");
+    assert_eq!(
+        record.args.get("typed_text").map(String::as_str),
+        Some("XYZ")
+    );
+
+    // Replay against a different selection: the text is inserted at the new
+    // carets (E-5 re-targeting). The first change shortened line 1, so the
+    // second word now starts after "one XYZ\n"; resolve its span live.
+    let text_before = f.app.note_editor_view(tab).unwrap().text.materialize();
+    let second_start = text_before.find("second").expect("second word");
+    selection(&mut f.app, tab, second_start, second_start + "second".len());
+    let mut seq = f.app.workspace.tab(&tab).unwrap().interaction().sequence;
+    press_key(&mut f.app, tab, Code::Period, ".", &mut seq);
+    assert_eq!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
+        "one XYZ\nXYZ line\n"
+    );
+
+    // The register is unchanged by replay: `.` stays idempotent.
+    let record = f
+        .app
+        .context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.repeat_last().cloned())
+        .expect("change still recorded");
+    assert_eq!(record.command_id, "editor.change");
 }
 
 #[path = "../../flavite-api/tests/support/editor_operations.rs"]

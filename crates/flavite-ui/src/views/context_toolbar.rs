@@ -147,8 +147,13 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
             actions = actions.push(menu_button(app, target, menu));
         }
     }
-    if plan.menu_visible(ContextMenu::Type) {
-        actions = actions.push(menu_button(app, target, ContextMenu::Type));
+    if plan.menu_visible(ContextMenu::Transform) {
+        for menu in [ContextMenu::Transform, ContextMenu::Lines] {
+            actions = actions.push(menu_button(app, target, menu));
+        }
+    }
+    if plan.menu_visible(ContextMenu::Surround) {
+        actions = actions.push(menu_button(app, target, ContextMenu::Surround));
     }
     if plan.command_visible(ContextCommand::Find) {
         actions = actions.push(action(
@@ -189,15 +194,24 @@ pub fn view<'a>(app: &'a App, target: &EditorTarget) -> Element<'a, Message> {
     // set grows (FEUX-0002 X04/D-18; non-color redundancy).
     let member_count = target.selections.len();
     let count = app.note_editor_view(target.tab).map_or(0, |view| {
-        flavite_edit_context::selected_characters(&view.text, target.selection)
+        flavite_edit_context::selected_characters(&view.text.materialize(), target.selection)
     });
     let message = app
         .context_mode
         .session
         .as_ref()
         .map_or("", |s| s.state.message().0);
+    // FEUX-0004 X06: Prepend count indicator if present (E-4 §5.2)
+    let count_prefix: String = app
+        .context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.count())
+        .map(|n| format!("{n}·"))
+        .unwrap_or_default();
+    let mut caption: String = format!("{count_prefix}{message}");
     let max_chars = ((width - 130.0).max(40.0) / 6.5) as usize;
-    let mut caption: String = message.chars().take(max_chars).collect();
+    caption = caption.chars().take(max_chars).collect();
     if message.chars().count() > max_chars {
         caption.push('…');
     }
@@ -352,7 +366,7 @@ pub fn overlay<'a>(app: &'a App, shell: Element<'a, Message>) -> Element<'a, Mes
                     row![
                         text(command.title()).size(metrics.text),
                         Space::new().width(Length::Fill),
-                        text(menu.hint(command))
+                        text(app.appearance.context_label(command.id()))
                             .size(metrics.text_sm)
                             .style(style::dim_text)
                     ]

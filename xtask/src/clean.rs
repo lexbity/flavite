@@ -15,17 +15,26 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
 
-/// Soft budget: at or under this, `gc` is a no-op (§10.10).
-pub const SOFT_BUDGET: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
+/// Soft budget: at or under this, `gc` is a no-op (§10.10). Sized 2026-11-19
+/// for the post-debuginfo-trim graphs (full workspace test graph ~17 GB,
+/// single-config build ~7 GB): a single-config workflow must stay a no-op,
+/// while a second variant set trips the retention tiers.
+pub const SOFT_BUDGET: u64 = 20 * 1024 * 1024 * 1024; // 20 GB
 
-/// Hard budget: still over this → remove rebuildable caches, retaining evidence.
-pub const HARD_BUDGET: u64 = 20 * 1024 * 1024 * 1024; // 20 GB
+/// Hard budget: still over this → remove rebuildable caches, retaining
+/// evidence. Kept at 2× soft so the retention tiers stay meaningful — a hard
+/// budget equal to soft would collapse the middle tier into the full wipe.
+pub const HARD_BUDGET: u64 = 40 * 1024 * 1024 * 1024; // 40 GB
 
 /// Retention window for previous-build artifacts: files under the cache
 /// profiles not modified within this many days are swept before the
 /// wholesale-wipe backstop is considered (§10.10). The current build's
 /// files — and everything written since the window began — survive.
-pub const STALE_ARTIFACT_DAYS: u64 = 14;
+/// One day (since 2026-11-19): variant sets accumulate within minutes, so a
+/// 14-day window hoarded them; a 1-day window trades a recompile of
+/// untouched-but-old units (cheap: a from-clean build is well under a minute)
+/// for a near-flat target dir. `--stale-days N` overrides per invocation.
+pub const STALE_ARTIFACT_DAYS: u64 = 1;
 
 /// Report from a `clean` or `gc` operation.
 #[derive(Debug, Default)]
@@ -688,7 +697,7 @@ mod tests {
     fn gc_under_budget_is_noop() {
         let tmp = temp_workspace();
         let canon = tmp.canonicalize().unwrap();
-        // Small target dir — well under 10 GB soft budget.
+        // Small target dir — well under the 20 GB soft budget.
         fs::create_dir_all(canon.join("target").join("debug")).unwrap();
         fs::write(canon.join("target").join("debug").join("bin"), b"x").unwrap();
 

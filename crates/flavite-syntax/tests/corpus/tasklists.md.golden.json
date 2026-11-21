@@ -1,0 +1,43 @@
+{
+  "links": [
+    {
+      "start": 26,
+      "end": 44,
+      "target_raw": "unchecked-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 89,
+      "end": 106,
+      "target_raw": "checked-embed",
+      "alias": null,
+      "anchor": null,
+      "is_embed": true,
+      "by_id": false
+    },
+    {
+      "start": 161,
+      "end": 180,
+      "target_raw": "plain-item-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      49,
+      63
+    ]
+  ],
+  "block_ids": [
+    [
+      126,
+      142
+    ]
+  ]
+}

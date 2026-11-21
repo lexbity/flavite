@@ -52,6 +52,9 @@ macro_rules! impl_fs_delegates {
         fn remove(&self, path: &Path) -> Result<()> {
             self.$inner.remove(path)
         }
+        fn remove_dir_all(&self, path: &Path) -> Result<()> {
+            self.$inner.remove_dir_all(path)
+        }
         fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
             self.$inner.rename_replace(from, to)
         }

@@ -18,15 +18,10 @@ pedantic = { level = "warn", priority = -1 }
 iced = { version = "0.14", features = ["tokio", "canvas"] }
 cosmic-text = "0.15"
 # Core
-# TextSnapshot/EolTable count LF only; standalone CR and Unicode separators
-# remain content. Ropey's default unicode_lines would split UTF-8 during save.
-ropey = { version = "1.6", default-features = false, features = ["simd"] }
 rusqlite = "0.41"
 tantivy = "0.27"
 pulldown-cmark = "0.13"
 notify = "8"
-tree-sitter = "0.27"
-tree-sitter-md = "0.5"
 unicode-segmentation = "1"
 nucleo-matcher = "0.3"
 # Source matching (RFC-0006 §4.1: flavite-text-search → regex)
@@ -59,6 +54,21 @@ nucleo = "0.5"
 # Theme packages (.xpi): zip reading/writing with deflate only — the codecs
 # browser themes actually ship. Every other codec (aes, bzip2, …) stays off.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+
+# Dev-profile debuginfo policy (measured 2026-11-19): a full workspace test
+# graph under the default `debug = 2` produced 74 GB in target/debug (232 test
+# executables, 61 GB of binaries — every test statically links the whole dep
+# tree with full DWARF). Dependency debuginfo is the bulk of that and nothing
+# in this workspace steps into dependency source under a debugger, so deps
+# build without debuginfo and workspace crates keep line tables only
+# (backtraces still resolve file:line for flavite crates). Measured result of
+# the same build+test graph with these settings: 17 GB (4.4x smaller).
+# Release benches are unaffected (separate profile).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [patch.crates-io]
 # RUSTSEC-2026-0253: lru <0.18.2 is unsound (use-after-free in LruCache::pop).

@@ -80,7 +80,16 @@ fn every_mutating_and_selection_verb_has_a_core_registry_executor() {
     // in the registry (its executor) — E-7/§6 one canonical ID, one
     // executor; the host only routes, never re-implements.
     for command in ContextCommand::ALL {
-        let needs_executor = command.mutates()
+        // FEUX-0004 X05 / FEUX-0006 X03: RepeatLast and ReplaceRegex are
+        // host-routed — RepeatLast replays recorded commands; ReplaceRegex
+        // opens the args draft, computes via the read-only `text.replace_plan`
+        // command, and commits through `apply_edits`, so neither owns a single
+        // core-registry executor.
+        let is_host_routed = matches!(
+            command,
+            ContextCommand::RepeatLast | ContextCommand::ReplaceRegex
+        );
+        let needs_executor = (command.mutates() && !is_host_routed)
             || matches!(
                 command,
                 ContextCommand::KeepPrimary
@@ -126,6 +135,8 @@ fn every_mutating_and_selection_verb_has_a_core_registry_executor() {
         ContextCommand::DocumentStart,
         ContextCommand::DocumentEnd,
         ContextCommand::SelectAll,
+        // FEUX-0004 X05: RepeatLast is host-routed (replays recorded commands)
+        ContextCommand::RepeatLast,
     ] {
         assert!(
             !registry.contains(command.id()),

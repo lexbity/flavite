@@ -534,3 +534,33 @@ pub fn pick_vault_folder() -> iced::Task<Message> {
         Message::VaultPicked,
     )
 }
+
+/// FEUX-0003 X07: Open the native file dialog for profile import.
+/// The task resolves into [`Message::ProfileImportPicked`].
+pub fn pick_profile_import_file() -> iced::Task<Message> {
+    iced::Task::perform(
+        async move {
+            rfd::AsyncFileDialog::new()
+                .add_filter("Profile", &["toml"])
+                .pick_file()
+                .await
+                .and_then(|handle| handle.path().to_path_buf().into())
+        },
+        Message::ProfileImportPicked,
+    )
+}
+
+/// FEUX-0003 X07: Open the native file dialog for profile export.
+/// The task resolves into [`Message::ProfileExportPicked`].
+pub fn pick_profile_export_file(profile_id: String) -> iced::Task<Message> {
+    iced::Task::perform(
+        async move {
+            rfd::AsyncFileDialog::new()
+                .add_filter("Profile", &["toml"])
+                .save_file()
+                .await
+                .map(move |handle| (profile_id, handle.path().to_path_buf()))
+        },
+        |result: Option<(String, std::path::PathBuf)>| Message::ProfileExportPicked(result),
+    )
+}

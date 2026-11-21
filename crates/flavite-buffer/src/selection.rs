@@ -15,11 +15,54 @@
 //! - Never empty; at most [`MAX_SELECTIONS`] members; endpoints validated
 //!   against the current text (bounds + extended-grapheme boundaries).
 
+use crate::chunks::DocumentText;
 use flavite_syntax::text::{TextByte, next_grapheme_boundary, prev_grapheme_boundary};
 use std::collections::HashMap;
 
 /// Maximum number of members in one canonical selection set (D-4).
 pub const MAX_SELECTIONS: usize = 10_000;
+
+/// Probe window (bytes) around an endpoint for grapheme-boundary checks on
+/// a [`DocumentText`] (RFC-0011 S4). The boundary verdict depends only on
+/// the extended grapheme cluster containing the endpoint; any realistic
+/// cluster (emoji ZWJ runs, flags, combining marks) is a few bytes to a
+/// few dozen bytes, so a 4 KiB margin covers every realistic document. A
+/// cluster larger than the margin (pathological — thousands of consecutive
+/// ZWJ-joined graphemes) can make the probe report a boundary where the
+/// full-text scanner would not; this is documented as the probe's bound.
+pub const DOCUMENT_PROBE_MARGIN: usize = 4096;
+
+/// Windowed mirror of [`is_grapheme_boundary`] for a [`DocumentText`]:
+/// probes a bounded neighborhood instead of requiring a contiguous full-text
+/// `&str`. Results equal the full-text answer when the cluster containing
+/// `at` fits inside the probe window (true for all realistic documents).
+#[must_use]
+pub fn is_grapheme_boundary_document(text: &DocumentText, at: usize) -> bool {
+    if at > text.len() {
+        return false;
+    }
+    if at == 0 || at == text.len() {
+        return true;
+    }
+    if !text.is_char_boundary(at) {
+        return false;
+    }
+    // Snap the probe edges to char boundaries so `slice` is safe.
+    let mut lo = at.saturating_sub(DOCUMENT_PROBE_MARGIN);
+    let mut hi = (at + DOCUMENT_PROBE_MARGIN).min(text.len());
+    while lo > 0 && !text.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    while hi < text.len() && !text.is_char_boundary(hi) {
+        hi += 1;
+    }
+    let window = text.slice(lo..hi);
+    let local = at - lo;
+    let mut cursor = unicode_segmentation::GraphemeCursor::new(local, window.len(), true);
+    cursor
+        .is_boundary(&window, 0)
+        .expect("complete window supplies grapheme context")
+}
 
 /// A stable identity within one view's set. Deterministic under
 /// normalization: a merged survivor keeps the earliest id of its members.
@@ -297,6 +340,64 @@ impl SelectionSet {
         Self::canonicalize(seen, primary_hint)
     }
 
+    /// Mirror of [`SelectionSet::normalize`] for a [`DocumentText`] (RFC-0011
+    /// S4): identical validation and canonicalization, with the grapheme
+    /// boundary check served by the windowed [`is_grapheme_boundary_document`]
+    /// probe instead of a contiguous full-text `&str`. Used by the widget's
+    /// revision-change clamp when no materialized copy exists (plain-mode /
+    /// huge documents) — the cost is O(#candidates × probe), never O(document).
+    pub fn normalize_document(
+        text: &DocumentText,
+        candidates: Vec<RawSelection>,
+        primary_hint: Option<u32>,
+    ) -> Result<(Self, IdRemap), SetError> {
+        if candidates.is_empty() {
+            return Err(SetError::Empty);
+        }
+        if candidates.len() > MAX_SELECTIONS {
+            return Err(SetError::TooMany {
+                observed: candidates.len(),
+            });
+        }
+        let mut seen = Vec::with_capacity(candidates.len());
+        let mut assigned_ids = HashMap::with_capacity(candidates.len());
+        let reserved: std::collections::HashSet<_> = candidates
+            .iter()
+            .filter_map(|candidate| candidate.id)
+            .collect();
+        let max_existing = reserved.iter().copied().max().unwrap_or(0);
+        let mut synthetic_next = max_existing.checked_add(1).unwrap_or(1);
+        for candidate in candidates {
+            for endpoint in [candidate.anchor, candidate.head] {
+                if endpoint > text.len() {
+                    return Err(SetError::OutOfBounds { at: endpoint });
+                }
+                if !is_grapheme_boundary_document(text, endpoint) {
+                    return Err(SetError::NotGraphemeBoundary { at: endpoint });
+                }
+            }
+            let id = match candidate.id {
+                Some(id) if !assigned_ids.contains_key(&id) => {
+                    assigned_ids.insert(id, id);
+                    id
+                }
+                Some(_) | None => {
+                    while reserved.contains(&synthetic_next)
+                        || assigned_ids.contains_key(&synthetic_next)
+                    {
+                        synthetic_next = synthetic_next.checked_add(1).unwrap_or(0);
+                    }
+                    let id = synthetic_next;
+                    assigned_ids.insert(id, id);
+                    synthetic_next = synthetic_next.checked_add(1).unwrap_or(0);
+                    id
+                }
+            };
+            seen.push((id, candidate.anchor, candidate.head));
+        }
+        Self::canonicalize(seen, primary_hint)
+    }
+
     /// Edits can join graphemes across a former boundary. Trusted mapped
     /// endpoints round outwards against the after-text; carets stick right.
     /// Untrusted incoming sets continue to use strict `normalize`.
@@ -343,6 +444,16 @@ impl SelectionSet {
             }
         }
         Self::normalize(text, candidates, primary_hint)
+    }
+
+    /// Geometry-only canonicalization for validation paths that already have
+    /// bounds/grapheme-checked endpoints (RFC-0011 S2). Mirrors the private
+    /// `canonicalize` used by `normalize`.
+    pub(crate) fn canonicalize_members(
+        candidates: Vec<(u32, usize, usize)>,
+        primary_hint: Option<u32>,
+    ) -> Result<(Self, IdRemap), SetError> {
+        Self::canonicalize(candidates, primary_hint)
     }
 
     /// The pure span algebra: sort, merge, absorb, assign the primary.
@@ -1055,19 +1166,34 @@ pub fn find_char(
     target: char,
     extend: bool,
 ) -> Result<SelectionSet, FindCharError> {
+    find_char_with_count(text, set, forward, target, extend, 1)
+}
+
+/// Find the Nth occurrence of a character (FEUX-0004 X06, E-4 §5.3).
+/// If count is 1, this is equivalent to find_char (first occurrence).
+/// For count > 1, finds the count-th occurrence in the direction.
+pub fn find_char_with_count(
+    text: &str,
+    set: &SelectionSet,
+    forward: bool,
+    target: char,
+    extend: bool,
+    count: u32,
+) -> Result<SelectionSet, FindCharError> {
     set.validate_against(text)?;
     let mut candidates = Vec::with_capacity(set.len());
     for member in set.iter() {
         let head = member.head();
         let found = if forward {
-            // Search strictly after the grapheme at the head.
+            // Search for the count-th occurrence starting from the head
             let from =
                 flavite_syntax::text::next_grapheme_boundary(text, TextByte(head.min(text.len())))
                     .0;
-            text[from..].find(target).map(|at| from + at)
+            find_nth_char(text, from, target, count, true)
         } else {
+            // Search backward for the count-th occurrence
             let until = head.min(text.len());
-            text[..until].rfind(target)
+            find_nth_char(text, until, target, count, false)
         };
         let Some(at) = found else {
             return Err(FindCharError::NotFound);
@@ -1082,6 +1208,55 @@ pub fn find_char(
     let hint = set.primary_id();
     let (found, _) = normalize_with_hint_fallback(text, candidates, hint)?;
     Ok(found)
+}
+
+/// Helper function to find the nth occurrence of a character in text.
+/// If forward is true, searches forward from start_pos.
+/// If forward is false, searches backward from start_pos.
+fn find_nth_char(
+    text: &str,
+    start_pos: usize,
+    target: char,
+    count: u32,
+    forward: bool,
+) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let mut found_count = 0u32;
+
+    if forward {
+        // Search forward
+        let mut pos = start_pos;
+        while let Some(idx) = text[pos..].find(target) {
+            found_count += 1;
+            if found_count == count {
+                return Some(pos + idx);
+            }
+            pos += idx + target.len_utf8();
+        }
+    } else {
+        // Search backward
+        let text_before = &text[..start_pos];
+        let chars: Vec<_> = text_before.chars().collect();
+
+        for (i, c) in chars.iter().enumerate().rev() {
+            if *c == target {
+                found_count += 1;
+                if found_count == count {
+                    // Calculate the byte position from the index
+                    return Some(
+                        text_before
+                            .char_indices()
+                            .nth(i)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0),
+                    );
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Expand `(start, end)` outward to the containing extended-grapheme
@@ -1165,6 +1340,71 @@ pub fn split_gaps(text: &str, spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
     gaps
 }
 
+/// The gaps *within* each member between consecutive matches fully contained
+/// in that member (FEUX-0006 E-2 `S` in-selections): per member, the leading
+/// gap (start → first match) and trailing gap (last match → end) are included
+/// iff non-empty; a member with **no** matches contributes its whole span
+/// (Kakoune semantics — `S` on unmatched text keeps it); zero-width matches
+/// collapse to a boundary and adjacent zero-width matches collapse to one
+/// boundary (delivered rule).
+///
+/// `matches` MUST be ascending and non-overlapping and fully contained in
+/// some member (the scoped matcher's guarantee); `members` MUST be sorted
+/// ascending and non-overlapping (a canonical selection set). Matches that
+/// are not fully contained in any member are ignored — edge-straddlers
+/// belong to no member (E-2).
+#[must_use]
+pub fn split_gaps_per_member(
+    text: &str,
+    matches: &[(usize, usize)],
+    members: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut gaps = Vec::new();
+    let mut i = 0usize;
+    for &(member_start, member_end) in members {
+        let member_end = member_end.min(text.len());
+        // Skip matches wholly before this member. A zero-width match exactly
+        // at the member's start is contained (it lies inside [start, end)),
+        // so the skip key is the raw start, not the end.
+        while i < matches.len() && matches[i].0 < member_start {
+            i += 1;
+        }
+        // Collect the contiguous block of matches fully contained here; any
+        // match that overlaps this member but is not fully contained
+        // (edge-straddler) is skipped — matches wholly after the member are
+        // left for their own member.
+        while i < matches.len()
+            && matches[i].0 < member_end
+            && (matches[i].0 < member_start || matches[i].1 > member_end)
+        {
+            i += 1;
+        }
+        let first = i;
+        while i < matches.len() && matches[i].1 <= member_end {
+            i += 1;
+        }
+        let contained = &matches[first..i];
+        if contained.is_empty() {
+            // Unmatched member contributes itself (Kakoune `S` on plain text).
+            if member_start < member_end {
+                gaps.push((member_start, member_end));
+            }
+            continue;
+        }
+        let mut cursor = member_start;
+        for &(start, end) in contained {
+            if start > cursor {
+                gaps.push((cursor, start));
+            }
+            cursor = end.max(cursor);
+        }
+        if cursor < member_end {
+            gaps.push((cursor, member_end));
+        }
+    }
+    gaps
+}
+
 /// The delivered `editor.select_line` range: the line containing `at`
 /// including its line break when one follows.
 #[must_use]
@@ -1199,6 +1439,49 @@ fn normalize_with_hint_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC-0011 S4: `normalize_document` (windowed grapheme probes) decides
+    /// exactly what `normalize` decides on the same candidates — same set,
+    /// same canonical order, same primary, same id remap. Runs on
+    /// grapheme-heavy, CRLF, empty, and document-edge texts.
+    #[test]
+    fn normalize_document_matches_normalize_on_the_str_path() {
+        type RawCandidate = (Option<u32>, usize, usize);
+        let cases: &[(&str, &[RawCandidate])] = &[
+            ("", &[(None, 0, 0)]),
+            ("a🧑🏽‍💻 bc", &[(None, 1, 1), (None, 17, 18)]),
+            ("alpha\r\nbeta", &[(Some(7), 0, 6), (None, 6, 10)]),
+            (
+                "é漢😀\n二行",
+                &[(None, 1, 3), (Some(9), 3, 12), (None, 12, 20)],
+            ),
+            ("one two three", &[(None, 8, 12), (None, 0, 3)]),
+        ];
+        for (text, raw) in cases {
+            let candidates: Vec<RawSelection> = raw
+                .iter()
+                .map(|&(id, anchor, head)| RawSelection { id, anchor, head })
+                .collect();
+            let via_str = SelectionSet::normalize(text, candidates.clone(), None);
+            let doc = crate::chunks::DocumentText::from(*text);
+            let via_doc = SelectionSet::normalize_document(&doc, candidates, None);
+            match (via_str, via_doc) {
+                (Ok((set_str, remap_str)), Ok((set_doc, remap_doc))) => {
+                    assert_eq!(set_doc.members(), set_str.members(), "{text:?}");
+                    assert_eq!(set_doc.primary_id(), set_str.primary_id(), "{text:?}");
+                    assert_eq!(remap_doc, remap_str, "{text:?}");
+                }
+                (Err(err_str), Err(err_doc)) => {
+                    assert_eq!(format!("{err_doc:?}"), format!("{err_str:?}"), "{text:?}");
+                }
+                (str_result, doc_result) => {
+                    panic!(
+                        "normalize/normalize_document diverged on {text:?}: str={str_result:?} doc={doc_result:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn raw(anchor: usize, head: usize) -> RawSelection {
         RawSelection {
@@ -1506,6 +1789,99 @@ mod tests {
         let gaps = split_gaps(text, &spans);
         assert_eq!(gaps.len(), text.len());
         assert!(gaps.iter().all(|&(start, end)| start < end));
+    }
+
+    #[test]
+    fn split_gaps_per_member_keeps_member_edges_and_unmatched_members() {
+        let text = "aa|bb|cc"; // 8 bytes
+        // Members: [0,3), [3,6), [6,8). Matches fully inside members 0 and 2.
+        let matches = [(0, 2), (6, 7)];
+        let members = [(0, 3), (3, 6), (6, 8)];
+        // Member 0: leading gap none, trailing (2,3). Member 1: unmatched →
+        // contributes itself (3,6). Member 2: leading (6,6)? none, trailing (7,8).
+        assert_eq!(
+            split_gaps_per_member(text, &matches, &members),
+            vec![(2, 3), (3, 6), (7, 8)]
+        );
+    }
+
+    #[test]
+    fn split_gaps_per_member_matches_at_edges_and_zero_width_collapse() {
+        let text = "abc"; // 3 bytes
+        // Match ends exactly at member end; match starts exactly at member start.
+        let members = [(0, 3)];
+        assert_eq!(
+            split_gaps_per_member(text, &[(0, 3)], &members),
+            Vec::<(usize, usize)>::new(),
+            "full coverage yields no gaps"
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(1, 2)], &members),
+            vec![(0, 1), (2, 3)]
+        );
+        // Zero-width matches at 1 and 2 form boundaries; adjacent zero-width
+        // matches at the same position (1) collapse to one boundary.
+        assert_eq!(
+            split_gaps_per_member(text, &[(1, 1), (2, 2)], &members),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(1, 1), (1, 1)], &members),
+            vec![(0, 1), (1, 3)]
+        );
+        // A zero-width match exactly at a member bound is contained: it does
+        // not make the member look unmatched.
+        assert_eq!(
+            split_gaps_per_member(text, &[(0, 0)], &members),
+            vec![(0, 3)]
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(3, 3)], &members),
+            vec![(0, 3)]
+        );
+        // A straddler belongs to no member, so every member is unmatched and
+        // contributes itself.
+        assert_eq!(
+            split_gaps_per_member(text, &[(0, 3)], &[(0, 2), (2, 3)]),
+            vec![(0, 2), (2, 3)]
+        );
+        // A match wholly inside a later member is left for that member, never
+        // consumed as a straddler of an earlier member.
+        assert_eq!(
+            split_gaps_per_member(text, &[(2, 3)], &[(0, 2), (2, 3)]),
+            vec![(0, 2)]
+        );
+    }
+
+    #[test]
+    fn split_gaps_per_member_caret_members_and_document_edges() {
+        // A caret member (start == end) contributes nothing and cannot
+        // produce gaps.
+        let text = "abcdef";
+        let members = [(0, 2), (2, 2), (2, 6)];
+        assert_eq!(
+            split_gaps_per_member(text, &[(3, 4)], &members),
+            vec![(0, 2), (2, 3), (4, 6)]
+        );
+        // Members at the document edges: the first member's leading gap and
+        // the last member's trailing gap are bounded by the text.
+        assert_eq!(
+            split_gaps_per_member(text, &[(2, 4)], &[(0, 6)]),
+            vec![(0, 2), (4, 6)]
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(0, 2)], &[(0, 6)]),
+            vec![(2, 6)]
+        );
+        assert_eq!(
+            split_gaps_per_member(text, &[(4, 6)], &[(0, 6)]),
+            vec![(0, 4)]
+        );
+        // A member extending to the end of the text still bounds its gaps.
+        assert_eq!(
+            split_gaps_per_member(text, &[(2, 4)], &[(0, 4), (4, 6)]),
+            vec![(0, 2), (4, 6)]
+        );
     }
 }
 

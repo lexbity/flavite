@@ -167,17 +167,27 @@ impl Vault {
         ensure_flavite_dir(&root)?;
 
         // Journal recovery precedes cache startup: disk is authoritative and
-        // interrupted committed renames roll forward before indexing.
-        let recovery_writer = crate::identity::resolve_data_dir(data_dir.as_deref()).map(|data| {
-            let dir = data
-                .join("flavite")
-                .join("vaults")
-                .join(identity.uuid.to_string())
-                .join("recovery");
-            flavite_buffer::recovery::RecoveryWriter::new(
-                flavite_buffer::recovery::RecoveryConfig::new(identity.uuid.to_string(), dir, 2),
-            )
-        });
+        // interrupted committed renames roll forward before indexing. The
+        // recovery writer lives in the vault (`.flavite/recovery/`; OS-temp
+        // backing for virtual test vaults).
+        let recovery_writer = {
+            let dir = crate::identity::vault_private_backing_dir(
+                &identity.root,
+                identity.uuid,
+                "recovery",
+            );
+            Some(flavite_buffer::recovery::RecoveryWriter::new(
+                flavite_buffer::recovery::RecoveryConfig::new(
+                    identity.uuid.to_string(),
+                    dir,
+                    // RFC-0007 D-13: the vault document's
+                    // `vault.recovery_interval_secs` reaches the recovery
+                    // machinery here (clamped to ≥1s; 2 was the fixed
+                    // historical value).
+                    config.recovery_interval_secs.max(1),
+                ),
+            ))
+        };
         let executor = crate::journal::JournalExecutor::new(&*fs, &root);
         let recovery = if let Some(writer) = &recovery_writer {
             executor.recover_with_buffer_base(|key| {
@@ -250,8 +260,12 @@ impl Vault {
         _config: &VaultConfig,
         generation_signal: Option<flavite_index::GenerationSignal>,
     ) -> Result<IndexActor, OpenVaultError> {
-        let cache_dir =
-            Self::get_cache_dir(identity.uuid)?.join(format!("v{}", flavite_index::SCHEMA_MAJOR));
+        let cache_dir = identity
+            .root
+            .join(".flavite")
+            .join("cache")
+            .join(identity.uuid.to_string())
+            .join(format!("v{}", flavite_index::SCHEMA_MAJOR));
         std::fs::create_dir_all(&cache_dir)
             .map_err(|error| OpenVaultError::Index(error.to_string()))?;
         let db_path = cache_dir.join("index.sqlite3");
@@ -268,20 +282,6 @@ impl Vault {
             None => IndexActor::new(&db_path, flavite_index::pool::DEFAULT_POOL_SIZE),
         };
         actor.map_err(|error| OpenVaultError::Index(error.to_string()))
-    }
-
-    /// Get the cache directory for a vault UUID.
-    fn get_cache_dir(uuid: Uuid) -> Result<PathBuf, OpenVaultError> {
-        use directories::ProjectDirs;
-
-        let cache_dir = ProjectDirs::from("com", "flavite", "Flavite")
-            .ok_or(OpenVaultError::Index(
-                "No cache directory available".to_string(),
-            ))?
-            .cache_dir()
-            .to_path_buf();
-
-        Ok(cache_dir.join("flavite").join(uuid.to_string()))
     }
 
     /// Get the session.
@@ -421,11 +421,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_cache_dir() {
-        let uuid = uuid::Uuid::now_v7();
-        let result = Vault::get_cache_dir(uuid);
-        // Should not panic, result may vary
-        assert!(result.is_ok() || result.is_err());
+    fn cache_dir_is_vault_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join(".flavite").join("cache");
+        assert_eq!(cache.join("v4"), cache.join("v4"));
+        assert!(cache.starts_with(temp.path()));
     }
 
     #[test]

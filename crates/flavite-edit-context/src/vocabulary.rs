@@ -75,10 +75,78 @@ pub enum ContextCommand {
     SelectMatches,
     /// Document-wide gap selection between matches (E-10).
     SplitSelection,
+    /// Filter selections to those containing a match (FEUX-0006 E-4).
+    /// `keep: false` means drop (complement).
+    KeepMatching {
+        keep: bool,
+    },
     LineStart,
     LineEnd,
     DocumentStart,
     DocumentEnd,
+    // FEUX-0004 X05: Repeat last command
+    /// Replay the last recorded command against the current selection set.
+    RepeatLast,
+    // FEUX-0004 X01: Transform family
+    /// Uppercase each character in each selection.
+    CaseUpper,
+    /// Lowercase each character in each selection.
+    CaseLower,
+    /// Swap case of each character in each selection.
+    CaseSwap,
+    /// Title-case each word in each selection (UAX #29 word boundaries).
+    CaseTitle,
+    /// Increment the first number in each selection (leading-zero width preserved).
+    NumberInc,
+    /// Decrement the first number in each selection (leading-zero width preserved).
+    NumberDec,
+    /// Replace each selection's number with its document-order index (1-based).
+    NumberSequence,
+    // FEUX-0006 X03: Regex replace
+    /// Replace text matching a regex pattern across selections.
+    ReplaceRegex,
+    // FEUX-0004 X03: Align command
+    /// Align lines in each selection's containing line block on a literal delimiter.
+    LinesAlign,
+    // FEUX-0004 X03: Goto-line command
+    /// Go to line N (opens draft if no count pending).
+    GotoLine,
+    // FEUX-0004 X01: Lines family
+    /// Sort lines in each selection's containing line block (byte-lexicographic, stable).
+    LinesSortAsc,
+    /// Sort lines in each selection's containing line block (inverse byte-lexicographic, stable).
+    LinesSortDesc,
+    /// Sort lines in each selection's containing line block by numeric value (stable).
+    LinesSortNumeric,
+    /// Join lines in each selection's containing line block (replace newlines with single space).
+    LinesJoin,
+    /// Duplicate each selection's containing line block.
+    LinesDuplicate,
+    /// Remove duplicate lines in each selection's containing line block (byte-exact, first wins).
+    LinesDedupe,
+    /// Shuffle lines in each selection's containing line block (Fisher-Yates, splitmix64 seeded).
+    LinesShuffle,
+    /// Move each selection's containing line block up by one position.
+    LinesMoveUp,
+    /// Move each selection's containing line block down by one position.
+    LinesMoveDown,
+    // FEUX-0004 X04: Surround family
+    /// Add surrounding delimiters to each selection.
+    SurroundAdd,
+    /// Change surrounding delimiters of each selection.
+    SurroundChange,
+    /// Delete surrounding delimiters from each selection.
+    SurroundDelete,
+    // FEUX-0005 X01: Indent family
+    /// Indent each selection's containing line block by one unit.
+    Indent,
+    /// Dedent each selection's containing line block by one unit.
+    Dedent,
+    // FEUX-0005 X02: Whitespace conversion family
+    /// Convert leading tabs to spaces in each selection's containing line block.
+    TabsToSpaces,
+    /// Convert leading spaces to tabs in each selection's containing line block.
+    SpacesToTabs,
 }
 
 impl ContextCommand {
@@ -121,6 +189,41 @@ impl ContextCommand {
         Self::LineEnd,
         Self::DocumentStart,
         Self::DocumentEnd,
+        // FEUX-0004 X05: Repeat last command
+        Self::RepeatLast,
+        // FEUX-0004 X01: Transform family
+        Self::CaseUpper,
+        Self::CaseLower,
+        Self::CaseSwap,
+        Self::CaseTitle,
+        Self::NumberInc,
+        Self::NumberDec,
+        Self::NumberSequence,
+        // FEUX-0006 X03: Regex replace
+        Self::ReplaceRegex,
+        // FEUX-0004 X03: Align and Goto-line
+        Self::LinesAlign,
+        Self::GotoLine,
+        // FEUX-0004 X01: Lines family
+        Self::LinesSortAsc,
+        Self::LinesSortDesc,
+        Self::LinesSortNumeric,
+        Self::LinesJoin,
+        Self::LinesDuplicate,
+        Self::LinesDedupe,
+        Self::LinesShuffle,
+        Self::LinesMoveUp,
+        Self::LinesMoveDown,
+        // FEUX-0004 X04: Surround family
+        Self::SurroundAdd,
+        Self::SurroundChange,
+        Self::SurroundDelete,
+        // FEUX-0005 X01: Indent family
+        Self::Indent,
+        Self::Dedent,
+        // FEUX-0005 X02: Whitespace conversion family
+        Self::TabsToSpaces,
+        Self::SpacesToTabs,
     ];
 
     #[must_use]
@@ -162,11 +265,47 @@ impl ContextCommand {
             Self::InvertSelections => "editor.invert_selections",
             Self::SelectMatches => "editor.select_matches",
             Self::SplitSelection => "editor.split_selection",
+            Self::KeepMatching { .. } => "editor.keep_matching",
             Self::FindChar { .. } => "editor.find_char",
             Self::LineStart => "workspace.caret_start_line",
             Self::LineEnd => "workspace.caret_end_line",
             Self::DocumentStart => "workspace.caret_start",
             Self::DocumentEnd => "workspace.caret_end",
+            // FEUX-0004 X05: Repeat last command
+            Self::RepeatLast => "editor.repeat_last",
+            // FEUX-0004 X01: Transform family
+            Self::CaseUpper => "editor.case_upper",
+            Self::CaseLower => "editor.case_lower",
+            Self::CaseSwap => "editor.case_swap",
+            Self::CaseTitle => "editor.case_title",
+            Self::NumberInc => "editor.number_inc",
+            Self::NumberDec => "editor.number_dec",
+            Self::NumberSequence => "editor.number_sequence",
+            // FEUX-0006 X03: Regex replace
+            Self::ReplaceRegex => "editor.replace_regex",
+            // FEUX-0004 X03: Align and Goto-line
+            Self::LinesAlign => "editor.lines_align",
+            Self::GotoLine => "editor.goto_line",
+            // FEUX-0004 X01: Lines family
+            Self::LinesSortAsc => "editor.lines_sort_asc",
+            Self::LinesSortDesc => "editor.lines_sort_desc",
+            Self::LinesSortNumeric => "editor.lines_sort_numeric",
+            Self::LinesJoin => "editor.lines_join",
+            Self::LinesDuplicate => "editor.lines_duplicate",
+            Self::LinesDedupe => "editor.lines_dedupe",
+            Self::LinesShuffle => "editor.lines_shuffle",
+            Self::LinesMoveUp => "editor.lines_move_up",
+            Self::LinesMoveDown => "editor.lines_move_down",
+            // FEUX-0004 X04: Surround family
+            Self::SurroundAdd => "editor.surround_add",
+            Self::SurroundChange => "editor.surround_change",
+            Self::SurroundDelete => "editor.surround_delete",
+            // FEUX-0005 X01: Indent family
+            Self::Indent => "editor.indent",
+            Self::Dedent => "editor.dedent",
+            // FEUX-0005 X02: Whitespace conversion family
+            Self::TabsToSpaces => "editor.tabs_to_spaces",
+            Self::SpacesToTabs => "editor.spaces_to_tabs",
         }
     }
 
@@ -207,12 +346,49 @@ impl ContextCommand {
             Self::InvertSelections => "Invert selections",
             Self::SelectMatches => "Select matches…",
             Self::SplitSelection => "Split on matches…",
+            Self::KeepMatching { keep: true } => "Keep matching…",
+            Self::KeepMatching { keep: false } => "Drop non-matching…",
             Self::FindChar { forward: true } => "Find character forward",
             Self::FindChar { forward: false } => "Find character backward",
             Self::LineStart => "Line start",
             Self::LineEnd => "Line end",
             Self::DocumentStart => "Document start",
             Self::DocumentEnd => "Document end",
+            // FEUX-0004 X05: Repeat last command
+            Self::RepeatLast => "Repeat last",
+            // FEUX-0004 X01: Transform family
+            Self::CaseUpper => "Uppercase",
+            Self::CaseLower => "Lowercase",
+            Self::CaseSwap => "Swap case",
+            Self::CaseTitle => "Title case",
+            Self::NumberInc => "Increment number",
+            Self::NumberDec => "Decrement number",
+            Self::NumberSequence => "Number sequence",
+            // FEUX-0006 X03: Regex replace
+            Self::ReplaceRegex => "Replace with regex…",
+            // FEUX-0004 X03: Align and Goto-line
+            Self::LinesAlign => "Align lines",
+            Self::GotoLine => "Go to line…",
+            // FEUX-0004 X01: Lines family
+            Self::LinesSortAsc => "Sort lines ascending",
+            Self::LinesSortDesc => "Sort lines descending",
+            Self::LinesSortNumeric => "Sort lines numeric",
+            Self::LinesJoin => "Join lines",
+            Self::LinesDuplicate => "Duplicate lines",
+            Self::LinesDedupe => "Deduplicate lines",
+            Self::LinesShuffle => "Shuffle lines",
+            Self::LinesMoveUp => "Move lines up",
+            Self::LinesMoveDown => "Move lines down",
+            // FEUX-0004 X04: Surround family
+            Self::SurroundAdd => "Surround add",
+            Self::SurroundChange => "Surround change",
+            Self::SurroundDelete => "Surround delete",
+            // FEUX-0005 X01: Indent family
+            Self::Indent => "Indent",
+            Self::Dedent => "Dedent",
+            // FEUX-0005 X02: Whitespace conversion family
+            Self::TabsToSpaces => "Tabs → Spaces",
+            Self::SpacesToTabs => "Spaces → Tabs",
         }
     }
 
@@ -228,6 +404,41 @@ impl ContextCommand {
                 | Self::OpenBelow
                 | Self::Change
                 | Self::Delete
+                // FEUX-0004 X01: Transform family - all mutate
+                | Self::CaseUpper
+                | Self::CaseLower
+                | Self::CaseSwap
+                | Self::CaseTitle
+                | Self::NumberInc
+                | Self::NumberDec
+                | Self::NumberSequence
+                // FEUX-0006 X03: Regex replace mutates
+                | Self::ReplaceRegex
+                // FEUX-0004 X03: Align mutates
+                | Self::LinesAlign
+                // FEUX-0004 X03: GotoLine does NOT mutate (selection-only)
+                // FEUX-0004 X01: Lines family - all mutate
+                | Self::LinesSortAsc
+                | Self::LinesSortDesc
+                | Self::LinesSortNumeric
+                | Self::LinesJoin
+                | Self::LinesDuplicate
+                | Self::LinesDedupe
+                | Self::LinesShuffle
+                | Self::LinesMoveUp
+                | Self::LinesMoveDown
+                // FEUX-0004 X04: Surround family - all mutate
+                | Self::SurroundAdd
+                | Self::SurroundChange
+                | Self::SurroundDelete
+                // FEUX-0005 X01: Indent family - all mutate
+                | Self::Indent
+                | Self::Dedent
+                // FEUX-0005 X02: Whitespace conversion family - all mutate
+                | Self::TabsToSpaces
+                | Self::SpacesToTabs
+                // FEUX-0004 X05: RepeatLast may mutate (replays a command that may mutate)
+                | Self::RepeatLast
         )
     }
 
@@ -244,65 +455,31 @@ impl ContextCommand {
                 | Self::Change
         )
     }
-
-    /// Physical-position hints; no guessed active-layout glyph is shown.
-    #[must_use]
-    pub const fn hint(self) -> &'static str {
-        match self {
-            Self::Cut => "Shift+KeyD",
-            Self::Copy => "KeyY",
-            Self::Paste => "KeyP",
-            Self::Undo => "KeyU",
-            Self::Redo => "Shift+KeyU",
-            Self::Commands => "Shift+Semicolon",
-            Self::Find => "Slash",
-            Self::Replace => "Shift+Slash",
-            Self::InsertStart => "KeyI",
-            Self::InsertEnd => "KeyA",
-            Self::InsertLineStart => "Shift+KeyI",
-            Self::InsertLineEnd => "Shift+KeyA",
-            Self::OpenAbove => "Shift+KeyO",
-            Self::OpenBelow => "KeyO",
-            Self::Change => "KeyC",
-            Self::Delete => "KeyD",
-            Self::SelectLine => "KeyX",
-            Self::Collapse => "Semicolon",
-            Self::FindChar { forward: true } => "KeyF",
-            Self::FindChar { forward: false } => "Shift+KeyF",
-            _ => "",
-        }
-    }
 }
 
 /// A toolbar menu is a flat list; commands are not duplicated as aliases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContextMenu {
     Select,
     Go,
-    Type,
     More,
+    // FEUX-0004 X01: new menus
+    Transform,
+    Lines,
+    // FEUX-0004 X04: Surround menu
+    Surround,
 }
 
 impl ContextMenu {
-    #[must_use]
-    pub const fn hint(self, command: ContextCommand) -> &'static str {
-        match (self, command) {
-            (Self::Select, ContextCommand::SelectWord) => "KeyW",
-            (Self::Select, ContextCommand::SelectAll) => "KeyA",
-            (Self::Go, ContextCommand::LineStart) => "KeyH",
-            (Self::Go, ContextCommand::LineEnd) => "KeyE",
-            (Self::Go, ContextCommand::DocumentStart) => "KeyT",
-            (Self::Go, ContextCommand::DocumentEnd) => "KeyB",
-            _ => command.hint(),
-        }
-    }
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
             Self::Select => "Select",
             Self::Go => "Go",
-            Self::Type => "Type",
             Self::More => "More",
+            Self::Transform => "Transform",
+            Self::Lines => "Lines",
+            Self::Surround => "Surround",
         }
     }
 
@@ -325,16 +502,15 @@ impl ContextMenu {
                 C::InvertSelections,
                 C::SelectMatches,
                 C::SplitSelection,
+                C::KeepMatching { keep: true },
+                C::KeepMatching { keep: false },
             ],
-            Self::Go => &[C::LineStart, C::LineEnd, C::DocumentStart, C::DocumentEnd],
-            Self::Type => &[
-                C::InsertStart,
-                C::InsertEnd,
-                C::InsertLineStart,
-                C::InsertLineEnd,
-                C::OpenAbove,
-                C::OpenBelow,
-                C::Change,
+            Self::Go => &[
+                C::LineStart,
+                C::LineEnd,
+                C::DocumentStart,
+                C::DocumentEnd,
+                C::GotoLine,
             ],
             Self::More => &[
                 C::Cut,
@@ -373,6 +549,36 @@ impl ContextMenu {
                 C::Commands,
                 C::History,
             ],
+            // FEUX-0004 X01: Transform menu
+            Self::Transform => &[
+                C::CaseUpper,
+                C::CaseLower,
+                C::CaseSwap,
+                C::CaseTitle,
+                C::NumberInc,
+                C::NumberDec,
+                C::NumberSequence,
+                // FEUX-0005 X02: Whitespace conversion
+                C::TabsToSpaces,
+                C::SpacesToTabs,
+                // FEUX-0006 X03: Regex replace
+                C::ReplaceRegex,
+            ],
+            // FEUX-0004 X01/X03: Lines menu
+            Self::Lines => &[
+                C::LinesSortAsc,
+                C::LinesSortDesc,
+                C::LinesSortNumeric,
+                C::LinesJoin,
+                C::LinesDuplicate,
+                C::LinesDedupe,
+                C::LinesShuffle,
+                C::LinesMoveUp,
+                C::LinesMoveDown,
+                C::LinesAlign,
+            ],
+            // FEUX-0004 X04: Surround menu (E-2)
+            Self::Surround => &[C::SurroundAdd, C::SurroundChange, C::SurroundDelete],
         }
     }
 }

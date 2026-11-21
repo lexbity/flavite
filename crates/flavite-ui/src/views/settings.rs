@@ -222,6 +222,9 @@ pub fn view(app: &App, tab: TabId) -> Element<'_, Message> {
         );
     }
 
+    // FEUX-0003 X07: Profiles section
+    body = body.push(profiles_section(app, metrics));
+
     container(
         column![
             row![
@@ -571,7 +574,13 @@ fn control<'a>(
         // The dynamic kinds get dedicated sections: options resolved from
         // the theme store and the host chord catalog respectively (D-04).
         SettingKind::ThemePackage => theme_package_section(app, metrics, tab),
-        SettingKind::ShortcutMap => shortcut_section(app, metrics),
+        SettingKind::ShortcutMap => {
+            if descriptor.id == "shortcuts.context_keys" {
+                context_keys_section(app, metrics)
+            } else {
+                shortcut_section(app, metrics)
+            }
+        }
     }
 }
 
@@ -603,15 +612,24 @@ fn chord_label(app: &App, id: &str) -> String {
 
 /// One shortcut-editor row: the command id, its effective chord, a
 /// capture button, and a reset button when overridden (the dialog-era
-/// capture state machine, now tab-scoped state).
+/// capture state machine, now tab-scoped state). Chordless commands
+/// (FEUX-0003 E-15) render as `unbound` rows with the same capture flow.
 #[allow(clippy::too_many_lines)]
 fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Element<'a, Message> {
     let mut section = column![].spacing(2);
-    for (id, _) in crate::host::commands::DEFAULT_CHORDS {
-        let capturing = app.settings.capture.as_deref() == Some(*id);
-        let overridden = app.appearance.shortcut_overrides().contains_key(*id);
+    let shortcut_ids: Vec<&str> = crate::host::commands::DEFAULT_CHORDS
+        .iter()
+        .map(|(id, _)| *id)
+        .chain(crate::host::commands::CHORDLESS_COMMANDS.iter().copied())
+        .collect();
+    for id in shortcut_ids {
+        let capturing = matches!(
+            app.settings.capture.as_ref(),
+            Some(crate::host::settings::CaptureRequest::Chord(c)) if c == id
+        );
+        let overridden = app.appearance.shortcut_overrides().contains_key(id);
         let mut row = row![
-            text((*id).to_owned()).size(metrics.text_sm),
+            text(id.to_owned()).size(metrics.text_sm),
             text(chord_label(app, id)).size(metrics.text),
         ]
         .spacing(metrics.spacing_sm)
@@ -621,7 +639,7 @@ fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Elemen
                 .padding(tab_strip::chip_padding())
                 .style(action_or_ghost(capturing))
                 .on_press(Message::Settings(SettingsMessage::BeginShortcutCapture {
-                    command: (*id).to_owned(),
+                    command: id.to_owned(),
                 })),
         );
         if overridden {
@@ -629,7 +647,7 @@ fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Elemen
                 button(text("Reset").size(metrics.text_sm))
                     .padding(tab_strip::chip_padding())
                     .style(style::ghost())
-                    .on_press(app.reset_shortcut_message((*id).to_owned())),
+                    .on_press(app.reset_shortcut_message(id.to_owned())),
             );
         }
         section = section.push(row);
@@ -647,6 +665,234 @@ fn shortcut_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Elemen
                 .style(style::dim_text),
         );
     }
+    section.into()
+}
+
+/// The Context Mode keys section: per-binding capture for physical position tokens.
+#[allow(clippy::too_many_lines)]
+fn context_keys_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Element<'a, Message> {
+    use flavite_edit_context::keymap::ContextKeymap;
+
+    let mut section = column![].spacing(2);
+    let binding_ids = ContextKeymap::default_binding_ids();
+
+    for id in binding_ids {
+        let capturing = matches!(
+            app.settings.capture.as_ref(),
+            Some(crate::host::settings::CaptureRequest::ContextKey(b)) if b == id
+        );
+        let overridden = app.appearance.context_key_overrides().contains_key(id);
+        let label = app.appearance.context_label(id);
+
+        let mut row = row![
+            text(id.to_owned()).size(metrics.text_sm),
+            text(label).size(metrics.text),
+        ]
+        .spacing(metrics.spacing_sm)
+        .align_y(iced::alignment::Vertical::Center);
+
+        row = row.push(
+            button(
+                text(if capturing {
+                    "Press key…".to_string()
+                } else {
+                    "Change".to_string()
+                })
+                .size(metrics.text_sm),
+            )
+            .padding(tab_strip::chip_padding())
+            .style(action_or_ghost(capturing))
+            .on_press(Message::Settings(SettingsMessage::BeginContextKeyCapture {
+                binding_id: id.to_owned(),
+            })),
+        );
+
+        if overridden {
+            row = row.push(
+                button(text("Reset").size(metrics.text_sm))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::ghost())
+                    .on_press(app.set_context_key_message(id.to_owned(), None)),
+            );
+        }
+
+        // Add Unbind button for all bindings
+        row = row.push(
+            button(text("Unbind").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(app.unbind_context_key_message(id.to_owned())),
+        );
+
+        section = section.push(row);
+    }
+
+    section = section.push(
+        button(text("Restore default context keys").size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(app.restore_context_keys_message()),
+    );
+
+    if let Some(error) = &app.appearance.keymap_error {
+        section = section.push(
+            text(error.clone())
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    }
+
+    section.into()
+}
+
+/// FEUX-0003 X07: The profiles section: list, create, import, export, apply, delete.
+#[allow(clippy::too_many_lines)]
+fn profiles_section<'a>(app: &'a App, metrics: &crate::style::Metrics) -> Element<'a, Message> {
+    let mut section = column![
+        text("Profiles").size(metrics.text_lg),
+        text("Named, shareable settings collections. Captured from current settings; applied through the existing funnel.")
+            .size(metrics.text_sm)
+            .style(style::dim_text),
+    ]
+    .spacing(metrics.spacing_sm);
+
+    // List of profiles
+    let profiles = &app.settings.profiles;
+    if profiles.is_empty() {
+        section = section.push(
+            text("No profiles yet. Create one from your current settings.")
+                .size(metrics.text_sm)
+                .style(style::dim_text),
+        );
+    } else {
+        let mut profiles_list = column![].spacing(metrics.spacing_sm);
+        for profile in profiles {
+            let mut row = row![
+                text(profile.name().to_string()).size(metrics.text),
+                text(format!("({} bytes)", profile.bytes.len()))
+                    .size(metrics.text_sm)
+                    .style(style::dim_text),
+            ]
+            .spacing(metrics.spacing_sm)
+            .align_y(iced::alignment::Vertical::Center);
+
+            // Apply button
+            row = row.push(
+                button(text("Apply").size(metrics.text_sm))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::ghost())
+                    .on_press(Message::Settings(SettingsMessage::ProfilesApply {
+                        id: profile.id.id.clone(),
+                    })),
+            );
+
+            // Export button
+            row = row.push(
+                button(text("Export").size(metrics.text_sm))
+                    .padding(tab_strip::chip_padding())
+                    .style(style::ghost())
+                    .on_press(Message::Settings(SettingsMessage::ProfilesExportPick {
+                        id: profile.id.id.clone(),
+                    })),
+            );
+
+            // Delete button
+            let deleting = app.settings.pending_profile_delete.as_deref() == Some(&profile.id.id);
+            if deleting {
+                row = row.push(
+                    text("Delete this profile?")
+                        .size(metrics.text_sm)
+                        .style(style::dim_text),
+                );
+                row = row.push(
+                    button(text("Confirm").size(metrics.text_sm))
+                        .padding(tab_strip::chip_padding())
+                        .style(style::action())
+                        .on_press(Message::Settings(SettingsMessage::ProfilesDeleteConfirm {
+                            id: profile.id.id.clone(),
+                        })),
+                );
+                row = row.push(
+                    button(text("Cancel").size(metrics.text_sm))
+                        .padding(tab_strip::chip_padding())
+                        .style(style::ghost())
+                        .on_press(Message::Settings(SettingsMessage::ProfilesDeleteCancel)),
+                );
+            } else {
+                row = row.push(
+                    button(text("Delete").size(metrics.text_sm))
+                        .padding(tab_strip::chip_padding())
+                        .style(style::ghost())
+                        .on_press(Message::Settings(SettingsMessage::ProfilesDeleteAsk {
+                            id: profile.id.id.clone(),
+                        })),
+                );
+            }
+
+            profiles_list = profiles_list.push(row);
+        }
+        section = section.push(profiles_list);
+    }
+
+    // Action buttons
+    let mut actions = row![].spacing(metrics.spacing_sm);
+
+    // Create from current
+    actions = actions.push(
+        button(text("Create from current…").size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(Message::Settings(SettingsMessage::ProfilesCreate {
+                name: "New Profile".to_string(),
+            })),
+    );
+
+    // Import
+    actions = actions.push(
+        button(text("Import profile…").size(metrics.text_sm))
+            .padding(tab_strip::chip_padding())
+            .style(style::ghost())
+            .on_press(Message::Settings(SettingsMessage::ProfilesImportPick)),
+    );
+
+    // Restore backup
+    if app.settings.backup_available {
+        actions = actions.push(
+            button(text("Restore last settings backup").size(metrics.text_sm))
+                .padding(tab_strip::chip_padding())
+                .style(style::ghost())
+                .on_press(Message::Settings(SettingsMessage::RestoreBackupShortcut)),
+        );
+    }
+
+    section = section.push(actions);
+
+    // Last apply result
+    if let Some(result) = &app.settings.last_apply_result {
+        section = section.push(
+            text(format!(
+                "Applied: {} settings changed, {} pending restart",
+                result.changed, result.restart_pending
+            ))
+            .size(metrics.text_sm)
+            .style(style::dim_text),
+        );
+    }
+
+    // Profile name input for creation (when creating)
+    if !app.settings.profile_name_draft.is_empty() {
+        section = section.push(
+            text_input("Profile name", &app.settings.profile_name_draft)
+                .size(metrics.text_sm)
+                .on_input(|value| {
+                    Message::Settings(SettingsMessage::ProfilesCreateName { name: value })
+                })
+                .on_submit(Message::Settings(SettingsMessage::ProfilesCreate {
+                    name: app.settings.profile_name_draft.clone(),
+                })),
+        );
+    }
+
     section.into()
 }
 

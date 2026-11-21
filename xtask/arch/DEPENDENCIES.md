@@ -70,7 +70,7 @@ Normal/build:
 - `blake3` (normal)
 - `flavite-encoding` (normal)
 - `flavite-syntax` (normal)
-- `ropey` (normal)
+- `tracing` (normal)
 
 ### `flavite-cli`
 
@@ -80,6 +80,10 @@ Normal/build:
 - `flavite-api` (normal)
 - `flavite-settings` (normal)
 - `tracing` (normal)
+
+Dev-only:
+
+- `zip`
 
 ### `flavite-edit-context`
 
@@ -99,6 +103,7 @@ Normal/build:
 - `flavite-syntax` (normal)
 - `iced` (normal)
 - `nucleo-matcher` (normal)
+- `tracing` (normal)
 
 Dev-only:
 
@@ -151,7 +156,6 @@ Normal/build:
 
 - `flavite-encoding` (normal)
 - `pulldown-cmark` (normal)
-- `tree-sitter` (normal)
 
 ### `flavite-text-search`
 
@@ -190,6 +194,7 @@ Normal/build:
 - `iced` (normal)
 - `iced_winit` (normal)
 - `nucleo` (normal)
+- `tracing` (normal)
 
 Dev-only:
 
@@ -247,13 +252,11 @@ Normal/build:
 - `nucleo` ← flavite-ui
 - `nucleo-matcher` ← flavite-editor
 - `pulldown-cmark` ← flavite-index, flavite-syntax
-- `ropey` ← flavite-buffer
 - `rusqlite` ← flavite-api, flavite-index, xtask
 - `similar` ← flavite-vault
 - `tantivy` ← flavite-index, xtask
-- `tracing` ← flavite-api, flavite-cli, flavite-index, flavite-vault
-- `tree-sitter` ← flavite-syntax
-- `zip` ← flavite-api, flavite-theme, flavite-ui
+- `tracing` ← flavite-api, flavite-buffer, flavite-cli, flavite-editor, flavite-index, flavite-ui, flavite-vault
+- `zip` ← flavite-api, flavite-cli, flavite-theme, flavite-ui
 - `zstd` ← flavite-vault
 
 ## Layering rules (§10.2)
@@ -276,6 +279,4 @@ Temporary floor waivers (must have a valid expiry and reason):
 
 | Crate | Temporary floor | Expires | Reason |
 |---|---:|---|---|
-| flavite-fs | 86.8% | 2026-11-30 | Platform-specific filesystem failure branches remain uncovered in the Linux report; add portable FaultFs cases before expiry. |
-| flavite-index | 87.5% | 2026-11-30 | Index actor error and cache-recovery branches remain uncovered; raise the floor after the next index fault-path test slice. |
 | flavite-vault | 84.4% | 2026-11-30 | Actor shutdown and uncommon journal-recovery branches remain uncovered; add deterministic fault cases before expiry. |

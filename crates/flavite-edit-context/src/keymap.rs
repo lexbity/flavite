@@ -1,0 +1,1399 @@
+//! Context Mode's data-driven keymap: binding slots, default bindings, override resolution,
+//! and validation (FEUX-0003 X01-X02).
+//!
+//! The compiled-in default `ContextKeymap` IS the source of truth for Context Mode
+//! key bindings, replacing the former hard-coded grammar.rs match statements.
+//! This module provides the data foundation for rebindable Context Mode accelerators.
+
+use crate::key::{KeyCode, Motion};
+use crate::vocabulary::{ContextCommand, ContextMenu};
+use std::collections::HashMap;
+
+/// Check if a position is a digit (grammar-owned, cannot be bound).
+/// FEUX-0004 E-4.
+#[must_use]
+fn is_digit_position(position: KeyCode) -> bool {
+    matches!(
+        position,
+        KeyCode::Digit0
+            | KeyCode::Digit1
+            | KeyCode::Digit2
+            | KeyCode::Digit3
+            | KeyCode::Digit4
+            | KeyCode::Digit5
+            | KeyCode::Digit6
+            | KeyCode::Digit7
+            | KeyCode::Digit8
+            | KeyCode::Digit9
+    )
+}
+
+/// A physical binding slot: a position with an optional Shift modifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Slot {
+    pub position: KeyCode,
+    pub shift: bool,
+}
+
+impl Slot {
+    /// Create a bare (non-shifted) slot.
+    #[must_use]
+    pub const fn bare(position: KeyCode) -> Self {
+        Self {
+            position,
+            shift: false,
+        }
+    }
+
+    /// Create a shifted slot.
+    #[must_use]
+    pub const fn shifted(position: KeyCode) -> Self {
+        Self {
+            position,
+            shift: true,
+        }
+    }
+}
+
+/// A binding identifier: every bindable entity in Context Mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingId {
+    /// A command from the vocabulary (uses canonical id).
+    Command(ContextCommand),
+    /// `FindChar` with direction (synthetic id: `editor.find_char.forward`/`editor.find_char.backward`).
+    FindChar { forward: bool },
+    /// A motion (synthetic id: `editor.motion.<name>`).
+    Motion(Motion),
+    /// A menu opener (synthetic id: `editor.menu_select`/`editor.menu_go`).
+    MenuOpener(ContextMenu),
+}
+
+impl BindingId {
+    /// Returns the string identifier for this binding.
+    #[must_use]
+    pub fn id(&self) -> &'static str {
+        match self {
+            BindingId::Command(c) => c.id(),
+            BindingId::FindChar { forward } => {
+                if *forward {
+                    "editor.find_char.forward"
+                } else {
+                    "editor.find_char.backward"
+                }
+            }
+            BindingId::Motion(m) => m.id(),
+            BindingId::MenuOpener(menu) => match menu {
+                ContextMenu::Select => "editor.menu_select",
+                ContextMenu::Go => "editor.menu_go",
+                ContextMenu::More => "editor.menu_more",
+                ContextMenu::Transform => "editor.menu_transform",
+                ContextMenu::Lines => "editor.menu_lines",
+                ContextMenu::Surround => "editor.menu_surround",
+            },
+        }
+    }
+
+    /// Parse a binding id string into a `BindingId`.
+    #[must_use]
+    pub fn parse(id: &str) -> Option<Self> {
+        // Try exact matches with command ids first
+        for cmd in ContextCommand::ALL {
+            if cmd.id() == id {
+                return Some(BindingId::Command(*cmd));
+            }
+        }
+
+        // Try synthetic ids
+        match id {
+            "editor.find_char.forward" => Some(BindingId::FindChar { forward: true }),
+            "editor.find_char.backward" => Some(BindingId::FindChar { forward: false }),
+            "editor.motion.previous" => Some(BindingId::Motion(Motion::Previous)),
+            "editor.motion.next" => Some(BindingId::Motion(Motion::Next)),
+            "editor.motion.up" => Some(BindingId::Motion(Motion::Up)),
+            "editor.motion.down" => Some(BindingId::Motion(Motion::Down)),
+            "editor.motion.next_word" => Some(BindingId::Motion(Motion::NextWord)),
+            "editor.motion.previous_word" => Some(BindingId::Motion(Motion::PreviousWord)),
+            "editor.motion.next_word_end" => Some(BindingId::Motion(Motion::NextWordEnd)),
+            "editor.menu_select" => Some(BindingId::MenuOpener(ContextMenu::Select)),
+            "editor.menu_go" => Some(BindingId::MenuOpener(ContextMenu::Go)),
+            "editor.menu_more" => Some(BindingId::MenuOpener(ContextMenu::More)),
+            "editor.menu_transform" => Some(BindingId::MenuOpener(ContextMenu::Transform)),
+            "editor.menu_lines" => Some(BindingId::MenuOpener(ContextMenu::Lines)),
+            "editor.menu_surround" => Some(BindingId::MenuOpener(ContextMenu::Surround)),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a motion binding (which must be bare per Rule X).
+    #[must_use]
+    pub fn is_motion(&self) -> bool {
+        matches!(self, BindingId::Motion(_))
+    }
+
+    /// Check if this is a menu opener binding (which must be bare per Rule X).
+    #[must_use]
+    pub fn is_menu_opener(&self) -> bool {
+        matches!(self, BindingId::MenuOpener(_))
+    }
+
+    /// Check if this binding also appears as a menu accelerator in the
+    /// default tables (which must be bare per Rule X §4).
+    #[must_use]
+    pub fn is_menu_accelerator(&self) -> bool {
+        match self {
+            BindingId::Command(command) => DEFAULT_MENUS
+                .iter()
+                .any(|(_, bid, _)| matches!(bid, BindingId::Command(menu_command) if menu_command == command)),
+            _ => false,
+        }
+    }
+}
+
+/// A binding token: physical position + optional shift, or the unbound sentinel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingToken {
+    /// A physical position slot.
+    Position(Slot),
+    /// The unbound sentinel (removes the default binding).
+    Unbound,
+}
+
+impl BindingToken {
+    /// Parse a token string into a `BindingToken`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        if text == "unbound" {
+            return Some(BindingToken::Unbound);
+        }
+
+        // Parse position token: ["shift+"]"physical:"<POSITION>
+        let (has_shift, rest) = if let Some(stripped) = text.strip_prefix("shift+") {
+            (true, stripped)
+        } else {
+            (false, text)
+        };
+
+        let (prefix, name) = rest.split_once(':')?;
+        if prefix != "physical" {
+            return None;
+        }
+
+        // Parse the position name
+        let position = match name {
+            "KeyA" => KeyCode::KeyA,
+            "KeyB" => KeyCode::KeyB,
+            "KeyC" => KeyCode::KeyC,
+            "KeyD" => KeyCode::KeyD,
+            "KeyE" => KeyCode::KeyE,
+            "KeyF" => KeyCode::KeyF,
+            "KeyG" => KeyCode::KeyG,
+            "KeyH" => KeyCode::KeyH,
+            "KeyI" => KeyCode::KeyI,
+            "KeyJ" => KeyCode::KeyJ,
+            "KeyK" => KeyCode::KeyK,
+            "KeyL" => KeyCode::KeyL,
+            "KeyM" => KeyCode::KeyM,
+            "KeyN" => KeyCode::KeyN,
+            "KeyO" => KeyCode::KeyO,
+            "KeyP" => KeyCode::KeyP,
+            "KeyQ" => KeyCode::KeyQ,
+            "KeyR" => KeyCode::KeyR,
+            "KeyS" => KeyCode::KeyS,
+            "KeyT" => KeyCode::KeyT,
+            "KeyU" => KeyCode::KeyU,
+            "KeyV" => KeyCode::KeyV,
+            "KeyW" => KeyCode::KeyW,
+            "KeyX" => KeyCode::KeyX,
+            "KeyY" => KeyCode::KeyY,
+            "KeyZ" => KeyCode::KeyZ,
+            "Semicolon" => KeyCode::Semicolon,
+            "Quote" => KeyCode::Quote,
+            "Comma" => KeyCode::Comma,
+            "Period" => KeyCode::Period,
+            "Slash" => KeyCode::Slash,
+            "Backslash" => KeyCode::Backslash,
+            "BracketLeft" => KeyCode::BracketLeft,
+            "BracketRight" => KeyCode::BracketRight,
+            "Minus" => KeyCode::Minus,
+            "Equal" => KeyCode::Equal,
+            // FEUX-0004 X06: Digits (grammar-owned, E-4)
+            "Digit0" => KeyCode::Digit0,
+            "Digit1" => KeyCode::Digit1,
+            "Digit2" => KeyCode::Digit2,
+            "Digit3" => KeyCode::Digit3,
+            "Digit4" => KeyCode::Digit4,
+            "Digit5" => KeyCode::Digit5,
+            "Digit6" => KeyCode::Digit6,
+            "Digit7" => KeyCode::Digit7,
+            "Digit8" => KeyCode::Digit8,
+            "Digit9" => KeyCode::Digit9,
+            _ => return None,
+        };
+
+        Some(BindingToken::Position(Slot {
+            position,
+            shift: has_shift,
+        }))
+    }
+}
+
+/// Validation errors for keymap resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeymapError {
+    /// The binding id is not recognized.
+    UnknownBinding { id: String },
+    /// The token string is unreadable (not "unbound" and not a position token).
+    UnreadableToken { id: String, text: String },
+    /// The position name in the token is not a valid `KeyCode` variant.
+    UnknownPosition { id: String, text: String },
+    /// Shift modifier on a motion binding (forbidden by Rule X rule 1).
+    ShiftOnMotion { id: String },
+    /// Shift modifier on a menu accelerator binding (forbidden by Rule X rule 4).
+    ShiftOnMenuAccelerator { id: String },
+    /// Two bindings map to the same root slot (position + shift).
+    Collision {
+        slot: Slot,
+        first: String,
+        second: String,
+    },
+    /// Two accelerators in the same menu map to the same position.
+    DuplicateMenuKey {
+        menu: ContextMenu,
+        position: KeyCode,
+        first: String,
+        second: String,
+    },
+    /// A binding attempts to use a digit position (FEUX-0004 E-4).
+    /// Digits are grammar-owned and cannot be bound.
+    ReservedPosition { id: String, position: KeyCode },
+}
+
+impl std::fmt::Display for KeymapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeymapError::UnknownBinding { id } => {
+                write!(f, "Unknown binding id: '{id}'")
+            }
+            KeymapError::UnreadableToken { id, text } => {
+                write!(f, "Unreadable token '{text}' for binding '{id}'")
+            }
+            KeymapError::UnknownPosition { id, text } => {
+                write!(f, "Unknown position '{text}' in binding '{id}'")
+            }
+            KeymapError::ShiftOnMotion { id } => {
+                write!(f, "Shift modifier not allowed on motion binding '{id}'")
+            }
+            KeymapError::ShiftOnMenuAccelerator { id } => {
+                write!(f, "Shift modifier not allowed on menu accelerator '{id}'")
+            }
+            KeymapError::Collision {
+                slot,
+                first,
+                second,
+            } => {
+                let mod_str = if slot.shift { "Shift+" } else { "" };
+                write!(
+                    f,
+                    "Collision: '{first}' and '{second}' both map to {}{}",
+                    mod_str,
+                    slot.position.token()
+                )
+            }
+            KeymapError::DuplicateMenuKey {
+                menu,
+                position,
+                first,
+                second,
+            } => {
+                write!(
+                    f,
+                    "Duplicate in {} menu: '{first}' and '{second}' both map to {}",
+                    menu.title(),
+                    position.token()
+                )
+            }
+            KeymapError::ReservedPosition { id, position } => {
+                write!(
+                    f,
+                    "Position {pos} is reserved for counts and cannot be bound (binding '{id}')",
+                    pos = position.token()
+                )
+            }
+        }
+    }
+}
+
+/// The effective Context Mode keymap: a compiled, validated mapping from slots to binding ids.
+#[derive(Debug, Clone)]
+pub struct ContextKeymap {
+    /// Root bindings: slot -> binding id.
+    root: HashMap<Slot, BindingId>,
+    /// Menu accelerator bindings: (menu, position) -> binding id.
+    /// Note: menu accelerators are bare (no shift), and only use position (not Slot).
+    menus: HashMap<(ContextMenu, KeyCode), BindingId>,
+    /// Reverse lookup: binding id -> slot (for label composition).
+    slots_of: HashMap<String, Slot>,
+}
+
+impl Default for ContextKeymap {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+impl ContextKeymap {
+    /// Returns the default keymap (behavior-identical to the delivered grammar.rs).
+    #[must_use]
+    pub fn defaults() -> Self {
+        let mut root = HashMap::new();
+        let mut slots_of = HashMap::new();
+
+        // Add root bindings from DEFAULT_ROOT.
+        //
+        // Motions appear twice — once bare, once as a shifted grammar-
+        // equivalence twin (the delivered `motion_key` ignored Shift, so
+        // Shift+H must still resolve to the same motion with extend applied
+        // at capture). `entry().or_insert` keeps the FIRST occurrence: the
+        // bare slot, so advertised labels show the unshifted glyph for
+        // motions rather than a misleading `⇧h`.
+        for (binding_id, slot) in DEFAULT_ROOT {
+            let id_str = binding_id.id().to_string();
+            root.insert(*slot, binding_id.clone());
+            slots_of.entry(id_str).or_insert(*slot);
+        }
+
+        let mut menus = HashMap::new();
+        for (menu, binding_id, position) in DEFAULT_MENUS {
+            let id_str = binding_id.id().to_string();
+            menus.insert((*menu, *position), binding_id.clone());
+            // Menu accelerators don't go in slots_of (they're menu-scoped)
+            // but we still need to track them for label lookup
+            // For now, we'll use the root slot if it exists, otherwise bare position
+            slots_of.entry(id_str).or_insert(Slot::bare(*position));
+        }
+
+        Self {
+            root,
+            menus,
+            slots_of,
+        }
+    }
+
+    /// Resolve a user override map into an effective keymap.
+    ///
+    /// The override map is binding-id -> token string.
+    /// Returns Ok(keymap) or Err(list of all violations).
+    ///
+    /// # Errors
+    /// Returns `Err` with a list of all validation violations if the overrides
+    /// contain unknown bindings, unreadable tokens, invalid positions, Rule X
+    /// violations, or collisions.
+    #[allow(clippy::too_many_lines)]
+    pub fn resolve(
+        overrides: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, Vec<KeymapError>> {
+        let mut errors = Vec::new();
+        let mut composed_root: HashMap<Slot, BindingId> = HashMap::new();
+        let mut composed_menus: HashMap<(ContextMenu, KeyCode), BindingId> = HashMap::new();
+
+        // Start with defaults
+        let defaults = Self::defaults();
+        for (slot, binding_id) in &defaults.root {
+            composed_root.insert(*slot, binding_id.clone());
+        }
+        let mut composed_slots_of = defaults.slots_of.clone();
+        for ((menu, position), binding_id) in &defaults.menus {
+            composed_menus.insert((*menu, *position), binding_id.clone());
+        }
+
+        // Apply overrides
+        for (id_str, token_str) in overrides {
+            // Parse the binding id
+            let Some(binding_id) = BindingId::parse(id_str) else {
+                errors.push(KeymapError::UnknownBinding { id: id_str.clone() });
+                continue;
+            };
+
+            // Parse the token
+            let Some(token) = BindingToken::parse(token_str) else {
+                errors.push(KeymapError::UnreadableToken {
+                    id: id_str.clone(),
+                    text: token_str.clone(),
+                });
+                continue;
+            };
+
+            match token {
+                BindingToken::Unbound => {
+                    // Remove this binding
+                    composed_root.retain(|_, bid| bid.id() != id_str);
+                    composed_menus.retain(|_, bid| bid.id() != id_str);
+                    composed_slots_of.remove(id_str);
+                }
+                BindingToken::Position(slot) => {
+                    // Validate Rule X: no shift on motions or menu accelerators
+                    // (rule 1 and rule 4 stand). Rule 3 was replaced by
+                    // FEUX-0004 E-3: menu-opener bindings MAY bind bare or
+                    // shift+ positions as distinct slots.
+                    if binding_id.is_motion() && slot.shift {
+                        errors.push(KeymapError::ShiftOnMotion { id: id_str.clone() });
+                        continue;
+                    }
+                    if binding_id.is_menu_accelerator() && slot.shift {
+                        errors.push(KeymapError::ShiftOnMenuAccelerator { id: id_str.clone() });
+                        continue;
+                    }
+
+                    // FEUX-0004 E-4: Digits are grammar-owned and cannot be bound
+                    if is_digit_position(slot.position) {
+                        errors.push(KeymapError::ReservedPosition {
+                            id: id_str.clone(),
+                            position: slot.position,
+                        });
+                        continue;
+                    }
+
+                    // Remove any existing entry for this binding id
+                    composed_root.retain(|_, bid| bid.id() != id_str);
+                    composed_menus.retain(|_, bid| bid.id() != id_str);
+                    composed_slots_of.remove(id_str);
+
+                    // Check if the new slot is already taken by a different binding
+                    if let Some(existing_bid) = composed_root.get(&slot)
+                        && existing_bid.id() != id_str
+                    {
+                        // Collision: this slot is already bound to a different binding
+                        errors.push(KeymapError::Collision {
+                            slot,
+                            first: existing_bid.id().to_string(),
+                            second: id_str.clone(),
+                        });
+                        continue;
+                    }
+
+                    // Add to composed map with new slot
+                    composed_slots_of.insert(id_str.clone(), slot);
+                    composed_root.insert(slot, binding_id);
+                }
+            }
+        }
+
+        // Check for collisions in root
+        let mut root_slots_seen: HashMap<Slot, String> = HashMap::new();
+        for (slot, binding_id) in &composed_root {
+            if let Some(existing_id) = root_slots_seen.get(slot) {
+                errors.push(KeymapError::Collision {
+                    slot: *slot,
+                    first: existing_id.clone(),
+                    second: binding_id.id().to_string(),
+                });
+            } else {
+                root_slots_seen.insert(*slot, binding_id.id().to_string());
+            }
+        }
+
+        // Check for collisions in menus
+        let mut menu_keys_seen: HashMap<(ContextMenu, KeyCode), String> = HashMap::new();
+        for ((menu, position), binding_id) in &composed_menus {
+            let key = (*menu, *position);
+            if let Some(existing_id) = menu_keys_seen.get(&key) {
+                errors.push(KeymapError::DuplicateMenuKey {
+                    menu: *menu,
+                    position: *position,
+                    first: existing_id.clone(),
+                    second: binding_id.id().to_string(),
+                });
+            } else {
+                menu_keys_seen.insert(key, binding_id.id().to_string());
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(Self {
+                root: composed_root,
+                menus: composed_menus,
+                slots_of: composed_slots_of,
+            })
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Look up a root binding by slot.
+    #[must_use]
+    pub fn lookup_root(&self, slot: Slot) -> Option<&BindingId> {
+        self.root.get(&slot)
+    }
+
+    /// Look up a menu accelerator by menu and position.
+    /// Falls through to root if the command is in the menu's command list.
+    #[must_use]
+    pub fn lookup_menu(&self, menu: ContextMenu, position: KeyCode) -> Option<ContextCommand> {
+        // First, check for explicit menu accelerator
+        if let Some(BindingId::Command(cmd)) = self.menus.get(&(menu, position))
+            && menu.commands().contains(cmd)
+        {
+            return Some(*cmd);
+        }
+
+        // Fall through to root
+        let slot = Slot::bare(position);
+        if let Some(BindingId::Command(cmd)) = self.root.get(&slot)
+            && menu.commands().contains(cmd)
+        {
+            return Some(*cmd);
+        }
+
+        None
+    }
+
+    /// Get the slot for a binding id (for label composition).
+    #[must_use]
+    pub fn slot_of(&self, binding_id: &str) -> Option<Slot> {
+        self.slots_of.get(binding_id).copied()
+    }
+
+    /// Get the binding label for a binding id using the given layout.
+    #[must_use]
+    pub fn binding_label(&self, layout: crate::labels::Layout, binding_id: &str) -> String {
+        use crate::labels::glyph;
+
+        self.slot_of(binding_id).map_or_else(
+            || "unbound".to_string(),
+            |slot| {
+                let glyph = glyph(layout, slot.position).unwrap_or_else(|| slot.position.token());
+                if slot.shift {
+                    format!("⇧{glyph}")
+                } else {
+                    glyph.to_string()
+                }
+            },
+        )
+    }
+
+    /// Returns all default binding ids (for Settings UI iteration).
+    #[must_use]
+    pub fn default_binding_ids() -> Vec<&'static str> {
+        DEFAULT_ROOT
+            .iter()
+            .map(|(bid, _)| bid.id())
+            .chain(DEFAULT_MENUS.iter().map(|(_, bid, _)| bid.id()))
+            .collect()
+    }
+}
+
+/// Default root bindings: binding id -> slot.
+/// This table IS the source of truth for Context Mode key bindings (FEUX-0003 X02).
+/// Menu openers (V, G, T) are first-class root bindings, replacing the former host special-casing.
+pub const DEFAULT_ROOT: &[(BindingId, Slot)] = &[
+    // Commands (18 entries, matching grammar::command_key exactly)
+    (
+        BindingId::Command(ContextCommand::InsertStart),
+        Slot::bare(KeyCode::KeyI),
+    ),
+    (
+        BindingId::Command(ContextCommand::InsertLineStart),
+        Slot::shifted(KeyCode::KeyI),
+    ),
+    (
+        BindingId::Command(ContextCommand::InsertEnd),
+        Slot::bare(KeyCode::KeyA),
+    ),
+    (
+        BindingId::Command(ContextCommand::InsertLineEnd),
+        Slot::shifted(KeyCode::KeyA),
+    ),
+    (
+        BindingId::Command(ContextCommand::OpenBelow),
+        Slot::bare(KeyCode::KeyO),
+    ),
+    (
+        BindingId::Command(ContextCommand::OpenAbove),
+        Slot::shifted(KeyCode::KeyO),
+    ),
+    (
+        BindingId::Command(ContextCommand::Change),
+        Slot::bare(KeyCode::KeyC),
+    ),
+    (
+        BindingId::Command(ContextCommand::Delete),
+        Slot::bare(KeyCode::KeyD),
+    ),
+    (
+        BindingId::Command(ContextCommand::Cut),
+        Slot::shifted(KeyCode::KeyD),
+    ),
+    (
+        BindingId::Command(ContextCommand::Copy),
+        Slot::bare(KeyCode::KeyY),
+    ),
+    (
+        BindingId::Command(ContextCommand::Paste),
+        Slot::bare(KeyCode::KeyP),
+    ),
+    (
+        BindingId::Command(ContextCommand::Undo),
+        Slot::bare(KeyCode::KeyU),
+    ),
+    (
+        BindingId::Command(ContextCommand::Redo),
+        Slot::shifted(KeyCode::KeyU),
+    ),
+    (
+        BindingId::Command(ContextCommand::SelectLine),
+        Slot::bare(KeyCode::KeyX),
+    ),
+    (
+        BindingId::Command(ContextCommand::Collapse),
+        Slot::bare(KeyCode::Semicolon),
+    ),
+    (
+        BindingId::Command(ContextCommand::Commands),
+        Slot::shifted(KeyCode::Semicolon),
+    ),
+    (
+        BindingId::Command(ContextCommand::Find),
+        Slot::bare(KeyCode::Slash),
+    ),
+    (
+        BindingId::Command(ContextCommand::Replace),
+        Slot::shifted(KeyCode::Slash),
+    ),
+    // FindChar is represented as ContextCommand::FindChar in grammar, but we use BindingId::FindChar
+    (
+        BindingId::FindChar { forward: true },
+        Slot::bare(KeyCode::KeyF),
+    ),
+    (
+        BindingId::FindChar { forward: false },
+        Slot::shifted(KeyCode::KeyF),
+    ),
+    // Menu openers (E-4: first-class root bindings replacing host special-casing)
+    (
+        BindingId::MenuOpener(ContextMenu::Select),
+        Slot::bare(KeyCode::KeyV),
+    ),
+    (
+        BindingId::MenuOpener(ContextMenu::Go),
+        Slot::bare(KeyCode::KeyG),
+    ),
+    // FEUX-0004 X01: Transform and Lines menu openers (E-3: shifted openers allowed)
+    (
+        BindingId::MenuOpener(ContextMenu::Transform),
+        Slot::bare(KeyCode::KeyT),
+    ),
+    (
+        BindingId::MenuOpener(ContextMenu::Lines),
+        Slot::shifted(KeyCode::KeyT),
+    ),
+    // FEUX-0004 X04: Surround menu opener
+    (
+        BindingId::MenuOpener(ContextMenu::Surround),
+        Slot::bare(KeyCode::KeyZ),
+    ),
+    // FEUX-0004 X05: Repeat last command on bare Period
+    (
+        BindingId::Command(ContextCommand::RepeatLast),
+        Slot::bare(KeyCode::Period),
+    ),
+    // Motions (14 entries: 7 bare + 7 shifted, matching grammar::motion_key exactly)
+    // Note: grammar::motion_key ignores shift, so we include both variants for equivalence
+    //
+    // DELIBERATE DIVERGENCE from FEUX-0003 §5.2 (documented): the normative
+    // spec table lists motions as bare-only, but the delivered grammar's
+    // `motion_key` accepted Shift on motion positions (Shift+`h` still moved,
+    // with extend applied at capture). To keep the data default byte-identical
+    // to the delivered behavior, each motion keeps a shifted equivalence twin
+    // here. Rule X still REFUSES shifted tokens in the *user* override layer
+    // (resolve() → ShiftOnMotion) — these twins are internal defaults, never
+    // user-authored. Labels advertise the bare slot (see `defaults`), so a
+    // Dvorak user sees `h`, not `⇧h`.
+    (
+        BindingId::Motion(Motion::Previous),
+        Slot::bare(KeyCode::KeyH),
+    ),
+    (
+        BindingId::Motion(Motion::Previous),
+        Slot::shifted(KeyCode::KeyH),
+    ),
+    (BindingId::Motion(Motion::Down), Slot::bare(KeyCode::KeyJ)),
+    (
+        BindingId::Motion(Motion::Down),
+        Slot::shifted(KeyCode::KeyJ),
+    ),
+    (BindingId::Motion(Motion::Up), Slot::bare(KeyCode::KeyK)),
+    (BindingId::Motion(Motion::Up), Slot::shifted(KeyCode::KeyK)),
+    (BindingId::Motion(Motion::Next), Slot::bare(KeyCode::KeyL)),
+    (
+        BindingId::Motion(Motion::Next),
+        Slot::shifted(KeyCode::KeyL),
+    ),
+    (
+        BindingId::Motion(Motion::NextWord),
+        Slot::bare(KeyCode::KeyW),
+    ),
+    (
+        BindingId::Motion(Motion::NextWord),
+        Slot::shifted(KeyCode::KeyW),
+    ),
+    (
+        BindingId::Motion(Motion::NextWordEnd),
+        Slot::bare(KeyCode::KeyE),
+    ),
+    (
+        BindingId::Motion(Motion::NextWordEnd),
+        Slot::shifted(KeyCode::KeyE),
+    ),
+    (
+        BindingId::Motion(Motion::PreviousWord),
+        Slot::bare(KeyCode::KeyB),
+    ),
+    (
+        BindingId::Motion(Motion::PreviousWord),
+        Slot::shifted(KeyCode::KeyB),
+    ),
+    // FEUX-0004 X03: GotoLine binding (E-12)
+    (
+        BindingId::Command(ContextCommand::GotoLine),
+        Slot::shifted(KeyCode::KeyG),
+    ),
+    // FEUX-0005 X01: Indent family (E-6)
+    (
+        BindingId::Command(ContextCommand::Indent),
+        Slot::shifted(KeyCode::Period),
+    ),
+    (
+        BindingId::Command(ContextCommand::Dedent),
+        Slot::shifted(KeyCode::Comma),
+    ),
+];
+
+/// Default menu accelerator bindings: menu -> binding id -> position.
+/// These are the accelerators that appear inside specific menus.
+pub const DEFAULT_MENUS: &[(ContextMenu, BindingId, KeyCode)] = &[
+    // Select menu
+    (
+        ContextMenu::Select,
+        BindingId::Command(ContextCommand::SelectWord),
+        KeyCode::KeyW,
+    ),
+    (
+        ContextMenu::Select,
+        BindingId::Command(ContextCommand::SelectLine),
+        KeyCode::KeyX,
+    ),
+    (
+        ContextMenu::Select,
+        BindingId::Command(ContextCommand::SelectAll),
+        KeyCode::KeyA,
+    ),
+    // Go menu
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::LineStart),
+        KeyCode::KeyH,
+    ),
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::LineEnd),
+        KeyCode::KeyE,
+    ),
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::DocumentStart),
+        KeyCode::KeyT,
+    ),
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::DocumentEnd),
+        KeyCode::KeyB,
+    ),
+    // FEUX-0004 X03: Goto-line in Go menu (E-12)
+    (
+        ContextMenu::Go,
+        BindingId::Command(ContextCommand::GotoLine),
+        KeyCode::KeyG,
+    ),
+    // FEUX-0004 X01: Transform menu accelerators (E-2)
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::CaseUpper),
+        KeyCode::KeyU,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::CaseLower),
+        KeyCode::KeyL,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::CaseSwap),
+        KeyCode::KeyS,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::CaseTitle),
+        KeyCode::KeyT,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::NumberInc),
+        KeyCode::KeyN,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::NumberDec),
+        KeyCode::KeyD,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::NumberSequence),
+        KeyCode::KeyQ,
+    ),
+    // FEUX-0005 X02: Whitespace conversion in Transform menu
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::TabsToSpaces),
+        KeyCode::KeyE,
+    ),
+    (
+        ContextMenu::Transform,
+        BindingId::Command(ContextCommand::SpacesToTabs),
+        KeyCode::KeyR,
+    ),
+    // FEUX-0004 X01: Lines menu accelerators (E-2)
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesSortAsc),
+        KeyCode::KeyS,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesSortDesc),
+        KeyCode::KeyD,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesSortNumeric),
+        KeyCode::KeyN,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesJoin),
+        KeyCode::KeyJ,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesDuplicate),
+        KeyCode::KeyC,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesDedupe),
+        KeyCode::KeyE,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesShuffle),
+        KeyCode::KeyH,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesMoveUp),
+        KeyCode::KeyU,
+    ),
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesMoveDown),
+        KeyCode::KeyK,
+    ),
+    // FEUX-0004 X03: Lines align
+    (
+        ContextMenu::Lines,
+        BindingId::Command(ContextCommand::LinesAlign),
+        KeyCode::KeyA,
+    ),
+    // FEUX-0004 X04: Surround menu accelerators (E-2)
+    (
+        ContextMenu::Surround,
+        BindingId::Command(ContextCommand::SurroundAdd),
+        KeyCode::KeyA,
+    ),
+    (
+        ContextMenu::Surround,
+        BindingId::Command(ContextCommand::SurroundChange),
+        KeyCode::KeyC,
+    ),
+    (
+        ContextMenu::Surround,
+        BindingId::Command(ContextCommand::SurroundDelete),
+        KeyCode::KeyD,
+    ),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_keymap_is_the_normative_snapshot() {
+        // Verify the DEFAULT_ROOT table contains exactly the expected bindings
+        // This is the drift gate for X02/X04.
+        // FEUX-0004 X01: 20 command-key entries (18 commands + 2 find_char) + 14 motions (7 bare + 7 shifted) = 34 total
+        // Plus 4 menu openers (V, G, T, Shift+T) = 38 total (E-3: shifted menu openers allowed)
+        // FEUX-0004 X03: +1 binding (Shift+G for goto-line) = 39 total
+        // FEUX-0004 X04: +1 binding (Z for surround) = 40 total
+        // FEUX-0004 X05: +1 binding (Period for repeat_last) = 41 total
+        // FEUX-0005 X01: +2 bindings (shifted Period/Comma for indent/dedent) = 43 total
+        assert_eq!(DEFAULT_ROOT.len(), 43); // 20 commands + 14 motions + 5 menu openers + 1 (goto-line) + 1 (repeat) + 2 (indent/dedent) = 43
+
+        // Spot-check a few key bindings
+        let has_insert_start = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.insert_start" && slot.position == KeyCode::KeyI && !slot.shift
+        });
+        assert!(has_insert_start, "InsertStart should map to bare KeyI");
+
+        let has_delete = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.delete" && slot.position == KeyCode::KeyD && !slot.shift
+        });
+        assert!(has_delete, "Delete should map to bare KeyD");
+
+        let has_cut = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.cut" && slot.position == KeyCode::KeyD && slot.shift
+        });
+        assert!(has_cut, "Cut should map to Shift+KeyD");
+
+        // Verify all motions are present and bare
+        let motion_ids = [
+            "editor.motion.previous",
+            "editor.motion.next",
+            "editor.motion.up",
+            "editor.motion.down",
+            "editor.motion.next_word",
+            "editor.motion.previous_word",
+            "editor.motion.next_word_end",
+        ];
+        for id in motion_ids {
+            let found = DEFAULT_ROOT
+                .iter()
+                .any(|(bid, slot)| bid.id() == id && !slot.shift);
+            assert!(found, "Motion {id} should be present and bare");
+        }
+
+        // Menu openers (V, G) ARE in DEFAULT_ROOT for X02 - they are first-class root bindings
+        // replacing the host special-casing.
+        let has_menu_select = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_select" && slot.position == KeyCode::KeyV && !slot.shift
+        });
+        assert!(has_menu_select, "menu_select should map to bare KeyV");
+
+        let has_menu_go = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_go" && slot.position == KeyCode::KeyG && !slot.shift
+        });
+        assert!(has_menu_go, "menu_go should map to bare KeyG");
+
+        // FEUX-0004 X01: new menu openers (E-3: shifted openers allowed)
+        let has_menu_transform = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_transform" && slot.position == KeyCode::KeyT && !slot.shift
+        });
+        assert!(has_menu_transform, "menu_transform should map to bare KeyT");
+
+        let has_menu_lines = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_lines" && slot.position == KeyCode::KeyT && slot.shift
+        });
+        assert!(has_menu_lines, "menu_lines should map to Shift+KeyT");
+
+        // FEUX-0004 X04: Surround menu opener
+        let has_menu_surround = DEFAULT_ROOT.iter().any(|(bid, slot)| {
+            bid.id() == "editor.menu_surround" && slot.position == KeyCode::KeyZ && !slot.shift
+        });
+        assert!(has_menu_surround, "menu_surround should map to bare KeyZ");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn defaults_keymap_classifies_identically_to_delivered_grammar() {
+        // This is the shadow equivalence test (AC-1 / FR-2).
+        // After X02, the keymap IS the source of truth. This test verifies the default
+        // table contains the expected bindings that match the delivered behavior.
+        //
+        // The original grammar positions (pre-X01 extension) are explicitly verified.
+
+        use crate::vocabulary::ContextMenu;
+        use ContextCommand as C;
+
+        let keymap = ContextKeymap::defaults();
+
+        // Verify menu openers map to MenuOpener binding ids
+        let v_slot = Slot::bare(KeyCode::KeyV);
+        assert!(
+            matches!(
+                keymap.lookup_root(v_slot),
+                Some(BindingId::MenuOpener(ContextMenu::Select))
+            ),
+            "KeyV should map to MenuOpener(Select)"
+        );
+
+        let g_slot = Slot::bare(KeyCode::KeyG);
+        assert!(
+            matches!(
+                keymap.lookup_root(g_slot),
+                Some(BindingId::MenuOpener(ContextMenu::Go))
+            ),
+            "KeyG should map to MenuOpener(Go)"
+        );
+
+        // FEUX-0004 X01: new menu openers
+        let t_slot = Slot::bare(KeyCode::KeyT);
+        assert!(
+            matches!(
+                keymap.lookup_root(t_slot),
+                Some(BindingId::MenuOpener(ContextMenu::Transform))
+            ),
+            "KeyT should map to MenuOpener(Transform)"
+        );
+
+        let lines_menu_slot = Slot::shifted(KeyCode::KeyT);
+        assert!(
+            matches!(
+                keymap.lookup_root(lines_menu_slot),
+                Some(BindingId::MenuOpener(ContextMenu::Lines))
+            ),
+            "Shift+KeyT should map to MenuOpener(Lines)"
+        );
+
+        // FEUX-0004 X04: Surround menu opener
+        let z_slot = Slot::bare(KeyCode::KeyZ);
+        assert!(
+            matches!(
+                keymap.lookup_root(z_slot),
+                Some(BindingId::MenuOpener(ContextMenu::Surround))
+            ),
+            "KeyZ should map to MenuOpener(Surround)"
+        );
+
+        // Verify FindChar directions
+        let find_forward_slot = Slot::bare(KeyCode::KeyF);
+        let find_forward_binding = keymap.lookup_root(find_forward_slot);
+        assert!(
+            matches!(
+                find_forward_binding,
+                Some(BindingId::FindChar { forward: true })
+            ),
+            "KeyF should map to FindChar forward"
+        );
+
+        let find_backward_slot = Slot::shifted(KeyCode::KeyF);
+        let find_backward_binding = keymap.lookup_root(find_backward_slot);
+        assert!(
+            matches!(
+                find_backward_binding,
+                Some(BindingId::FindChar { forward: false })
+            ),
+            "Shift+KeyF should map to FindChar backward"
+        );
+
+        // Verify motions
+        let h_slot = Slot::bare(KeyCode::KeyH);
+        assert!(
+            matches!(
+                keymap.lookup_root(h_slot),
+                Some(BindingId::Motion(Motion::Previous))
+            ),
+            "KeyH should map to Motion::Previous"
+        );
+
+        let j_slot = Slot::bare(KeyCode::KeyJ);
+        assert!(
+            matches!(
+                keymap.lookup_root(j_slot),
+                Some(BindingId::Motion(Motion::Down))
+            ),
+            "KeyJ should map to Motion::Down"
+        );
+
+        let k_slot = Slot::bare(KeyCode::KeyK);
+        assert!(
+            matches!(
+                keymap.lookup_root(k_slot),
+                Some(BindingId::Motion(Motion::Up))
+            ),
+            "KeyK should map to Motion::Up"
+        );
+
+        let l_slot = Slot::bare(KeyCode::KeyL);
+        assert!(
+            matches!(
+                keymap.lookup_root(l_slot),
+                Some(BindingId::Motion(Motion::Next))
+            ),
+            "KeyL should map to Motion::Next"
+        );
+
+        // Verify commands
+        let d_slot = Slot::bare(KeyCode::KeyD);
+        assert_eq!(
+            keymap.lookup_root(d_slot).and_then(|bid| match bid {
+                BindingId::Command(c) => Some(*c),
+                _ => None,
+            }),
+            Some(C::Delete),
+            "KeyD should map to Delete"
+        );
+
+        let sd_slot = Slot::shifted(KeyCode::KeyD);
+        assert_eq!(
+            keymap.lookup_root(sd_slot).and_then(|bid| match bid {
+                BindingId::Command(c) => Some(*c),
+                _ => None,
+            }),
+            Some(C::Cut),
+            "Shift+KeyD should map to Cut"
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_rebind_and_unbound() {
+        use std::collections::BTreeMap;
+
+        let mut overrides = BTreeMap::new();
+
+        // Rebind delete to KeyS
+        overrides.insert("editor.delete".to_string(), "physical:KeyS".to_string());
+
+        let keymap = ContextKeymap::resolve(&overrides).expect("Should resolve valid rebind");
+
+        // Verify the rebind worked
+        let slot = Slot::bare(KeyCode::KeyS);
+        let binding = keymap.lookup_root(slot);
+        assert!(binding.is_some(), "KeyS should have a binding");
+        assert_eq!(binding.unwrap().id(), "editor.delete");
+
+        // Verify old position is unbound
+        let old_slot = Slot::bare(KeyCode::KeyD);
+        assert!(
+            keymap.lookup_root(old_slot).is_none(),
+            "KeyD should be unbound"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_binding() {
+        use std::collections::BTreeMap;
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "editor.nonexistent".to_string(),
+            "physical:KeyD".to_string(),
+        );
+
+        let result = ContextKeymap::resolve(&overrides);
+        assert!(result.is_err(), "Unknown binding should be rejected");
+
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KeymapError::UnknownBinding { .. }))
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_shift_on_motion() {
+        use std::collections::BTreeMap;
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "editor.motion.previous".to_string(),
+            "shift+physical:KeyH".to_string(),
+        );
+
+        let result = ContextKeymap::resolve(&overrides);
+        assert!(result.is_err(), "Shift on motion should be rejected");
+
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KeymapError::ShiftOnMotion { .. }))
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_shift_on_menu_opener() {
+        use std::collections::BTreeMap;
+
+        // FEUX-0004 E-3: Rule X rule 3 was replaced - menu openers MAY bind
+        // shifted positions as distinct slots (the default `⇧T` Lines opener
+        // is exactly such a slot).
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "editor.menu_lines".to_string(),
+            "shift+physical:KeyT".to_string(),
+        );
+
+        let result = ContextKeymap::resolve(&overrides);
+        assert!(
+            result.is_ok(),
+            "Shift on a menu opener should be accepted: {result:?}"
+        );
+        let keymap = result.unwrap();
+        let slot = Slot::shifted(KeyCode::KeyT);
+        assert!(matches!(
+            keymap.lookup_root(slot),
+            Some(BindingId::MenuOpener(ContextMenu::Lines))
+        ));
+    }
+
+    #[test]
+    fn resolve_rejects_shift_on_menu_accelerator() {
+        use std::collections::BTreeMap;
+
+        // `editor.select_word` is a Select-menu accelerator (bare only per
+        // Rule X §4); a shifted token must be refused.
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "editor.select_word".to_string(),
+            "shift+physical:KeyW".to_string(),
+        );
+
+        let result = ContextKeymap::resolve(&overrides);
+        assert!(
+            result.is_err(),
+            "Shift on a menu accelerator should be rejected"
+        );
+
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| { matches!(e, KeymapError::ShiftOnMenuAccelerator { .. }) }),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn motion_labels_are_bare_glyphs() {
+        use crate::labels::Layout;
+
+        let keymap = ContextKeymap::defaults();
+
+        // The shifted equivalence twins must not leak into labels: a motion
+        // advertises its bare slot even though Shift+position also resolves
+        // to it (grammar-equivalence twin).
+        assert_eq!(
+            keymap.binding_label(Layout::Qwerty, "editor.motion.previous"),
+            "h"
+        );
+        assert_eq!(
+            keymap.binding_label(Layout::Qwerty, "editor.motion.next_word"),
+            "w"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_collision() {
+        use std::collections::BTreeMap;
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("editor.delete".to_string(), "physical:KeyD".to_string());
+        overrides.insert("editor.cut".to_string(), "physical:KeyD".to_string());
+
+        let result = ContextKeymap::resolve(&overrides);
+        assert!(result.is_err(), "Collision should be rejected");
+
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, KeymapError::Collision { .. }))
+        );
+    }
+
+    #[test]
+    fn lookup_menu_falls_through_to_root() {
+        let keymap = ContextKeymap::defaults();
+
+        // Delete should be accessible in More menu via fall-through
+        let result = keymap.lookup_menu(ContextMenu::More, KeyCode::KeyD);
+        assert_eq!(result, Some(ContextCommand::Delete));
+    }
+
+    #[test]
+    fn menu_accelerator_takes_precedence() {
+        let keymap = ContextKeymap::defaults();
+
+        // In Select menu, KeyW should give SelectWord (menu accelerator), not InsertStart
+        let result = keymap.lookup_menu(ContextMenu::Select, KeyCode::KeyW);
+        assert_eq!(result, Some(ContextCommand::SelectWord));
+    }
+
+    #[test]
+    fn binding_label_uses_glyphs() {
+        use crate::labels::Layout;
+
+        let keymap = ContextKeymap::defaults();
+
+        // Delete should show as "d" in qwerty
+        let label = keymap.binding_label(Layout::Qwerty, "editor.delete");
+        assert_eq!(label, "d");
+
+        // Cut should show as "⇧d" in qwerty
+        let label = keymap.binding_label(Layout::Qwerty, "editor.cut");
+        assert_eq!(label, "⇧d");
+    }
+
+    #[test]
+    fn token_parsing_covers_all_positions() {
+        // Every KeyCode variant should parse from its token string
+        for code in [
+            KeyCode::KeyA,
+            KeyCode::KeyB,
+            KeyCode::KeyC,
+            KeyCode::KeyD,
+            KeyCode::KeyE,
+            KeyCode::KeyF,
+            KeyCode::KeyG,
+            KeyCode::KeyH,
+            KeyCode::KeyI,
+            KeyCode::KeyJ,
+            KeyCode::KeyK,
+            KeyCode::KeyL,
+            KeyCode::KeyM,
+            KeyCode::KeyN,
+            KeyCode::KeyO,
+            KeyCode::KeyP,
+            KeyCode::KeyQ,
+            KeyCode::KeyR,
+            KeyCode::KeyS,
+            KeyCode::KeyT,
+            KeyCode::KeyU,
+            KeyCode::KeyV,
+            KeyCode::KeyW,
+            KeyCode::KeyX,
+            KeyCode::KeyY,
+            KeyCode::KeyZ,
+            KeyCode::Semicolon,
+            KeyCode::Quote,
+            KeyCode::Comma,
+            KeyCode::Period,
+            KeyCode::Slash,
+            KeyCode::Backslash,
+            KeyCode::BracketLeft,
+            KeyCode::BracketRight,
+            KeyCode::Minus,
+            KeyCode::Equal,
+        ] {
+            let token = format!("physical:{}", code.token());
+            let parsed = BindingToken::parse(&token);
+            assert!(parsed.is_some(), "Token {token} should parse");
+
+            let token_shifted = format!("shift+physical:{}", code.token());
+            let parsed_shifted = BindingToken::parse(&token_shifted);
+            assert!(
+                parsed_shifted.is_some(),
+                "Shifted token {token_shifted} should parse"
+            );
+        }
+    }
+}

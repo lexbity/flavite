@@ -55,7 +55,7 @@ fn snapshot(buffer_id: u64, revision: u64, caret: usize, sequence: u64, focused:
 fn typed(
     editor_view: &EditorView,
     state: &mut flavite_editor::widget::EditorState,
-    text: &str,
+    _text: &str,
     input: &str,
 ) -> Vec<EditorAction> {
     let mut messages = Vec::new();
@@ -72,8 +72,9 @@ fn typed(
             preferred_x: Vec::new(),
             clipboard_acquired: false,
         };
+        let text = editor_view.text.materialize();
         let set = SelectionSet::normalize(
-            &editor_view.text,
+            &text,
             vec![RawSelection {
                 id: None,
                 anchor: state.selection().0,
@@ -95,7 +96,8 @@ fn typed(
         // The acknowledgment round trip: the after-set installs through the
         // public restore path (same buffer/revision, newer sequence).
         state.restore_interaction(
-            text,
+            &editor_view.text,
+            &text,
             Snapshot {
                 selections: members
                     .iter()
@@ -124,25 +126,27 @@ fn delayed_acknowledgement_installs_and_lower_sequences_are_rejected() {
     let _widget = EditorWidget::new(&buffer, |action| action);
     let mut state = EditorWidget::<EditorAction>::state_for_test();
     state.reconcile(&editor_view, &HashMap::new());
+    let hello = flavite_buffer::chunks::DocumentText::from("hello");
+    let other = flavite_buffer::chunks::DocumentText::from("other");
 
     // A delayed host acknowledgement (sequence 7) installs caret and focus.
-    state.restore_interaction("hello", snapshot(12, 11, 3, 7, true));
+    state.restore_interaction(&hello, "hello", snapshot(12, 11, 3, 7, true));
     assert_eq!(state.caret(), 3);
     assert!(state.is_focused());
 
     // A stale runtime event (lower sequence) cannot overwrite it.
-    state.restore_interaction("hello", snapshot(12, 11, 0, 6, false));
+    state.restore_interaction(&hello, "hello", snapshot(12, 11, 0, 6, false));
     assert_eq!(state.caret(), 3, "stale sequence must be ignored");
     assert!(state.is_focused(), "stale unfocused snapshot must not blur");
 
     // A newer acknowledgement takes effect, including blur.
-    state.restore_interaction("hello", snapshot(12, 11, 5, 9, false));
+    state.restore_interaction(&hello, "hello", snapshot(12, 11, 5, 9, false));
     assert_eq!(state.caret(), 5);
     assert!(!state.is_focused());
 
     // A mismatched buffer or revision is rejected outright.
-    state.restore_interaction("other", snapshot(13, 11, 1, 10, true));
-    state.restore_interaction("hello", snapshot(12, 12, 1, 10, true));
+    state.restore_interaction(&other, "other", snapshot(13, 11, 1, 10, true));
+    state.restore_interaction(&hello, "hello", snapshot(12, 12, 1, 10, true));
     assert_eq!(
         state.caret(),
         5,
@@ -157,7 +161,8 @@ fn typed_edits_are_revision_guarded_and_stale_actions_fail_conversion() {
     let editor_view = EditorView::from(&buffer);
     let mut state = EditorWidget::<EditorAction>::state_for_test();
     state.reconcile(&editor_view, &HashMap::new());
-    state.restore_interaction("hello", snapshot(12, 11, 2, 1, true));
+    let hello = flavite_buffer::chunks::DocumentText::from("hello");
+    state.restore_interaction(&hello, "hello", snapshot(12, 11, 2, 1, true));
 
     let messages = typed(&editor_view, &mut state, "hello", "é漢");
     assert_eq!(messages.len(), 2, "one guarded edit per input event");
@@ -182,7 +187,8 @@ fn focused_editor_operations_respect_buffer_and_revision() {
     let editor_view = EditorView::from(&view("text", 12));
     let mut state = EditorWidget::<EditorAction>::state_for_test();
     state.reconcile(&editor_view, &HashMap::new());
-    state.restore_interaction("text", snapshot(12, 11, 2, 4, false));
+    let text_doc = flavite_buffer::chunks::DocumentText::from("text");
+    state.restore_interaction(&text_doc, "text", snapshot(12, 11, 2, 4, false));
 
     // Stale revision focus is refused; current revision focus works.
     let mut stale = focus_editor(12, 12, None);
@@ -289,7 +295,8 @@ fn preedit_cancellation_and_buffer_replacement_under_the_same_tab_role() {
     let editor_view = EditorView::from(&view("hello", 12));
     let mut state = EditorWidget::<EditorAction>::state_for_test();
     state.reconcile(&editor_view, &HashMap::new());
-    state.restore_interaction("hello", snapshot(12, 11, 3, 2, true));
+    let hello = flavite_buffer::chunks::DocumentText::from("hello");
+    state.restore_interaction(&hello, "hello", snapshot(12, 11, 3, 2, true));
 
     // Composition opens, accumulates preedit, then is cancelled: the
     // document is untouched and the caret stays at the composition start.
@@ -339,8 +346,9 @@ fn crlf_positions_and_newline_edits_stay_byte_exact() {
     let editor_view = EditorView::from(&buffer);
     let mut state = EditorWidget::<EditorAction>::state_for_test();
     state.reconcile(&editor_view, &HashMap::new());
+    let text_doc = flavite_buffer::chunks::DocumentText::from(text);
     // Caret after "alpha\r\n" is byte 7 (CR at 5, LF at 6).
-    state.restore_interaction(text, snapshot(12, 11, 7, 1, true));
+    state.restore_interaction(&text_doc, text, snapshot(12, 11, 7, 1, true));
     assert_eq!(state.caret(), 7);
 
     let captured = CapturedInput {

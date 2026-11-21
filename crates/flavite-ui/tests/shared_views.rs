@@ -115,7 +115,10 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
     assert_eq!(app.workspace.writing_target().unwrap().tab, second);
     let first_view = app.note_editor_view(first).unwrap();
     let second_view = app.note_editor_view(second).unwrap();
-    assert!(std::sync::Arc::ptr_eq(&first_view.text, &second_view.text));
+    assert!(std::sync::Arc::ptr_eq(
+        first_view.text.root(),
+        second_view.text.root()
+    ));
     assert_eq!(
         app.workspace.tab(&first).unwrap().interaction().selections,
         vec![CommittedSelection::caret(1)]
@@ -155,14 +158,18 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         action: edit,
     });
     assert_eq!(
-        app.note_editor_view(first).unwrap().text.as_ref(),
+        app.note_editor_view(first)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\nbeta\n!"
     );
     let after_edit_first = app.note_editor_view(first).unwrap();
     let after_edit_second = app.note_editor_view(second).unwrap();
     assert!(std::sync::Arc::ptr_eq(
-        &after_edit_first.text,
-        &after_edit_second.text
+        after_edit_first.text.root(),
+        after_edit_second.text.root()
     ));
     assert!(
         app.workspace.writing_target().is_none(),
@@ -177,7 +184,11 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         action: undo,
     });
     assert_eq!(
-        app.note_editor_view(first).unwrap().text.as_ref(),
+        app.note_editor_view(first)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\nbeta\n"
     );
     // Redo from the other view restores the same one-edit boundary.
@@ -190,7 +201,11 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         action: redo,
     });
     assert_eq!(
-        app.note_editor_view(first).unwrap().text.as_ref(),
+        app.note_editor_view(first)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\nbeta\n!",
         "redo restores the shared edit"
     );
@@ -204,7 +219,11 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         action: undo_again,
     });
     assert_eq!(
-        app.note_editor_view(first).unwrap().text.as_ref(),
+        app.note_editor_view(first)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\nbeta\n"
     );
     let _ = app.update(Message::RunHostCommand("note.save"));
@@ -399,7 +418,11 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
         },
     });
     assert_eq!(
-        app.note_editor_view(tab).unwrap().text.as_ref(),
+        app.note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\n\n"
     );
     let _ = app.update(Message::EditorInput {
@@ -419,14 +442,18 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
         },
     });
     assert_eq!(
-        app.note_editor_view(tab).unwrap().text.as_ref(),
+        app.note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\n雪\n"
     );
     assert_eq!(
         fs.read_if_exists(&app.root().join("note.md"))
             .unwrap()
             .unwrap(),
-        source.text.as_bytes()
+        source.text.materialize().as_bytes()
     );
     let current = app.note_editor_view(tab).unwrap();
     let _ = app.update(Message::EditorAction {
@@ -435,7 +462,11 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
         action: EditorAction::history(&current, false),
     });
     assert!(
-        !app.note_editor_view(tab).unwrap().text.contains('雪'),
+        !app.note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .contains('雪'),
         "undo remains Session-owned"
     );
 }

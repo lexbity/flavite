@@ -369,7 +369,7 @@ fn doctor_reports_explicit_skip_without_a_live_mirror() {
     use flavite_api::doctor::{CheckStatus, DoctorChecker, cache_db_path};
     let root = tempfile::tempdir().unwrap();
     let uuid = uuid::Uuid::new_v4();
-    let db = cache_db_path(uuid);
+    let db = cache_db_path(root.path(), uuid);
     std::fs::create_dir_all(db.parent().expect("cache dir")).unwrap();
     drop(open_or_init(&db).unwrap());
     let vault = ApiVaultRef::new(uuid, root.path().to_path_buf());

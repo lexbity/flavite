@@ -203,6 +203,19 @@ pub trait Fs: Send + Sync {
     /// Remove a file. Fails if the path does not exist or is a directory.
     fn remove(&self, path: &Path) -> Result<()>;
 
+    /// Recursively remove a directory tree. Fails if the path does not
+    /// exist or is not a directory. Used to clean private scratch state
+    /// (journal transaction payload dirs, replace job dirs) once it
+    /// reaches a terminal state.
+    ///
+    /// The default implementation reports [`FsError::Unsupported`]; custom
+    /// adapters implement it when they serve private scratch cleanup.
+    fn remove_dir_all(&self, _path: &Path) -> Result<()> {
+        Err(FsError::Unsupported(
+            "Recursive directory removal unavailable".into(),
+        ))
+    }
+
     // --- Atomic operations ---
 
     /// Atomically rename `from` to `to`, replacing any existing file at `to`.

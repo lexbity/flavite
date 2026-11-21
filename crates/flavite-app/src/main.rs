@@ -45,5 +45,25 @@ fn main() -> Result<(), iced_winit::Error> {
         );
         std::process::exit(1);
     }
+    install_trace_subscriber();
     iced_winit::run(flavite_ui::accessibility::program::FlaviteProgram)
+}
+
+/// RFC-0008 S1 (FR-10): install the `fmt` subscriber when `FLAVITE_TRACE` is
+/// set. Default off — with the env var unset, no subscriber is installed and
+/// the tracing events/spans compiled into the keystroke path are inert (zero
+/// emission, zero hot-path allocation, S1-T2).
+///
+/// The filter falls back to `trace` when `RUST_LOG` is unset; setting
+/// `RUST_LOG` alongside `FLAVITE_TRACE` narrows the recorded levels.
+fn install_trace_subscriber() {
+    if std::env::var_os("FLAVITE_TRACE").is_none() {
+        return;
+    }
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("trace"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .try_init()
+        .expect("FLAVITE_TRACE subscriber install failed (a subscriber is already set)");
 }

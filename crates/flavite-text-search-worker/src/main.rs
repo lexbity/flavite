@@ -24,8 +24,8 @@ use std::process::exit;
 
 use flavite_text_search::matcher::{MatchLimits, MatchMode, MatchOptions};
 use flavite_text_search::protocol::{
-    self, FRAME_MAX_BYTES, FailureCode, FromHelper, RequestKind, SOURCE_MAX_BYTES, ToHelper,
-    WireMatch, encode_reply, read_request, write_frame,
+    self, FRAME_MAX_BYTES, FailureCode, FromHelper, MAX_SCOPE_SPANS, RequestKind, SOURCE_MAX_BYTES,
+    ToHelper, WireMatch, encode_reply, read_request, write_frame,
 };
 use flavite_text_search::template::{ReplacementTemplate, TemplateGrammar};
 use flavite_text_search::{Matcher, Span, TextByte};
@@ -119,7 +119,6 @@ fn main() {
                 report_matches,
                 skip_matches,
                 max_output,
-                scope,
                 source_total,
                 pattern,
             } => {
@@ -165,6 +164,7 @@ fn main() {
                     );
                     continue;
                 };
+                // Start with empty spans; they'll be populated by SpanFrame messages
                 active = Some(ActiveRequest {
                     request_id,
                     kind,
@@ -175,15 +175,32 @@ fn main() {
                     report_matches,
                     skip_matches,
                     max_output,
-                    scope,
                     source_total,
                     pattern,
+                    scope_spans: Vec::new(),
                     template: None,
                     source: Vec::with_capacity(source_total.min(64 * 1024) as usize),
                     received: 0,
                     cancelled: false,
                 });
                 let _ = reply(&mut out, &FromHelper::Accepted { request_id });
+            }
+            ToHelper::SpanFrame { request_id, spans } => {
+                let Some(request) = active
+                    .as_mut()
+                    .filter(|request| request.request_id == request_id)
+                else {
+                    let _ = reply(
+                        &mut out,
+                        &FromHelper::Failed {
+                            request_id,
+                            failure: FailureCode::Protocol,
+                        },
+                    );
+                    continue;
+                };
+                // Accumulate spans; validate after all frames are received
+                request.scope_spans.extend(spans);
             }
             ToHelper::Template {
                 request_id,
@@ -202,6 +219,18 @@ fn main() {
                     );
                     continue;
                 };
+                // Validate spans before accepting template
+                if !validate_spans(&request.scope_spans, request.source_total) {
+                    let _ = reply(
+                        &mut out,
+                        &FromHelper::Failed {
+                            request_id,
+                            failure: FailureCode::BadSpans,
+                        },
+                    );
+                    active = None;
+                    continue;
+                }
                 request.template = Some(template);
             }
             ToHelper::SourceChunk {
@@ -298,9 +327,9 @@ struct ActiveRequest {
     report_matches: u64,
     skip_matches: u64,
     max_output: u64,
-    scope: Option<(u64, u64)>,
     source_total: u64,
     pattern: Vec<u8>,
+    scope_spans: Vec<(u64, u64)>,
     template: Option<Vec<u8>>,
     source: Vec<u8>,
     received: usize,
@@ -315,6 +344,43 @@ fn finish_cancelled(out: &mut dyn Write, request: &ActiveRequest) {
             failure: FailureCode::Cancelled,
         },
     );
+}
+
+/// Validate scope spans: sorted, non-overlapping, within bounds, char boundaries,
+/// and within the maximum count.
+fn validate_spans(spans: &[(u64, u64)], source_total: u64) -> bool {
+    if spans.len() > MAX_SCOPE_SPANS {
+        return false;
+    }
+    let mut prev_end: u64 = 0;
+    for &(start, end) in spans {
+        // Check order
+        if start > end {
+            return false;
+        }
+        // Check non-overlapping (must be sorted)
+        if start < prev_end {
+            return false;
+        }
+        // Check bounds
+        if end > source_total {
+            return false;
+        }
+        prev_end = end;
+    }
+    true
+}
+
+/// Check if spans are sorted and non-overlapping (for validated usize spans).
+fn is_validated_spans(spans: &[(usize, usize)]) -> bool {
+    let mut prev_end: usize = 0;
+    for &(start, end) in spans {
+        if start < prev_end {
+            return false;
+        }
+        prev_end = end;
+    }
+    true
 }
 
 /// Build the matcher (and template for Replace), stream bounded pages from
@@ -385,17 +451,18 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
             return;
         }
     };
-    // Decode the declared scope against the actual source before iterating:
-    // endpoints must sit on legal UTF-8 boundaries within the received text.
-    let scope = match request.scope {
-        None => None,
-        Some((start, end)) => {
+    // Convert scope_spans to usable format and validate against actual source
+    let scope_spans: Vec<(usize, usize)> = if request.scope_spans.is_empty() {
+        Vec::new() // Empty spans = whole source
+    } else {
+        let mut validated = Vec::with_capacity(request.scope_spans.len());
+        for &(start, end) in &request.scope_spans {
             let Ok(start) = usize::try_from(start) else {
-                fail(out, FailureCode::Source);
+                fail(out, FailureCode::BadSpans);
                 return;
             };
             let Ok(end) = usize::try_from(end) else {
-                fail(out, FailureCode::Source);
+                fail(out, FailureCode::BadSpans);
                 return;
             };
             if end < start
@@ -403,11 +470,17 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
                 || !source.is_char_boundary(start)
                 || !source.is_char_boundary(end)
             {
-                fail(out, FailureCode::Source);
+                fail(out, FailureCode::BadSpans);
                 return;
             }
-            Some(Span::new(TextByte(start), TextByte(end)))
+            validated.push((start, end));
         }
+        // Re-validate sorted and non-overlapping on the actual source
+        if !is_validated_spans(&validated) {
+            fail(out, FailureCode::BadSpans);
+            return;
+        }
+        validated
     };
     let stream_budget = if request.report_matches == 0 {
         u64::MAX
@@ -419,7 +492,7 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
     // The parent also discards partial pages, but the helper protocol itself
     // promises that a validation failure precedes all pages (§6.2/D-05).
     let validated_output_len = if let Some(template) = &template {
-        match preflight_output(source, scope, &matcher, template, request) {
+        match preflight_output_spans(source, &scope_spans, &matcher, template, request) {
             Ok(length) => length,
             Err(failure) => {
                 fail(out, failure);
@@ -429,7 +502,7 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
     } else {
         source.len() as u64
     };
-    let iter = match matcher.iter_matches(source, scope) {
+    let iter = match matcher.iter_matches_spans(source, &scope_spans) {
         Ok(iter) => iter,
         Err(_) => {
             fail(out, FailureCode::Source);
@@ -576,6 +649,7 @@ fn run_request(out: &mut dyn Write, request: &ActiveRequest) {
     );
 }
 
+#[allow(dead_code)]
 fn preflight_output(
     source: &str,
     scope: Option<Span<TextByte>>,
@@ -589,6 +663,43 @@ fn preflight_output(
     }
     let iter = matcher
         .iter_matches(source, scope)
+        .map_err(|_| FailureCode::Source)?;
+    for item in iter {
+        if request.cancelled {
+            return Err(FailureCode::Cancelled);
+        }
+        let hit = item.map_err(|_| FailureCode::Limit)?;
+        let expansion_len = template
+            .expansion_len(matcher, &hit)
+            .map_err(|_| FailureCode::Template)?;
+        let span_len =
+            u64::try_from(hit.span.end.0 - hit.span.start.0).map_err(|_| FailureCode::Limit)?;
+        output_len = output_len
+            .checked_sub(span_len)
+            .and_then(|rest| rest.checked_add(u64::try_from(expansion_len).ok()?))
+            .ok_or(FailureCode::Limit)?;
+        if output_len > request.max_output {
+            return Err(FailureCode::Limit);
+        }
+    }
+    Ok(output_len)
+}
+
+/// Preflight for span-based matching: proves every capture/template and the
+/// final serialized UTF-8 bound for matches contained in the provided spans.
+fn preflight_output_spans(
+    source: &str,
+    scope_spans: &[(usize, usize)],
+    matcher: &Matcher,
+    template: &ReplacementTemplate,
+    request: &ActiveRequest,
+) -> Result<u64, FailureCode> {
+    let mut output_len = u64::try_from(source.len()).map_err(|_| FailureCode::Limit)?;
+    if output_len > request.max_output {
+        return Err(FailureCode::Limit);
+    }
+    let iter = matcher
+        .iter_matches_spans(source, scope_spans)
         .map_err(|_| FailureCode::Source)?;
     for item in iter {
         if request.cancelled {

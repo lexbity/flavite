@@ -117,10 +117,6 @@
       "kind": "external"
     },
     {
-      "id": "ropey",
-      "kind": "external"
-    },
-    {
       "id": "rusqlite",
       "kind": "external"
     },
@@ -134,10 +130,6 @@
     },
     {
       "id": "tracing",
-      "kind": "external"
-    },
-    {
-      "id": "tree-sitter",
       "kind": "external"
     },
     {
@@ -266,7 +258,7 @@
     },
     {
       "from": "flavite-buffer",
-      "to": "ropey",
+      "to": "tracing",
       "kind": "normal"
     },
     {
@@ -288,6 +280,11 @@
       "from": "flavite-cli",
       "to": "tracing",
       "kind": "normal"
+    },
+    {
+      "from": "flavite-cli",
+      "to": "zip",
+      "kind": "dev"
     },
     {
       "from": "flavite-edit-context",
@@ -337,6 +334,11 @@
     {
       "from": "flavite-editor",
       "to": "nucleo-matcher",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-editor",
+      "to": "tracing",
       "kind": "normal"
     },
     {
@@ -402,11 +404,6 @@
     {
       "from": "flavite-syntax",
       "to": "pulldown-cmark",
-      "kind": "normal"
-    },
-    {
-      "from": "flavite-syntax",
-      "to": "tree-sitter",
       "kind": "normal"
     },
     {
@@ -512,6 +509,11 @@
     {
       "from": "flavite-ui",
       "to": "nucleo",
+      "kind": "normal"
+    },
+    {
+      "from": "flavite-ui",
+      "to": "tracing",
       "kind": "normal"
     },
     {

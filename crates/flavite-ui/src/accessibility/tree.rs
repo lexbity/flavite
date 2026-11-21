@@ -246,12 +246,7 @@ fn context_controls(app: &App) -> Vec<ContextControl> {
         if !active || app.palette_open || app.picker.open || app.context_mode.history.open {
             continue;
         }
-        for menu in [
-            ContextMenu::Select,
-            ContextMenu::Go,
-            ContextMenu::Type,
-            ContextMenu::More,
-        ] {
+        for menu in [ContextMenu::Select, ContextMenu::Go, ContextMenu::More] {
             if !plan.menu_visible(menu) {
                 continue;
             }
@@ -968,8 +963,9 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
                 let tab = g.active();
                 let id = editor_node(app, tab);
                 let mut editor = Node::new(Role::MultilineTextInput);
+                let text = view.text.materialize();
                 editor.set_label(view.path.display().to_string());
-                editor.set_value(view.text.to_string());
+                editor.set_value(text.to_string());
                 editor.add_action(Action::Focus);
                 editor.add_action(Action::SetTextSelection);
                 if let Some(rect) = app
@@ -981,11 +977,11 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
                 }
                 let mut runs = Vec::new();
                 mounted_buffers.insert(view.buffer_id);
-                let projection = text_cache.project(view.buffer_id, &view.text);
+                let projection = text_cache.project(view.buffer_id, &text);
                 for (i, line) in projection.lines.iter().enumerate() {
                     let run = run_id(id, view.revision, i);
                     let mut node = Node::new(Role::TextRun);
-                    node.set_value(&view.text[line.start..line.end]);
+                    node.set_value(&text[line.start..line.end]);
                     node.set_character_lengths(line.lengths.to_vec());
                     nodes.push((run, node));
                     runs.push(run);
@@ -1158,8 +1154,11 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
         let mut node = Node::new(Role::Button);
         if let NodeTarget::EditorContextCommand { target, command } = &control.target
             && let Some(view) = app.note_editor_view(target.tab)
-            && let Some(effect) =
-                flavite_edit_context::effect::plan(&view.text, target.selection, *command)
+            && let Some(effect) = flavite_edit_context::effect::plan(
+                &view.text.materialize(),
+                target.selection,
+                *command,
+            )
         {
             node.set_description(effect.accessible_description());
         }

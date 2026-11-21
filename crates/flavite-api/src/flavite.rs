@@ -408,6 +408,7 @@ fn handle_edits(session: &Session, invocation: &Invocation) -> Result<SessionRes
         undo_policy,
         editor: args.editor,
         operation: args.operation.decode(args.buffer_id)?,
+        unit: None,
     }))
 }
 #[derive(Debug, Deserialize)]
@@ -625,6 +626,8 @@ const READ_NOTES_COMMAND_IDS: &[&str] = &[
     "editor.flip_selections",
     "editor.trim_selections",
     "editor.invert_selections",
+    "editor.goto_line",
+    "text.replace_plan",
 ];
 
 /// Stable token for one notice presentation acknowledgement.
@@ -695,6 +698,10 @@ pub struct Flavite {
     /// Device-local installed theme packages; `None` without an OS data
     /// directory. Theme commands run here, not on the vault session.
     pub(crate) themes: Option<crate::themes::ThemeStore>,
+    /// Vault profiles store (FEUX-0003 X06): inert TOML documents under
+    /// `<vault>/.flavite/profiles/`. Profiles are NOT live-linked; they are
+    /// explicitly applied through the settings funnel.
+    pub(crate) profiles: crate::profiles::ProfilesStore,
     /// Vault-relative user state (graph pins; W07/TD-11) behind the `Fs`.
     pub(crate) vault_user_state: flavite_vault::user_state::VaultUserStateStore,
     /// One graph base service per vault (W07/TD-12): the only graph-path
@@ -759,7 +766,7 @@ fn attach_services(
         )
     };
     let graph = crate::graph_service::GraphService::start_with_index_watch(
-        crate::doctor::cache_db_path(uuid),
+        crate::doctor::cache_db_path(root, uuid),
         Some(Arc::clone(session)),
         index_watch,
     );
@@ -772,7 +779,7 @@ fn attach_services(
     // Trigger migration if needed - this loads or creates the v2 settings document
     let _ = settings_store
         .load_or_migrate(&registry, root, data_dir, &vault_uuid)
-        .map_err(|e| eprintln!("Failed to load or migrate settings: {}", e));
+        .map_err(|e| tracing::warn!("failed to load or migrate settings: {e}"));
 
     // OS-backed vaults migrate legacy device-local layout/theme state into
     // the vault root on disk. Hermetic fixtures own virtual roots and must
@@ -794,8 +801,8 @@ fn attach_services(
                 && std::fs::read(&device_layout_path)
                     .is_ok_and(|bytes| std::fs::write(&vault_layout_path, &bytes).is_ok())
             {
-                eprintln!(
-                    "Migrated workspace layout from {} to {}",
+                tracing::info!(
+                    "migrated workspace layout from {} to {}",
                     device_layout_path.display(),
                     vault_layout_path.display()
                 );
@@ -840,8 +847,8 @@ fn attach_services(
                     copied += 1;
                 }
                 if copied > 0 {
-                    eprintln!(
-                        "Migrated {copied} theme(s) from {} to {}",
+                    tracing::info!(
+                        "migrated {copied} theme(s) from {} to {}",
                         device_themes_root.display(),
                         vault_themes_root.display()
                     );
@@ -906,6 +913,14 @@ impl Flavite {
             )
             .ok()
         };
+        let profiles = crate::profiles::ProfilesStore::at_vault(
+            if let Some(fs) = vault_fs.clone() {
+                Box::new(fs)
+            } else {
+                Box::new(flavite_fs::OsFs::new())
+            },
+            &root,
+        );
         let themes = Some(if let Some(fs) = vault_fs {
             crate::themes::ThemeStore::at_vault(Box::new(fs), &root)
         } else {
@@ -928,6 +943,7 @@ impl Flavite {
             queries,
             user_state,
             themes,
+            profiles,
             vault_user_state,
             graph,
             settings_store,
@@ -1062,6 +1078,11 @@ impl Flavite {
     ) -> Result<Self, FlaviteError> {
         let (generation_signal, generation_watch) = flavite_index::GenerationSignal::new();
         let data_dir_clone = data_dir.clone();
+        // RFC-0007 D-13: fold the vault document's resolved `[vault]`
+        // settings into the caller-supplied config BEFORE the vault actor
+        // is built (OnRestart fields take effect at open). A missing,
+        // unreadable, or schema-newer document leaves the config untouched.
+        let config = Self::vault_config_with_settings(&root, data_dir.as_deref(), config);
         let vault = Vault::open_with_data_dir_and_generation_signal(
             root,
             Box::new(flavite_fs::OsFs::new()),
@@ -1079,6 +1100,42 @@ impl Flavite {
         )?;
         flavite.owned_vault = Some(vault);
         Ok(flavite)
+    }
+
+    /// RFC-0007 D-13: map the vault document's resolved `[vault]` settings
+    /// onto a caller-supplied [`VaultConfig`] before the vault actor is
+    /// built.
+    ///
+    /// Only the OnRestart vault settings are folded in (see
+    /// [`crate::settings_store::apply_vault_settings`]). A missing document
+    /// (fresh vault), an unreadable one, or a schema-newer document
+    /// (read-only) leaves the config untouched — defaults equal
+    /// `VaultConfig::default()` by construction, so the identity case is
+    /// the common one.
+    fn vault_config_with_settings(
+        root: &Path,
+        data_dir: Option<&Path>,
+        mut config: VaultConfig,
+    ) -> VaultConfig {
+        let _ = data_dir; // migration runs in attach_services after open (idempotent)
+        let store = crate::settings_store::SettingsStore::new(
+            Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
+                Box::new(flavite_fs::OsFs::new()),
+                root,
+            )),
+            true,
+        );
+        let Ok(Some(stored)) = store.read() else {
+            return config;
+        };
+        if stored.read_only {
+            // Schema newer than this build: never interpret unknown shapes.
+            return config;
+        }
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+        let resolved = flavite_settings::resolve::RegistryResolve::resolve(&registry, &stored.doc);
+        crate::settings_store::apply_vault_settings(&mut config, &resolved);
+        config
     }
 
     /// Register built-in commands.
@@ -1151,6 +1208,12 @@ impl Flavite {
                 "Apply prepared replacement",
                 ArgSchema::typed::<crate::text_edit::ApplyReplaceArgs>(),
                 crate::text_edit::handle_apply_replace,
+            ),
+            (
+                "text.replace_plan",
+                "Compute replace plan over scope spans (FEUX-0006 E-5)",
+                ArgSchema::typed::<crate::text_edit::ReplacePlanArgs>(),
+                crate::text_edit::handle_replace_plan,
             ),
             (
                 "source_find.start",
@@ -1457,6 +1520,167 @@ impl Flavite {
                 "Select the gaps between matches",
                 ArgSchema::typed::<crate::editor_commands::EditorSelectMatchesArgs>(),
                 crate::editor_commands::handle_split_selection,
+            ),
+            (
+                "editor.keep_matching",
+                "Keep selections containing matches",
+                ArgSchema::typed::<crate::editor_commands::EditorKeepMatchingArgs>(),
+                crate::editor_commands::handle_keep_matching,
+            ),
+            // FEUX-0004 X01: Transform family
+            (
+                "editor.case_upper",
+                "Uppercase",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_case_upper,
+            ),
+            (
+                "editor.case_lower",
+                "Lowercase",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_case_lower,
+            ),
+            (
+                "editor.case_swap",
+                "Swap case",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_case_swap,
+            ),
+            (
+                "editor.case_title",
+                "Title case",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_case_title,
+            ),
+            (
+                "editor.number_inc",
+                "Increment number",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_number_inc,
+            ),
+            (
+                "editor.number_dec",
+                "Decrement number",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_number_dec,
+            ),
+            (
+                "editor.number_sequence",
+                "Number sequence",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_number_sequence,
+            ),
+            // FEUX-0004 X01: Lines family
+            (
+                "editor.lines_sort_asc",
+                "Sort lines ascending",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_lines_sort_asc,
+            ),
+            (
+                "editor.lines_sort_desc",
+                "Sort lines descending",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_lines_sort_desc,
+            ),
+            (
+                "editor.lines_sort_numeric",
+                "Sort lines numeric",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_lines_sort_numeric,
+            ),
+            (
+                "editor.lines_join",
+                "Join lines",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_lines_join,
+            ),
+            (
+                "editor.lines_duplicate",
+                "Duplicate lines",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_lines_duplicate,
+            ),
+            (
+                "editor.lines_dedupe",
+                "Deduplicate lines",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_lines_dedupe,
+            ),
+            (
+                "editor.lines_shuffle",
+                "Shuffle lines",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_lines_shuffle,
+            ),
+            (
+                "editor.lines_move_up",
+                "Move lines up",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_lines_move_up,
+            ),
+            (
+                "editor.lines_move_down",
+                "Move lines down",
+                ArgSchema::typed::<crate::editor_commands::EditorMutateArgs>(),
+                crate::editor_commands::handle_lines_move_down,
+            ),
+            // FEUX-0005 X01: Indent family
+            (
+                "editor.indent",
+                "Indent",
+                ArgSchema::typed::<crate::editor_commands::EditorIndentArgs>(),
+                crate::editor_commands::handle_editor_indent,
+            ),
+            (
+                "editor.dedent",
+                "Dedent",
+                ArgSchema::typed::<crate::editor_commands::EditorIndentArgs>(),
+                crate::editor_commands::handle_editor_dedent,
+            ),
+            // FEUX-0005 X02: Whitespace conversion
+            (
+                "editor.tabs_to_spaces",
+                "Tabs → Spaces",
+                ArgSchema::typed::<crate::editor_commands::EditorReWhitespaceArgs>(),
+                crate::editor_commands::handle_editor_tabs_to_spaces,
+            ),
+            (
+                "editor.spaces_to_tabs",
+                "Spaces → Tabs",
+                ArgSchema::typed::<crate::editor_commands::EditorReWhitespaceArgs>(),
+                crate::editor_commands::handle_editor_spaces_to_tabs,
+            ),
+            // FEUX-0004 X03: Align and Goto-line
+            (
+                "editor.lines_align",
+                "Align lines",
+                ArgSchema::typed::<crate::editor_commands::EditorLinesAlignArgs>(),
+                crate::editor_commands::handle_lines_align,
+            ),
+            (
+                "editor.goto_line",
+                "Go to line",
+                ArgSchema::typed::<crate::editor_commands::EditorGotoLineArgs>(),
+                crate::editor_commands::handle_goto_line,
+            ),
+            (
+                "editor.surround_add",
+                "Surround add",
+                ArgSchema::typed::<crate::editor_commands::EditorSurroundAddArgs>(),
+                crate::editor_commands::handle_surround_add,
+            ),
+            (
+                "editor.surround_delete",
+                "Surround delete",
+                ArgSchema::typed::<crate::editor_commands::EditorSurroundDeleteArgs>(),
+                crate::editor_commands::handle_surround_delete,
+            ),
+            (
+                "editor.surround_change",
+                "Surround change",
+                ArgSchema::typed::<crate::editor_commands::EditorSurroundChangeArgs>(),
+                crate::editor_commands::handle_surround_change,
             ),
             (
                 "buffer.history_page",
@@ -1869,6 +2093,16 @@ impl Flavite {
         self.themes.as_ref()
     }
 
+    /// The vault's profiles store (`.flavite/profiles/`), always present for
+    /// an opened vault (FEUX-0003 X06). Profiles are inert TOML documents
+    /// that capture the delta from descriptor defaults for visible settings.
+    /// They are NOT live-linked; explicit apply through the settings funnel
+    /// is required.
+    #[must_use]
+    pub fn profiles(&self) -> &crate::profiles::ProfilesStore {
+        &self.profiles
+    }
+
     /// Current number of notice credits held by the host.
     #[must_use]
     pub fn outstanding_notice_count(&self) -> usize {
@@ -1939,7 +2173,7 @@ impl Flavite {
     ///
     /// Returns `None` if no settings document exists. Use `settings_read` for
     /// a resolved view with defaults.
-    pub fn read_settings_raw(
+    pub fn read_stored_settings(
         &self,
     ) -> Result<Option<crate::settings_store::StoredSettings>, FlaviteError> {
         self.settings_store.read().map_err(FlaviteError::from)
@@ -2027,6 +2261,218 @@ impl Flavite {
         flavite_settings::registry::SettingRegistry::builtins()
     }
 
+    // ============ FEUX-0003 X06: Profile operations ============
+
+    /// List all stored profiles (FEUX-0003 X06).
+    ///
+    /// Returns a list of all profile identities sorted by name.
+    pub fn profiles_list(&self) -> Result<Vec<crate::profiles::StoredProfile>, FlaviteError> {
+        self.profiles
+            .list()
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Create a profile from the current resolved settings (FEUX-0003 X06).
+    ///
+    /// Captures the delta from descriptor defaults for visible descriptors only.
+    /// The profile is stored inertly; apply must be called separately.
+    ///
+    /// # Arguments
+    /// * `name` - The display name for the profile (sanitized and hashed for the id).
+    ///
+    /// # Returns
+    /// The stored profile on success.
+    pub fn profiles_create_from_current(
+        &self,
+        name: &str,
+    ) -> Result<crate::profiles::StoredProfile, FlaviteError> {
+        use flavite_settings::codec::serialize;
+
+        // Get the current resolved settings
+        let resolved_settings = self.settings_read()?;
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+
+        // Capture the delta using the resolved field
+        let delta_doc =
+            flavite_settings::resolve::capture_delta(&resolved_settings.resolved, &registry);
+
+        // Serialize to TOML
+        let toml_string =
+            serialize(&delta_doc).map_err(|e| FlaviteError::ProfilesParseError(e.to_string()))?;
+        let toml_bytes = toml_string.into_bytes();
+
+        // Create the profile in the store
+        self.profiles
+            .create(name, &toml_bytes)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Read a profile's raw bytes by id (FEUX-0003 X06).
+    pub fn profiles_read_bytes(&self, id: &str) -> Result<Vec<u8>, FlaviteError> {
+        self.profiles
+            .read_bytes(id)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Delete a profile by id (FEUX-0003 X06).
+    ///
+    /// # Arguments
+    /// * `id` - The internal profile id (not the display name).
+    pub fn profiles_delete(&self, id: &str) -> Result<(), FlaviteError> {
+        self.profiles
+            .delete(id)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Export a profile to a host path (FEUX-0003 X06).
+    ///
+    /// Copies the profile's TOML bytes to the specified path.
+    ///
+    /// # Arguments
+    /// * `id` - The internal profile id.
+    /// * `path` - The destination path on the host filesystem.
+    pub fn profiles_export_path(
+        &self,
+        id: &str,
+        path: &std::path::Path,
+    ) -> Result<(), FlaviteError> {
+        // Use the host OS filesystem for export, rooted at the same
+        // `<vault>/.flavite/profiles` store the vault uses.
+        let os_fs = Box::new(flavite_fs::OsFs::new());
+        let store_with_os = crate::profiles::ProfilesStore::at_vault(os_fs, &self.vault_ref().root);
+        store_with_os
+            .export_path(id, path)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Import a profile from a host path (FEUX-0003 X06).
+    ///
+    /// Reads the TOML file from the host filesystem and creates a new profile
+    /// in the vault's store.
+    /// The profile name is derived from the file stem.
+    ///
+    /// # Arguments
+    /// * `path` - The source path on the host filesystem.
+    ///
+    /// # Returns
+    /// The stored profile on success.
+    pub fn profiles_import_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<crate::profiles::StoredProfile, FlaviteError> {
+        // Use the host OS filesystem for import, rooted at the same
+        // `<vault>/.flavite/profiles` store the vault uses.
+        let os_fs = Box::new(flavite_fs::OsFs::new());
+        let store_with_os = crate::profiles::ProfilesStore::at_vault(os_fs, &self.vault_ref().root);
+        store_with_os
+            .import_path(path)
+            .map_err(|e| FlaviteError::ProfilesError(e.to_string()))
+    }
+
+    /// Apply a profile to the current settings (FEUX-0003 X06/E-13).
+    ///
+    /// This is a ONE atomic CAS write through the settings funnel:
+    /// 1. Read the profile document
+    /// 2. Parse with the codec (schema > 2 -> refuse)
+    /// 3. Merge: clone current doc, set each applicable key (known-visible only;
+    ///    invalid values substituted with warnings; unknown/hidden skipped with warnings)
+    /// 4. Write once via settings_write CAS
+    /// 5. On success: re-resolve, live-apply, report counts + pending restart
+    ///
+    /// Apply is NOT undoable step-wise and has NO confirmation dialog.
+    /// Recovery is the always-visible "Restore last settings backup" affordance.
+    ///
+    /// # Arguments
+    /// * `id` - The internal profile id.
+    ///
+    /// # Returns
+    /// A result with counts of changed settings and restart-pending settings.
+    pub fn profiles_apply(&self, id: &str) -> Result<ApplyProfileResult, FlaviteError> {
+        use flavite_settings::codec::parse;
+
+        // Step 1: Read the profile bytes
+        let profile_bytes = self.profiles_read_bytes(id)?;
+
+        // Step 2: Parse the profile document
+        let profile_text = String::from_utf8(profile_bytes)
+            .map_err(|e| FlaviteError::ProfilesParseError(e.to_string()))?;
+        let parsed = parse(Some(&profile_text))
+            .map_err(|e| FlaviteError::ProfilesParseError(e.to_string()))?;
+
+        // Check schema version (must be <= 2)
+        if parsed.doc.schema > 2 {
+            return Err(FlaviteError::ProfilesSchemaNewer);
+        }
+
+        // Step 3: Get current document and generation
+        let stored_settings = self
+            .settings_store
+            .read()?
+            .ok_or(FlaviteError::ProfilesError(
+                "No settings document found".to_string(),
+            ))?;
+        let current_doc = stored_settings.doc;
+        let current_generation = stored_settings.generation;
+        let registry = flavite_settings::registry::SettingRegistry::with_builtins();
+
+        // Step 4: Merge: clone current, apply profile overrides
+        let mut merged_doc = current_doc.clone();
+        let mut changed_count = 0;
+        let mut warnings = Vec::new();
+        let mut restart_pending = 0;
+        let profile_doc = &parsed.doc;
+
+        // Apply each section/key from the profile
+        for (section, section_map) in &profile_doc.sections {
+            for (key, value) in section_map {
+                let full_key = format!("{}.{}", section, key);
+
+                // Check if this is a known descriptor
+                if let Some(descriptor) = registry.lookup(&full_key) {
+                    // Check visibility (E-12: hidden keys are never applied)
+                    if descriptor.visibility == flavite_settings::descriptor::Visibility::Hidden {
+                        warnings.push(format!("Skipping hidden key: {full_key}"));
+                        continue;
+                    }
+
+                    // Validate the value against the descriptor
+                    if let Err(validate_err) = descriptor.validate_value(value) {
+                        warnings.push(format!("Invalid value for {full_key}: {validate_err}"));
+                        // Substitute with descriptor default
+                        let default_value = descriptor.kind.default_value();
+                        let _ = merged_doc.set(&full_key, default_value, &registry);
+                        continue;
+                    }
+
+                    // Set the value
+                    let _ = merged_doc.set(&full_key, value.clone(), &registry);
+                    changed_count += 1;
+
+                    // Check if this requires restart
+                    if descriptor.apply == flavite_settings::descriptor::Apply::OnRestart {
+                        restart_pending += 1;
+                    }
+                } else {
+                    // Unknown key: preserve in stored file but skip on apply with warning
+                    warnings.push(format!("Unknown key: {full_key}"));
+                }
+            }
+        }
+
+        // Step 5: Write via CAS (using the generation we already retrieved)
+        self.settings_write(&merged_doc, current_generation)
+            .map_err(|e| FlaviteError::SettingsWriteError(e.to_string()))?;
+
+        // Re-resolve settings to apply changes
+        let _ = self.settings_read()?;
+
+        Ok(ApplyProfileResult {
+            changed: changed_count,
+            restart_pending,
+            warnings,
+        })
+    }
+
     /// Test-only seam: rewire every vault-rooted store (vault user state,
     /// theme packages, settings) onto a caller-owned `MemFs` so vault
     /// persistence is exercised hermetically — fixtures root vaults at
@@ -2042,6 +2488,7 @@ impl Flavite {
             Box::new(fs.clone()),
             &root,
         ));
+        self.profiles = crate::profiles::ProfilesStore::at_vault(Box::new(fs.clone()), &root);
         let settings_vault_store = Arc::new(flavite_vault::user_state::VaultUserStateStore::new(
             Box::new(fs.clone()),
             &root,
@@ -2091,6 +2538,11 @@ impl Flavite {
 
     /// The turn body: ingress-serialized validation + dispatch + conversion.
     fn execute_turn(&self, invocation: Invocation) -> ExecutionResult {
+        // RFC-0008 S1 (FR-10): the api turn phase of the keystroke path. The
+        // command id is a borrowed &str — no string formatting on the hot
+        // path; args are never logged.
+        let _api_turn =
+            tracing::info_span!("edit.api_turn", command = %invocation.command_id).entered();
         let _turn = self.ingress.lock_recovering();
         if let Err(error) = self
             .command_registry
@@ -2119,8 +2571,11 @@ impl Flavite {
         // Every required capability of the spec must be covered; the
         // registry is the single enforcement point (no command-id special
         // cases on the dispatch path).
+        // RFC-0008 S7 (debt): the spec is fetched once per turn — three
+        // clones per keystroke were being made for read-only checks.
+        let spec = self.command_registry.get_spec(invocation.command_id);
         let target = self.command_target(&invocation);
-        if let Some(spec) = self.command_registry.get_spec(invocation.command_id) {
+        if let Some(spec) = &spec {
             for required in &spec.required_capabilities {
                 if !invocation
                     .capabilities
@@ -2148,10 +2603,7 @@ impl Flavite {
         }
         // Replays retain their original completion even after text or view
         // state advances. Capability and vault policy checks still apply.
-        if self
-            .command_registry
-            .get_spec(invocation.command_id)
-            .is_some_and(|spec| spec.requires_write)
+        if spec.as_ref().is_some_and(|spec| spec.requires_write)
             && let Some(buffer) = invocation
                 .args
                 .get("buffer_id")
@@ -2165,35 +2617,29 @@ impl Flavite {
         }
         if let Some(buffer_id) = invocation.preconditions.buffer_id {
             let revision = invocation.preconditions.expected_revision;
-            match self.get_buffer_view(BufferId::from(buffer_id), revision.map(Revision::new)) {
+            // RFC-0011 T13: validate preconditions against the O(1) shared
+            // snapshot — never materialize the discarded `String` the
+            // serialized `BufferView` path would build.
+            match self
+                .session
+                .shared_buffer_snapshot(BufferId::from(buffer_id), revision.map(Revision::new))
+            {
                 Ok(_) => {}
-                Err(FlaviteError::BufferNotFound(_)) => {
+                Err(flavite_vault::session::BufferSnapshotError::NotFound(_)) => {
                     return ExecutionResult::Rejected(RejectedResult::with_request(
                         RejectionReason::BufferNotFound,
                         invocation.request_id,
                     ));
                 }
-                Err(FlaviteError::StaleBufferView { .. }) => {
+                Err(flavite_vault::session::BufferSnapshotError::Stale { .. }) => {
                     return ExecutionResult::Rejected(RejectedResult::with_request(
                         RejectionReason::StaleRevision,
                         invocation.request_id,
                     ));
                 }
-                Err(error) => {
-                    return ExecutionResult::Rejected(
-                        RejectedResult::with_request(
-                            RejectionReason::Unsupported,
-                            invocation.request_id,
-                        )
-                        .with_message(error.to_string()),
-                    );
-                }
             }
         }
-        let requires_write = self
-            .command_registry
-            .get_spec(invocation.command_id)
-            .is_some_and(|spec| spec.requires_write)
+        let requires_write = spec.as_ref().is_some_and(|spec| spec.requires_write)
             || invocation.preconditions.requires_write;
         // The write policy is a property of the opened vault, never of the
         // caller's preconditions (TD-17): a read-only vault rejects every
@@ -2484,10 +2930,16 @@ impl Flavite {
             SessionResult::Success(crate::session::CommandResult::ReplacePrepared { .. }) => {
                 "text.prepare_replace"
             }
+            SessionResult::Success(crate::session::CommandResult::ReplacePlan { .. }) => {
+                "text.replace_plan"
+            }
             SessionResult::Success(crate::session::CommandResult::Found { .. }) => "text.find",
             SessionResult::Success(crate::session::CommandResult::MatchesCollected { .. }) => {
                 "editor.select_matches"
             }
+            SessionResult::Success(crate::session::CommandResult::KeepMatchingCollected {
+                ..
+            }) => "editor.keep_matching",
             SessionResult::Success(
                 crate::session::CommandResult::SelectionCollectionCancelled { .. },
             ) => "editor.cancel_selection",
@@ -2610,12 +3062,14 @@ impl Flavite {
                         new_revision,
                         movement,
                         after_selections,
+                        unit,
                     } => {
                         serde_json::json!({
                             "buffer_id": buffer_id.as_u64(),
                             "revision": new_revision.as_u64(),
                             "movement": movement,
                             "after_selections": after_selections,
+                            "unit": unit.map(|u| u.display()),
                         })
                     }
                     crate::session::CommandResult::OperationIssued {
@@ -2810,6 +3264,24 @@ impl Flavite {
                             "truncated": truncated,
                         })
                     }
+                    crate::session::CommandResult::ReplacePlan {
+                        buffer_id,
+                        revision,
+                        match_count,
+                        output_len,
+                        ops,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "match_count": match_count,
+                            "output_len": output_len,
+                            "ops": ops
+                                .into_iter()
+                                .map(|(start, end, replacement)| serde_json::json!([start, end, replacement]))
+                                .collect::<Vec<_>>(),
+                        })
+                    }
                     crate::session::CommandResult::MatchesCollected {
                         buffer_id,
                         revision,
@@ -2826,6 +3298,19 @@ impl Flavite {
                                 .collect::<Vec<[u64; 2]>>(),
                             "total_matches": total_matches,
                             "zero_width_count": zero_width_count,
+                        })
+                    }
+                    crate::session::CommandResult::KeepMatchingCollected {
+                        buffer_id,
+                        revision,
+                        selection_indices,
+                        match_count,
+                    } => {
+                        serde_json::json!({
+                            "buffer_id": buffer_id.as_u64(),
+                            "revision": revision.as_u64(),
+                            "selection_indices": selection_indices,
+                            "match_count": match_count,
                         })
                     }
                     crate::session::CommandResult::SelectionCollectionCancelled { request_id } => {
@@ -3145,7 +3630,9 @@ impl Flavite {
         Ok(BufferView {
             buffer_id: snapshot.buffer_id.as_u64(),
             revision: snapshot.revision.as_u64(),
-            text: snapshot.text.to_string(),
+            // Serialized surface: materialize at serialization time
+            // (client-paced; RFC-0011 FR-9).
+            text: snapshot.text.materialize().to_string(),
             base_hash: snapshot
                 .base_hash
                 .map_or_else(Vec::new, |hash| hash.to_vec()),
@@ -3183,13 +3670,14 @@ impl Flavite {
             state: snapshot.state,
             path: snapshot.path,
             source_format: snapshot.source_format,
+            last_edit: snapshot.last_edit,
         })
     }
 
     /// Current index and watcher summary for CLI and diagnostics.
     pub fn vault_info(&self) -> Result<VaultInfo, FlaviteError> {
         let version = self.session.version().map_err(FlaviteError::IndexError)?;
-        let db_path = crate::doctor::cache_db_path(self.vault_ref.uuid);
+        let db_path = crate::doctor::cache_db_path(&self.vault_ref.root, self.vault_ref.uuid);
         let (note_count, tantivy_generation) = if db_path.exists() {
             let connection = rusqlite::Connection::open_with_flags(
                 &db_path,
@@ -3373,8 +3861,10 @@ pub struct SharedBufferView {
     pub buffer_id: u64,
     /// Buffer revision.
     pub revision: u64,
-    /// Shared normalized text.
-    pub text: Arc<str>,
+    /// Shared normalized text as an immutable chunk-tree root. Consumers
+    /// slice or materialize on their own side of the channel boundary —
+    /// never on the session's keystroke path (RFC-0011 D-10/D-11).
+    pub text: flavite_buffer::chunks::DocumentText,
     /// Base hash.
     pub base_hash: Vec<u8>,
     /// Typed canonical buffer state.
@@ -3383,6 +3873,11 @@ pub struct SharedBufferView {
     pub path: PathBuf,
     /// Authoritative save-format descriptor of this revision (§6.10).
     pub source_format: flavite_encoding::SourceFormat,
+    /// Single-edit changed-range hint, session-computed (RFC-0008 D1/D9):
+    /// never crosses the JSON command surface, never client-supplied.
+    /// `None` for external reloads, merges, journal patches, first open,
+    /// and multi-op batches.
+    pub last_edit: Option<flavite_syntax::EditRange>,
 }
 
 /// Result of a query.
@@ -3489,6 +3984,22 @@ pub enum FlaviteError {
     #[error("Theme store error: {0}")]
     ThemeStore(String),
 
+    /// Profiles store error (FEUX-0003 X06).
+    #[error("Profiles store error: {0}")]
+    ProfilesError(String),
+
+    /// Profile parse error (FEUX-0003 X06).
+    #[error("Profile parse error: {0}")]
+    ProfilesParseError(String),
+
+    /// Profile schema is newer than supported (FEUX-0003 X06).
+    #[error("Profile schema version is newer than supported")]
+    ProfilesSchemaNewer,
+
+    /// Settings write error (FEUX-0003 X06).
+    #[error("Settings write error: {0}")]
+    SettingsWriteError(String),
+
     /// JSON serialization error.
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
@@ -3508,6 +4019,17 @@ pub mod session {
 pub mod channels {
     pub use flavite_buffer::manager::NoteRef;
     pub use flavite_vault::channels::{Notice, Pulse, RenameTier};
+}
+
+/// Result of applying a profile (FEUX-0003 X06).
+#[derive(Debug, Clone)]
+pub struct ApplyProfileResult {
+    /// Number of settings changed.
+    pub changed: usize,
+    /// Number of settings requiring restart.
+    pub restart_pending: usize,
+    /// Warnings from the apply operation (unknown keys, invalid values, etc.).
+    pub warnings: Vec<String>,
 }
 
 /// Terminal completion for an asynchronous public command.
@@ -3876,6 +4398,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         });
         assert!(matches!(
             flavite.get_buffer_view(buffer_id, Some(Revision::new(initial.revision))),
@@ -4131,6 +4654,7 @@ mod tests {
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         });
         fs.write_new(&root.join(".external"), b"external").unwrap();
         fs.rename_replace(&root.join(".external"), &root.join("note.md"))
@@ -4670,6 +5194,7 @@ mod tests {
                 new_revision: revision,
                 movement: None,
                 after_selections: None,
+                unit: None,
             },
             CommandResult::NoteSaved {
                 buffer_id: buffer,

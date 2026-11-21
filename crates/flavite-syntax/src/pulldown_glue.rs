@@ -6,10 +6,11 @@
 //! 3. Run the [`crate::scanner`] on the unmasked text to extract link/tag/block-ID spans.
 //!
 //! The scanner is the **single semantics source** for what counts as a link/tag;
-//! tree-sitter never decides this (D10). Both parse paths use the same scanner,
-//! which is what makes AC-5 parity possible.
+//! the parser only decides what text reaches it (D10). The segment cache and
+//! the whole-document bridge share this module, which is what makes AC-5
+//! parity structural.
 
-use crate::mask::{TextMask, math_ranges};
+use crate::mask::{TextMask, find_frontmatter_close, math_ranges};
 use crate::scanner::{ScannedSpan, SpanKind, scan_inline};
 use crate::text::{Span, TextByte, TextSnapshot};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -100,6 +101,48 @@ pub fn parse_snapshot(snapshot: TextSnapshot) -> Result<ParsedNote, String> {
     {
         excluded.push(0..close);
     }
+    let pass = event_pass(text, excluded);
+    let (links, tags, block_ids, headings, mask) = finish_pass(&snapshot, text, pass);
+    Ok(ParsedNote {
+        snapshot,
+        links,
+        tags,
+        block_ids,
+        headings,
+        mask,
+    })
+}
+
+/// Parse `text` as one prose segment (RFC-0011 S5): the same pulldown
+/// event pass and scanner as [`parse_snapshot`], without the document-level
+/// frontmatter branch (frontmatter is a separate segment). Spans are
+/// returned in coordinates relative to `text`; the segment cache offsets
+/// them into document coordinates. Used by the segment cache so per-segment
+/// spans are byte-identical to the whole-document bridge by construction.
+pub(crate) fn parse_prose_segment(text: &str) -> Result<ProseSpans, String> {
+    if text.contains('\0') {
+        return Err("markdown contains an embedded NUL byte".into());
+    }
+    let snapshot = TextSnapshot::from_normalized(text);
+    let pass = event_pass(text, Vec::new());
+    let (links, tags, block_ids, _headings, _mask) = finish_pass(&snapshot, text, pass);
+    Ok((links, tags, block_ids))
+}
+
+/// Prose spans: links, tags, block IDs (all in the segment's own
+/// coordinates).
+pub(crate) type ProseSpans = (Vec<Link>, Vec<Span<TextByte>>, Vec<Span<TextByte>>);
+
+/// The shared pulldown event pass: exclusion ranges + prose scan windows +
+/// headings. `initial_excluded` carries document-level exclusions (e.g.
+/// frontmatter) that precede the event stream.
+struct EventPass {
+    excluded: Vec<Range<usize>>,
+    scan_ranges: Vec<Range<usize>>,
+    headings: Vec<(HeadingLevel, String)>,
+}
+
+fn event_pass(text: &str, initial_excluded: Vec<Range<usize>>) -> EventPass {
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
@@ -110,6 +153,7 @@ pub fn parse_snapshot(snapshot: TextSnapshot) -> Result<ParsedNote, String> {
     let mut code_start = None;
     let mut pending = 0..0;
     let mut scan_ranges = Vec::new();
+    let mut excluded = initial_excluded;
 
     // One CommonMark event pass supplies both exclusion ranges and the
     // canonical prose windows. Keep byte ranges instead of copying prose
@@ -176,14 +220,33 @@ pub fn parse_snapshot(snapshot: TextSnapshot) -> Result<ParsedNote, String> {
         }
     }
     flush_scan_range(&mut scan_ranges, &mut pending);
+    EventPass {
+        excluded,
+        scan_ranges,
+        headings,
+    }
+}
+
+/// The full output of one event pass after scanning: spans, headings, and
+/// the built mask.
+type FinishPassOutput = (
+    Vec<Link>,
+    Vec<Span<TextByte>>,
+    Vec<Span<TextByte>>,
+    Vec<(HeadingLevel, String)>,
+    TextMask,
+);
+
+fn finish_pass(snapshot: &TextSnapshot, text: &str, pass: EventPass) -> FinishPassOutput {
+    let mut excluded = pass.excluded;
     excluded.extend(math_ranges(text, &excluded));
     let mask = TextMask::new(excluded, text.len());
     let mut links = Vec::new();
     let mut tags = Vec::new();
     let mut block_ids = Vec::new();
-    for prose in scan_ranges {
+    for prose in pass.scan_ranges {
         for range in mask.unmasked(&prose) {
-            for span in scan_inline(&snapshot, range) {
+            for span in scan_inline(snapshot, range) {
                 match span.kind {
                     SpanKind::Link | SpanKind::Embed => {
                         if let Some(link) = Link::from_scanned(span) {
@@ -196,14 +259,7 @@ pub fn parse_snapshot(snapshot: TextSnapshot) -> Result<ParsedNote, String> {
             }
         }
     }
-    Ok(ParsedNote {
-        snapshot,
-        links,
-        tags,
-        block_ids,
-        headings,
-        mask,
-    })
+    (links, tags, block_ids, pass.headings, mask)
 }
 
 fn flush_scan_range(ranges: &mut Vec<Range<usize>>, pending: &mut Range<usize>) {
@@ -211,22 +267,6 @@ fn flush_scan_range(ranges: &mut Vec<Range<usize>>, pending: &mut Range<usize>) 
         ranges.push(pending.clone());
         pending.end = pending.start;
     }
-}
-
-/// Find the closing `---` or `...` delimiter for frontmatter.
-fn find_frontmatter_close(text: &str) -> Option<usize> {
-    let after_open = 3; // Skip initial "---"
-    let rest = &text[after_open..];
-
-    let mut line_start = 0usize;
-    for line in rest.lines() {
-        let trimmed = line.trim();
-        if trimmed == "---" || trimmed == "..." {
-            return Some(after_open + line_start + line.len());
-        }
-        line_start += line.len() + 1;
-    }
-    None
 }
 
 #[cfg(test)]

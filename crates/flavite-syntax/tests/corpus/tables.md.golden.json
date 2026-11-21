@@ -1,0 +1,103 @@
+{
+  "links": [
+    {
+      "start": 39,
+      "end": 45,
+      "target_raw": "t1",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 63,
+      "end": 75,
+      "target_raw": "t2",
+      "alias": "Alias",
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 93,
+      "end": 106,
+      "target_raw": "t3",
+      "alias": null,
+      "anchor": "anchor",
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 124,
+      "end": 130,
+      "target_raw": "t4",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 251,
+      "end": 257,
+      "target_raw": "u1",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 279,
+      "end": 285,
+      "target_raw": "u2",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 350,
+      "end": 359,
+      "target_raw": "thead",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      48,
+      52
+    ],
+    [
+      78,
+      82
+    ],
+    [
+      109,
+      113
+    ],
+    [
+      133,
+      137
+    ]
+  ],
+  "block_ids": [
+    [
+      55,
+      58
+    ],
+    [
+      85,
+      88
+    ],
+    [
+      116,
+      119
+    ],
+    [
+      140,
+      143
+    ]
+  ]
+}

@@ -45,6 +45,9 @@ pub trait OpStoreIo: Send + Sync {
     fn fsync_dir(&self, path: &Path) -> Result<(), String>;
     /// Remove one file (idempotent for absent files).
     fn remove(&self, path: &Path) -> Result<(), String>;
+    /// Recursively remove a directory tree (job scratch cleanup); fails
+    /// when the path does not exist or is not a directory.
+    fn remove_dir_all(&self, path: &Path) -> Result<(), String>;
 }
 
 /// Store error (typed, redacted).
@@ -310,8 +313,9 @@ impl ReplaceStore {
             }
         }
         let _ = io.remove(&manifest);
-        let _ = io.remove(&dir.join("payloads"));
-        let _ = io.remove(&dir);
+        // Remove the whole job directory (payloads + extras) recursively now
+        // that the I/O surface supports directory-tree removal.
+        let _ = io.remove_dir_all(&dir);
         Ok(())
     }
 }
@@ -373,6 +377,9 @@ mod tests {
         }
         fn remove(&self, path: &Path) -> Result<(), String> {
             self.0.remove(path).map_err(|e| e.to_string())
+        }
+        fn remove_dir_all(&self, path: &Path) -> Result<(), String> {
+            self.0.remove_dir_all(path).map_err(|e| e.to_string())
         }
     }
 

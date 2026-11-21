@@ -61,6 +61,8 @@ struct Harness {
     fs: MemFs,
     root: PathBuf,
     #[allow(dead_code)]
+    root_dir: tempfile::TempDir,
+    #[allow(dead_code)]
     db_dir: tempfile::TempDir,
     #[allow(dead_code)]
     data_dir: tempfile::TempDir,
@@ -68,10 +70,13 @@ struct Harness {
 
 /// Build a Session over MemFs with hermetic index + device-local data dirs,
 /// exactly like the in-crate `test_session` harness but with the explicit
-/// data dir the hint store and recovery writer root under.
+/// data dir the hint store and recovery writer root under. The vault root
+/// is REAL: `.flavite/` (hints, recovery) is OS-addressable, while note
+/// content flows through the MemFs.
 fn harness() -> Harness {
     let fs = MemFs::new();
-    let root = PathBuf::from("/test/vault");
+    let root_dir = tempfile::tempdir().expect("vault root");
+    let root = root_dir.path().to_path_buf();
     fs.create_dir_all(&root).expect("vault root");
     let db_dir = tempfile::tempdir().expect("index dir");
     let db = db_dir.path().join("index.sqlite3");
@@ -104,6 +109,7 @@ fn harness() -> Harness {
         session,
         fs,
         root,
+        root_dir,
         db_dir,
         data_dir,
     }
@@ -168,7 +174,7 @@ fn open_note(session: &Session, path: &Path) -> (BufferId, Revision, String, Sou
     (
         buffer_id,
         revision,
-        snapshot.text.to_string(),
+        snapshot.text.materialize().to_string(),
         snapshot.source_format,
     )
 }
@@ -207,6 +213,7 @@ fn utf16le_bom_open_edit_save_preserves_descriptor_and_bytes() {
                 None,
             )
             .expect("fixture activation"),
+        unit: None,
     });
     let applied = expect_success(result, "apply edits");
     let CommandResult::EditsApplied { new_revision, .. } = applied else {
@@ -292,7 +299,7 @@ fn reopen_encoding_binds_hint_and_preserves_text() {
         .shared_buffer_snapshot(buffer_id, None)
         .expect("snapshot after reopen");
     assert_eq!(
-        snapshot.text.to_string(),
+        snapshot.text.materialize().to_string(),
         "bom note body\n",
         "text unchanged"
     );
@@ -341,6 +348,7 @@ fn reopen_encoding_refuses_dirty_buffer() {
                 None,
             )
             .expect("fixture activation"),
+        unit: None,
     });
     expect_success(result, "apply edits");
 
@@ -358,7 +366,10 @@ fn reopen_encoding_refuses_dirty_buffer() {
         .session
         .shared_buffer_snapshot(buffer_id, None)
         .expect("snapshot");
-    assert_eq!(snapshot.text.to_string(), "draft saved base\n");
+    assert_eq!(
+        snapshot.text.materialize().to_string(),
+        "draft saved base\n"
+    );
     let view = h.session.encoding_hints();
     assert!(
         !view
@@ -422,7 +433,7 @@ fn convert_encoding_then_save_writes_utf16be_bom() {
         .shared_buffer_snapshot(buffer_id, None)
         .expect("snapshot after convert");
     assert_eq!(
-        snapshot.text.to_string(),
+        snapshot.text.materialize().to_string(),
         text,
         "text unchanged by conversion"
     );

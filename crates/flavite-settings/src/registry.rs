@@ -71,6 +71,23 @@ impl SettingRegistry {
                 Apply::Live,
                 false,
             ),
+            SettingDescriptor::new(
+                "appearance.keyboard_layout",
+                "Appearance",
+                "Keyboard Layout",
+                "Declared physical layout for Context Mode key labels",
+                SettingKind::Choice(&[
+                    ("qwerty", "QWERTY"),
+                    ("dvorak", "Dvorak"),
+                    ("colemak", "Colemak"),
+                    ("azerty", "AZERTY"),
+                    ("qwertz", "QWERTZ"),
+                ]),
+                SettingValue::Str("qwerty".to_owned()),
+                Visibility::Visible,
+                Apply::Live,
+                false,
+            ),
             // Editor settings
             SettingDescriptor::new(
                 "editor.font_size",
@@ -212,6 +229,17 @@ impl SettingRegistry {
                 Apply::Live,
                 false,
             ),
+            SettingDescriptor::new(
+                "shortcuts.context_keys",
+                "Shortcuts",
+                "Context Mode Keys",
+                "Binding-id to physical-position overrides for Context Mode (e.g. physical:KeyD, unbound)",
+                SettingKind::ShortcutMap,
+                SettingValue::ShortcutMap(BTreeMap::new()),
+                Visibility::Visible,
+                Apply::Live,
+                false,
+            ),
             // State settings (hidden)
             SettingDescriptor::new(
                 "state.graph_activation_acknowledged",
@@ -303,8 +331,9 @@ mod tests {
     fn test_builtins_count() {
         // RFC-0007 D-04 specifies 16 descriptors (15 visible + 1 hidden);
         // FEUX-0002 X07 adds the typed `editor.burst_hint_enabled` bool.
+        // FEUX-0003 X03 adds shortcuts.context_keys and appearance.keyboard_layout.
         let descriptors = SettingRegistry::builtins();
-        assert_eq!(descriptors.len(), 17);
+        assert_eq!(descriptors.len(), 19);
     }
 
     #[test]
@@ -335,7 +364,9 @@ mod tests {
         let registry = SettingRegistry::with_builtins();
         let visible = registry.visible();
         // 16 visible + 1 hidden = 17 total (X07 burst-hint bool visible)
-        assert_eq!(visible.len(), 16);
+        // FEUX-0003 X03 adds 2 visible descriptors (context_keys, keyboard_layout)
+        // So now: 18 visible + 1 hidden = 19 total
+        assert_eq!(visible.len(), 18);
     }
 
     #[test]
@@ -374,11 +405,13 @@ mod tests {
         }
 
         // All D-04 IDs plus the X07 burst-hint bool
+        // FEUX-0003 X03 adds shortcuts.context_keys and appearance.keyboard_layout
         let expected_ids = vec![
             "appearance.theme",
             "appearance.theme_package",
             "appearance.scale_pct",
             "appearance.reduced_motion",
+            "appearance.keyboard_layout",
             "editor.font_size",
             "editor.line_width",
             "editor.burst_hint_enabled",
@@ -391,6 +424,7 @@ mod tests {
             "vault.change_log_budget_mib",
             "vault.ignore_globs",
             "shortcuts.overrides",
+            "shortcuts.context_keys",
             "state.graph_activation_acknowledged",
         ];
 

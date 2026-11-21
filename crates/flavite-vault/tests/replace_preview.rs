@@ -223,6 +223,7 @@ fn source_find_freezes_scope_and_excludes_dirty_buffers() {
                         None,
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
         ),
         "dirty edit",
@@ -415,6 +416,7 @@ fn draft_inclusion_is_an_explicit_opt_in_and_clean_lineage_is_recorded() {
                         None,
                     )
                     .expect("fixture activation"),
+                unit: None,
             }),
         ),
         "dirty edit",

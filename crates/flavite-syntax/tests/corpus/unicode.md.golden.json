@@ -1,0 +1,47 @@
+{
+  "links": [
+    {
+      "start": 21,
+      "end": 46,
+      "target_raw": "ünïcode-link",
+      "alias": "Aliás",
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 91,
+      "end": 105,
+      "target_raw": "emoji-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 228,
+      "end": 273,
+      "target_raw": "日本語ノート",
+      "alias": "表示名",
+      "anchor": "アンカー",
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      127,
+      131
+    ],
+    [
+      134,
+      137
+    ]
+  ],
+  "block_ids": [
+    [
+      187,
+      194
+    ]
+  ]
+}

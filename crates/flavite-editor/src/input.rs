@@ -127,7 +127,7 @@ pub fn prepare(
     set: &SelectionSet,
     input: &CapturedInput,
 ) -> Result<PreparedInput, &'static str> {
-    let text = &view.text;
+    let text = view.text.materialize();
     let unchanged = || PreparedInput::Selection {
         members: member_pairs(set),
         primary: primary_index(set),
@@ -142,7 +142,7 @@ pub fn prepare(
             }
             op => op,
         };
-        let prepared = plan(text, set, &edit_operation)
+        let prepared = plan(&text, set, &edit_operation)
             .map_err(|_| "Selection changed; place the caret again")?;
         if prepared.ops.is_empty() {
             // Zero-effect (e.g. an empty line's Delete): no history node.
@@ -163,7 +163,7 @@ pub fn prepare(
     }
     if input.action == KeyAction::Copy {
         let fragments =
-            copy_fragments(text, set).map_err(|_| "Selection changed; place the caret again")?;
+            copy_fragments(&text, set).map_err(|_| "Selection changed; place the caret again")?;
         return Ok(PreparedInput::Copy {
             text: fragments.join("\n"),
         });
@@ -181,7 +181,7 @@ pub fn prepare(
         for (index, member) in set.iter().enumerate() {
             let sticky = input.preferred_x.get(index).copied().flatten();
             let (at, column) =
-                crate::navigation::vertical_target(text, member.head(), *vertical, sticky);
+                crate::navigation::vertical_target(&text, member.head(), *vertical, sticky);
             let anchor = if input.extend { member.anchor() } else { at };
             members.push((anchor, at));
             preferred_x.push(Some(column));
@@ -194,7 +194,7 @@ pub fn prepare(
         });
     }
     if let Some(motion) = motion_of(input.action, input.document_boundary) {
-        let moved = motion::apply(text, set, motion, input.extend, None)
+        let moved = motion::apply(&text, set, motion, input.extend, None)
             .map_err(|_| "Selection changed; place the caret again")?;
         return Ok(PreparedInput::Selection {
             primary: primary_index(&moved),
@@ -226,6 +226,7 @@ mod tests {
             text: "one café\n雪 three".into(),
             path: "note.md".into(),
             state: flavite_buffer::state::BufferState::Clean,
+            last_edit: None,
         }
     }
 
@@ -273,7 +274,7 @@ mod tests {
         let view = view();
         let mut key = input(KeyAction::Paste);
         key.text = "a\r\nb\rc".into();
-        let set = set_of(&view.text, &[(0, 0)]);
+        let set = set_of(&view.text.materialize(), &[(0, 0)]);
         let (action, members, clipboard) = edit_of(prepare(&view, &set, &key).unwrap());
         assert_eq!(members, vec![(5, 5)]);
         assert!(clipboard.is_none());
@@ -286,19 +287,19 @@ mod tests {
         let view = view();
         let mut key = input(KeyAction::NextWord);
         key.extend = true;
-        let set = set_of(&view.text, &[(0, 4)]);
+        let set = set_of(&view.text.materialize(), &[(0, 4)]);
         let PreparedInput::Selection { members, .. } = prepare(&view, &set, &key).unwrap() else {
             panic!("selection");
         };
         assert_eq!(members, vec![(0, 9)]);
         key.action = KeyAction::BackspaceWord;
-        let set = set_of(&view.text, &[(9, 9)]);
+        let set = set_of(&view.text.materialize(), &[(9, 9)]);
         let (action, members, _) = edit_of(prepare(&view, &set, &key).unwrap());
         assert_eq!(members, vec![(4, 4)]);
         let (_, _, edits) = action.as_edit().unwrap();
         assert_eq!((edits[0].range.start.0, edits[0].range.end.0), (4, 9));
         // An existing selection takes precedence over the word modifier.
-        let set = set_of(&view.text, &[(0, 3)]);
+        let set = set_of(&view.text.materialize(), &[(0, 3)]);
         let (action, _, _) = edit_of(prepare(&view, &set, &key).unwrap());
         assert_eq!(action.as_edit().unwrap().2[0].range.end.0, 3);
     }
@@ -308,7 +309,7 @@ mod tests {
         let view = view();
         let mut key = input(KeyAction::Insert);
         key.text = "_".into();
-        let set = set_of(&view.text, &[(0, 0), (4, 6)]);
+        let set = set_of(&view.text.materialize(), &[(0, 0), (4, 6)]);
         let (action, members, _) = edit_of(prepare(&view, &set, &key).unwrap());
         let (_, _, edits) = action.as_edit().unwrap();
         assert_eq!(edits.len(), 2, "one atomic batch");
@@ -323,7 +324,7 @@ mod tests {
         let view = view();
         let key = input(KeyAction::Backspace);
         // Two carets on one line, both backspacing onto the same point.
-        let set = set_of(&view.text, &[(1, 1), (2, 2)]);
+        let set = set_of(&view.text.materialize(), &[(1, 1), (2, 2)]);
         let (_, members, _) = edit_of(prepare(&view, &set, &key).unwrap());
         assert_eq!(members, vec![(0, 0)], "collided carets merge");
     }
@@ -332,7 +333,7 @@ mod tests {
     fn cut_joins_fragments_with_lf_in_document_order() {
         let view = view();
         let key = input(KeyAction::Cut);
-        let set = set_of(&view.text, &[(0, 3), (14, 19)]);
+        let set = set_of(&view.text.materialize(), &[(0, 3), (14, 19)]);
         let (_, members, clipboard) = edit_of(prepare(&view, &set, &key).unwrap());
         assert_eq!(clipboard.as_deref(), Some("one\nthree"));
         assert_eq!(members.len(), 2);
@@ -343,7 +344,7 @@ mod tests {
     fn copy_joins_fragments_with_lf_in_document_order() {
         let view = view();
         let key = input(KeyAction::Copy);
-        let set = set_of(&view.text, &[(0, 3), (14, 19)]);
+        let set = set_of(&view.text.materialize(), &[(0, 3), (14, 19)]);
         let PreparedInput::Copy { text } = prepare(&view, &set, &key).unwrap() else {
             panic!("copy");
         };
@@ -362,7 +363,7 @@ mod tests {
         });
         key.preferred_x = vec![Some(0.0), Some(0.0)];
         // The second caret sits on the second line (after the 雪 grapheme).
-        let set = set_of(&view.text, &[(0, 0), (13, 13)]);
+        let set = set_of(&view.text.materialize(), &[(0, 0), (13, 13)]);
         let PreparedInput::VerticalSelection {
             members,
             primary: _,
@@ -380,7 +381,7 @@ mod tests {
     fn zero_effect_deletes_change_nothing() {
         let view = view();
         let key = input(KeyAction::Backspace);
-        let set = set_of(&view.text, &[(0, 0)]);
+        let set = set_of(&view.text.materialize(), &[(0, 0)]);
         let PreparedInput::Selection { members, .. } = prepare(&view, &set, &key).unwrap() else {
             panic!("selection");
         };

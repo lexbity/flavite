@@ -1,0 +1,6 @@
+- level one [[l1]]
+  - level two [[l2]] #t2
+    - level three with ![[e3]]
+      - level four with ^b4
+  - back to level two [[l2b]]
+- back to level one [[l1b]]

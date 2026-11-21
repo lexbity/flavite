@@ -323,7 +323,7 @@ pub fn assemble(
                 .base_hash
                 .as_ref()
                 .is_some_and(|h| h.as_slice() == hash)
-                && snapshot.text.as_ref() == text
+                && snapshot.text.materialize().as_ref() == text
                 && snapshot.state == flavite_buffer::state::BufferState::Clean
         }) {
             continue;
@@ -360,7 +360,10 @@ pub fn assemble(
         // the whole run), mark the source dirty; `iter()` skips its saved
         // runs and emits the overlay runs below. Byte-identical order.
         occurrences.dirty_srcs.insert(node_id_entity(id));
-        let parsed = match parse_normalized(&snapshot.text) {
+        // The graph pump runs on its own thread: materialize the dirty
+        // buffer's root there, never under the session's locks (RFC-0011
+        // D-11). User-paced per pump, unchanged cost class.
+        let parsed = match parse_normalized(&snapshot.text.materialize()) {
             Ok(parsed) => parsed,
             Err(_) => {
                 overlays.insert(

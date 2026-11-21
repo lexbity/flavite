@@ -1496,6 +1496,7 @@ dependencies = [
  "clap",
  "flavite-ui",
  "iced_winit",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1507,10 +1508,10 @@ dependencies = [
  "flavite-encoding",
  "flavite-syntax",
  "proptest",
- "ropey",
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
  "unicode-segmentation",
  "uuid",
 ]
@@ -1530,6 +1531,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -1553,7 +1555,9 @@ dependencies = [
  "flavite-syntax",
  "iced",
  "nucleo-matcher",
+ "proptest",
  "serde_json",
+ "tracing",
  "unicode-segmentation",
 ]
 
@@ -1632,12 +1636,11 @@ name = "flavite-syntax"
 version = "0.1.0"
 dependencies = [
  "flavite-encoding",
+ "proptest",
  "pulldown-cmark",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "tree-sitter",
- "tree-sitter-md",
  "unicode-normalization",
  "unicode-segmentation",
 ]
@@ -1698,11 +1701,13 @@ dependencies = [
  "iced_winit",
  "naga",
  "nucleo",
+ "regex",
  "rfd",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tracing",
  "uuid",
  "zip",
 ]
@@ -2964,6 +2969,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
 ]
 
 [[package]]
@@ -4268,16 +4282,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ropey"
-version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
-dependencies = [
- "smallvec",
- "str_indices",
-]
-
-[[package]]
 name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4473,8 +4477,6 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
- "foldhash 0.2.0",
- "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -4754,18 +4756,6 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
-name = "str_indices"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
-
-[[package]]
-name = "streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
 
 [[package]]
 name = "strict-num"
@@ -5261,41 +5251,16 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "tree-sitter"
-version = "0.27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5129de2ccc97808c4583d48f1fb44576d015cf241e432800572bda11ef30c3b"
-dependencies = [
- "cc",
- "regex",
- "serde_json",
- "streaming-iterator",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-language"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
-
-[[package]]
-name = "tree-sitter-md"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed661bfe3c264961425f77cd89ad2998bf5d629e71ce8bab1e5d7e940d6246e"
-dependencies = [
- "cc",
- "tree-sitter-language",
 ]
 
 [[package]]

@@ -3,6 +3,15 @@
 
 use flavite_edit_context::{ContextCommand as C, ContextMenu as M};
 
+pub const MENUS: &[M] = &[
+    M::Select,
+    M::Go,
+    M::More,
+    M::Transform,
+    M::Lines,
+    M::Surround,
+];
+
 pub const GAP: f32 = 4.0;
 pub const STATE_WIDTH: f32 = 70.0;
 pub const SUMMARY_WIDTH: f32 = 128.0;
@@ -50,8 +59,10 @@ impl ContextLayout {
         self.width
             >= match menu {
                 M::More => 320.0,
-                M::Type => 390.0,
                 M::Select | M::Go => 720.0,
+                M::Transform => 390.0, // FEUX-0004 E-2: Transform ≥390
+                M::Lines => 920.0,     // FEUX-0004 X01: Lines after History
+                M::Surround => 920.0,  // FEUX-0004 X04: Surround after History
             }
     }
 
@@ -75,7 +86,10 @@ pub const fn menu_width(menu: M) -> f32 {
     match menu {
         M::Select => 76.0,
         M::Go => 52.0,
-        M::Type | M::More => 64.0,
+        M::More => 64.0,
+        M::Transform => 84.0,
+        M::Lines => 60.0,
+        M::Surround => 72.0,
     }
 }
 
@@ -92,8 +106,9 @@ mod tests {
                 .copied()
                 .filter(|&c| layout.command_visible(c))
                 .collect();
-            let menus: Vec<_> = [M::Select, M::Go, M::Type, M::More]
-                .into_iter()
+            let menus: Vec<_> = MENUS
+                .iter()
+                .copied()
                 .filter(|&m| layout.menu_visible(m))
                 .collect();
             let count = commands.len() + menus.len() + usize::from(layout.shows_state());

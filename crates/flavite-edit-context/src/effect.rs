@@ -74,8 +74,7 @@ pub fn plan(
         return None;
     }
     for endpoint in [selection.0, selection.1] {
-        if endpoint > text.len()
-            || crate::grammar::clamp_grapheme_boundary(text, endpoint) != endpoint
+        if endpoint > text.len() || crate::text::clamp_grapheme_boundary(text, endpoint) != endpoint
         {
             return None;
         }

@@ -8,7 +8,7 @@ use flavite_fs::Fs;
 use flavite_settings::registry::SettingRegistry;
 use flavite_ui::app::{App, Message};
 use flavite_ui::host::commands;
-use flavite_ui::host::settings::SettingsMessage;
+use flavite_ui::host::settings::{CaptureRequest, SettingsMessage};
 use flavite_ui::views::settings;
 use flavite_workspace::{TabId, ViewKind};
 mod support;
@@ -306,7 +306,7 @@ fn scalar_edits_persist_apply_and_survive_reopen() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("written");
     assert_eq!(
@@ -430,7 +430,7 @@ fn unparseable_document_shows_restore_affordance_and_round_trips() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("restored");
     assert_eq!(
@@ -452,7 +452,7 @@ fn read_only_facade_refuses_edits_and_keeps_the_document() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("doc");
     app.flavite.as_mut().unwrap().set_read_only(true);
@@ -472,7 +472,7 @@ fn read_only_facade_refuses_edits_and_keeps_the_document() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("doc");
     assert_eq!(before.generation, after.generation, "document unchanged");
@@ -623,7 +623,13 @@ fn shortcut_capture_flows_through_the_tab() {
     let _ = app.update(Message::Settings(SettingsMessage::BeginShortcutCapture {
         command: "workspace.find".into(),
     }));
-    assert_eq!(app.settings.capture.as_deref(), Some("workspace.find"));
+    assert_eq!(
+        app.settings.capture.as_ref().and_then(|c| match c {
+            CaptureRequest::Chord(s) => Some(s.as_str()),
+            _ => None,
+        }),
+        Some("workspace.find")
+    );
     assert!(
         app.status.contains("Press the new key combination"),
         "status: {}",
@@ -762,7 +768,7 @@ fn theme_package_management_flows_through_the_tab() {
         .flavite
         .as_ref()
         .unwrap()
-        .read_settings_raw()
+        .read_stored_settings()
         .expect("read")
         .expect("doc");
     assert_ne!(
@@ -850,4 +856,137 @@ fn slash_focuses_the_search_input_for_keyboard_operation() {
         rows.iter().map(|row| row.id).collect::<Vec<_>>(),
         vec!["editor.font_size"]
     );
+}
+
+/// FR-5/E-6: an externally edited (hand-written) `shortcuts.context_keys`
+/// layer that fails whole-layer validation must degrade to the pure default
+/// grammar at adoption, surface the first violation in the Settings row,
+/// and emit `KeymapLayerRejected` exactly once.
+#[test]
+fn invalid_adopted_keymap_layer_degrades_to_defaults_and_emits_diagnostics() {
+    let mut fixture = ui_fixture(2314, "/settings-keymap-reject", &seed());
+    let app = &mut fixture.app;
+
+    // Write a bad layer raw through the settings funnel (the generic
+    // `settings_set` path validates the registry type, not the Context
+    // grammar — a hand-edited document would carry exactly this).
+    let mut bad: std::collections::BTreeMap<String, String> = Default::default();
+    bad.insert("editor.delete".to_string(), "physical:NotAKey".to_string());
+    let _ = app
+        .flavite
+        .as_ref()
+        .unwrap()
+        .settings_set(
+            "shortcuts.context_keys",
+            flavite_settings::value::SettingValue::ShortcutMap(bad),
+        )
+        .expect("registry accepts the map shape");
+
+    let _ = app.update(Message::Settings(SettingsMessage::FocusGained));
+
+    assert!(
+        app.appearance.keymap_error.is_some(),
+        "the first violation is surfaced: {:?}",
+        app.appearance.keymap_error
+    );
+    // The default grammar is intact: `d` still deletes.
+    assert!(
+        matches!(
+            app.appearance
+                .context_keys
+                .lookup_root(flavite_edit_context::Slot::bare(
+                    flavite_edit_context::KeyCode::KeyD
+                )),
+            Some(flavite_edit_context::keymap::BindingId::Command(
+                flavite_edit_context::ContextCommand::Delete
+            ))
+        ),
+        "degraded keymap is the pure default"
+    );
+    assert!(
+        app.diagnostics
+            .export_text()
+            .contains("KeymapLayerRejected"),
+        "the adoption event fired: {}",
+        app.diagnostics.export_text()
+    );
+}
+
+/// FEUX-0003 E-15: `workspace.apply_profile` opens the profile chooser
+/// overlay (not the Settings tab); applying the selected row routes
+/// through the shared ProfileApplied path.
+#[test]
+fn apply_profile_opens_the_chooser_and_applies_the_selection() {
+    let mut fixture = ui_fixture(2315, "/settings-profile-picker", &seed());
+    let app = &mut fixture.app;
+
+    // Load the profile list, then create one profile.
+    let _ = app.update(Message::Settings(SettingsMessage::ProfilesList));
+    let profile = app
+        .flavite
+        .as_ref()
+        .unwrap()
+        .profiles_create_from_current("demo")
+        .expect("create");
+    let profile_id = profile.profile_id().to_string();
+    let _ = app.update(Message::Settings(SettingsMessage::ProfilesList));
+
+    let _ = app.update(Message::RunHostCommand("workspace.apply_profile"));
+    assert!(app.profile_picker.is_some(), "the chooser overlay opens");
+    assert_eq!(app.profile_picker_matches().len(), 1, "one row");
+
+    let _ = app.update(Message::ProfilePickerSubmit);
+    assert!(app.profile_picker.is_none(), "the overlay closes");
+    assert!(
+        app.status.contains("Applied profile"),
+        "status: {}",
+        app.status
+    );
+    assert!(
+        app.diagnostics.export_text().contains("ProfileApplied"),
+        "the apply event fired: {}",
+        app.diagnostics.export_text()
+    );
+    let _ = profile_id;
+}
+
+/// FEUX-0003 E-15: with no saved profiles the command is refused with the
+/// named reason and no overlay opens.
+#[test]
+fn apply_profile_with_no_profiles_reports_the_reason() {
+    let mut fixture = ui_fixture(2316, "/settings-profile-empty", &seed());
+    let app = &mut fixture.app;
+
+    let _ = app.update(Message::RunHostCommand("workspace.apply_profile"));
+    assert!(app.profile_picker.is_none(), "no overlay");
+    assert_eq!(app.status, "No saved profiles");
+}
+
+/// FEUX-0003 E-15: chordless commands resolve only through a validated
+/// override, and the palette/spec surface reflects the assigned chord.
+#[test]
+fn chordless_command_is_bindable_through_an_override() {
+    use std::collections::BTreeMap;
+
+    let none = BTreeMap::new();
+    assert!(
+        commands::resolved_chord("workspace.apply_profile", &none).is_none(),
+        "no default chord"
+    );
+
+    let mut overrides = BTreeMap::new();
+    overrides.insert("workspace.apply_profile".to_string(), "Mod+9".to_string());
+    let chord = commands::resolved_chord("workspace.apply_profile", &overrides);
+    assert_eq!(
+        chord.as_ref().map(|c| c.key.as_str()),
+        Some("9"),
+        "a validated override binds the chordless command"
+    );
+
+    let specs = commands::ui_specs(&overrides);
+    let spec = specs
+        .iter()
+        .find(|spec| spec.id == "workspace.apply_profile")
+        .expect("the command is in the palette catalog");
+    assert_eq!(spec.keys.len(), 1, "the palette shows the assigned chord");
 }

@@ -36,13 +36,18 @@ struct Harness {
     identity: VaultIdentity,
     db: PathBuf,
     #[allow(dead_code)]
+    root_dir: tempfile::TempDir,
+    #[allow(dead_code)]
     db_dir: tempfile::TempDir,
     data_dir: tempfile::TempDir,
 }
 
 fn harness() -> Harness {
     let fs = MemFs::new();
-    let root = PathBuf::from("/test/vault");
+    // The vault root is REAL so `.flavite/` (operation key, recovery,
+    // hints) is OS-addressable; note content still flows through MemFs.
+    let root_dir = tempfile::tempdir().expect("vault root");
+    let root = root_dir.path().to_path_buf();
     fs.create_dir_all(&root).expect("vault root");
     let db_dir = tempfile::tempdir().expect("index dir");
     let db = db_dir.path().join("index.sqlite3");
@@ -77,6 +82,7 @@ fn harness() -> Harness {
         root,
         identity,
         db,
+        root_dir,
         db_dir,
         data_dir,
     }
@@ -117,11 +123,11 @@ fn seed_note(h: &Harness, relative: &str, bytes: &[u8]) {
     reconcile(&h.session);
 }
 
-fn open(session: &Session, relative: &str) -> (u64, u64) {
+fn open(h: &Harness, relative: &str) -> (u64, u64) {
     let result = wait_terminal(
-        session,
-        session.execute(SessionCommand::OpenNote {
-            path: PathBuf::from(format!("/test/vault/{relative}")),
+        &h.session,
+        h.session.execute(SessionCommand::OpenNote {
+            path: h.root.join(relative),
             policy: OpenPolicy::ExistingOnly,
         }),
     );
@@ -153,6 +159,7 @@ fn edit(session: &Session, buffer_id: u64, revision: u64, ops: Vec<flavite_buffe
                     None,
                 )
                 .expect("fixture activation"),
+            unit: None,
         }),
     );
     match expect_success(result, "edit") {
@@ -255,7 +262,7 @@ fn text_find(session: &Session, buffer_id: u64, revision: u64, query: &str) -> u
                 mode: flavite_text_search::matcher::MatchMode::Literal,
                 case_sensitive: false,
                 whole_word: false,
-                scope: None,
+                scope_spans: vec![],
                 offset: 0,
             },
         }),
@@ -268,13 +275,7 @@ fn text_find(session: &Session, buffer_id: u64, revision: u64, query: &str) -> u
 
 /// List recovery files under the private data dir for this vault.
 fn recovery_files(h: &Harness) -> Vec<std::path::PathBuf> {
-    let dir = h
-        .data_dir
-        .path()
-        .join("flavite")
-        .join("vaults")
-        .join(h.identity.uuid.to_string())
-        .join("recovery");
+    let dir = h.root.join(".flavite").join("recovery");
     std::fs::read_dir(&dir)
         .map(|entries| {
             entries
@@ -290,7 +291,7 @@ fn recovery_files(h: &Harness) -> Vec<std::path::PathBuf> {
 fn draft_apply_is_isolated_checkpointed_and_not_a_save() {
     let h = harness();
     seed_note(&h, "notes/a.md", b"alpha\n");
-    let (buffer_id, rev0) = open(&h.session, "notes/a.md");
+    let (buffer_id, rev0) = open(&h, "notes/a.md");
     let rev1 = edit(
         &h.session,
         buffer_id,
@@ -331,7 +332,7 @@ fn draft_apply_is_isolated_checkpointed_and_not_a_save() {
 fn draft_guard_skips_after_revision_changed() {
     let h = harness();
     seed_note(&h, "notes/a.md", b"alpha\n");
-    let (buffer_id, rev0) = open(&h.session, "notes/a.md");
+    let (buffer_id, rev0) = open(&h, "notes/a.md");
     let rev1 = edit(
         &h.session,
         buffer_id,
@@ -371,7 +372,7 @@ fn draft_guard_skips_after_revision_changed() {
 fn draft_apply_restart_reclassifies_from_records_and_checkpoint() {
     let mut h = harness();
     seed_note(&h, "notes/a.md", b"alpha\n");
-    let (buffer_id, rev0) = open(&h.session, "notes/a.md");
+    let (buffer_id, rev0) = open(&h, "notes/a.md");
     let _rev1 = edit(
         &h.session,
         buffer_id,

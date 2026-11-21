@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Directory name for Flavite's configuration.
-const FLAVITE_DIR: &str = "flavite";
+/// Directory name for Flavite's vault-local identity store.
+const IDENTITY_DIR: &str = "identity";
 
 /// Subdirectory for vault registries.
 const VAULTS_DIR: &str = "vaults";
@@ -105,7 +105,12 @@ pub enum IdentityError {
 /// Type alias for identity results.
 pub type IdentityResult<T> = Result<T, IdentityError>;
 
-/// Resolve the OS data directory for Flavite.
+/// Resolve the OS data directory for Flavite's one deliberate
+/// device-local exception: the "last opened vault" app-launch memory
+/// (`user_state::UserStateKind::AppLaunch`). Everything else — identity,
+/// locks, operation keys, history, recovery, index cache, logs, encoding
+/// hints — lives inside the vault under `.flavite/`, so a vault is
+/// self-contained by design.
 ///
 /// Explicit plumbing (M3): libraries NEVER read the environment. The binary
 /// boundary (`flavite-app` / `flavite-cli`) resolves the data-directory
@@ -126,36 +131,75 @@ pub fn resolve_data_dir(explicit: Option<&Path>) -> Option<PathBuf> {
     ProjectDirs::from("com", "flavite", "Flavite").map(|p| p.data_dir().to_path_buf())
 }
 
-fn registry_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
-    data_dir
-        .join(FLAVITE_DIR)
+/// The vault-local identity root: `<vault>/.flavite/identity`. All
+/// identity state (per-root registry, root guards, UUID locks, instance
+/// IPC) lives here so no configuration escapes the vault.
+#[must_use]
+pub fn vault_identity_root(vault_root: &Path) -> PathBuf {
+    vault_root.join(".flavite").join(IDENTITY_DIR)
+}
+
+/// Resolve the OS-addressable backing directory for one private vault
+/// store (`recovery`, `operations`, `userstate`, …). Normally this is
+/// `<vault>/.flavite/<sub>`. When the vault root is not addressable by
+/// the OS filesystem (virtual in-memory test vaults), the store falls
+/// back to an OS-temp backing keyed by the root and the vault UUID so the
+/// private stores keep working without cross-vault collisions; production
+/// vaults are always vault-local.
+#[must_use]
+pub fn vault_private_backing_dir(vault_root: &Path, uuid: uuid::Uuid, sub: &str) -> PathBuf {
+    let dir = vault_root.join(".flavite").join(sub);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        return dir;
+    }
+    let digest = blake3::hash(vault_root.to_string_lossy().as_bytes());
+    let key = hex::encode(&digest.as_bytes()[..8]);
+    let fallback = std::env::temp_dir()
+        .join("flavite-backing")
+        .join(key)
+        .join(uuid.to_string())
+        .join(sub);
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
+fn registry_path_in(identity_root: &Path, root_key: &[u8]) -> PathBuf {
+    identity_root
         .join(VAULTS_DIR)
         .join(format!("{}.toml", hex::encode(root_key)))
 }
 
-/// Get the path to the root ownership guard.
-pub fn root_guard_path(root_key: &[u8]) -> Option<PathBuf> {
-    resolve_data_dir(None).map(|data_dir| root_guard_path_in(&data_dir, root_key))
+/// Get the path to the root ownership guard inside the vault identity root.
+pub fn root_guard_path(vault_root: &Path, root_key: &[u8]) -> PathBuf {
+    root_guard_path_in(&vault_identity_root(vault_root), root_key)
 }
 
-fn root_guard_path_in(data_dir: &Path, root_key: &[u8]) -> PathBuf {
-    data_dir
-        .join(FLAVITE_DIR)
+fn root_guard_path_in(identity_root: &Path, root_key: &[u8]) -> PathBuf {
+    identity_root
         .join(ROOTS_DIR)
         .join(format!("{}.lock", hex::encode(root_key)))
 }
 
-/// Get the path to the UUID instance lock.
-pub fn uuid_lock_path(uuid: Uuid) -> Option<PathBuf> {
-    resolve_data_dir(None).map(|data_dir| uuid_lock_path_in(&data_dir, uuid))
+/// Get the path to the UUID instance lock inside the vault identity root.
+pub fn uuid_lock_path(vault_root: &Path, uuid: Uuid) -> PathBuf {
+    uuid_lock_path_in(&vault_identity_root(vault_root), uuid)
 }
 
-fn uuid_lock_path_in(data_dir: &Path, uuid: Uuid) -> PathBuf {
-    data_dir
-        .join(FLAVITE_DIR)
+fn uuid_lock_path_in(identity_root: &Path, uuid: Uuid) -> PathBuf {
+    identity_root
         .join(VAULTS_DIR)
         .join(uuid.to_string())
         .join(UUID_LOCK)
+}
+
+/// The path to the focus-IPC endpoint inside the vault identity root
+/// (`<vault>/.flavite/identity/vaults/<uuid>/instance.ipc`).
+#[must_use]
+pub fn instance_ipc_path(vault_root: &Path, uuid: Uuid) -> PathBuf {
+    vault_identity_root(vault_root)
+        .join(VAULTS_DIR)
+        .join(uuid.to_string())
+        .join("instance.ipc")
 }
 
 /// Get the path to the vault.toml in a vault directory.
@@ -271,10 +315,11 @@ pub struct RootGuard {
 }
 
 impl RootGuard {
-    /// Acquire a root guard for the given root path.
+    /// Acquire a root guard for the given root path. The lock lives
+    /// inside the vault's own identity root (`.flavite/identity/roots/`).
     pub fn acquire(fs: &dyn Fs, root: &Path) -> IdentityResult<Self> {
         let root_key = compute_root_key(fs, root)?;
-        let path = root_guard_path(&root_key).ok_or(IdentityError::NoProjectDirs)?;
+        let path = root_guard_path(root, &root_key);
         Self::acquire_at(root_key, path)
     }
 
@@ -348,9 +393,10 @@ fn uuid_lock_is_stale(path: &std::path::Path) -> bool {
 }
 
 impl UuidGuard {
-    /// Acquire a UUID guard for the given UUID.
-    pub fn acquire(uuid: Uuid) -> IdentityResult<Self> {
-        let path = uuid_lock_path(uuid).ok_or(IdentityError::NoProjectDirs)?;
+    /// Acquire a UUID guard for the given UUID, rooted at the vault's
+    /// identity root (`.flavite/identity/vaults/<uuid>/instance.lock`).
+    pub fn acquire(vault_root: &Path, uuid: Uuid) -> IdentityResult<Self> {
+        let path = uuid_lock_path(vault_root, uuid);
         Self::acquire_at(uuid, path)
     }
 
@@ -431,29 +477,33 @@ impl IdentityManager {
     ///
     /// This follows the startup sequence from §4.13:
     /// 1. Resolve the selected root
-    /// 2. Acquire its root guard
+    /// 2. Acquire its root guard (vault-local, `.flavite/identity/roots`)
     /// 3. Read vault.toml and registry without mutation
     /// 4. Select identity in memory
-    /// 5. Acquire the UUID lock
+    /// 5. Acquire the UUID lock (vault-local)
     /// 6. Verify and persist identity/binding
     pub fn open(fs: &dyn Fs, root: PathBuf) -> IdentityResult<Self> {
-        let data_dir = resolve_data_dir(None).ok_or(IdentityError::NoProjectDirs)?;
-        Self::open_in_data_dir(fs, root, &data_dir)
+        let canonical_root = fs.canonicalize(&root)?;
+        let identity_root = vault_identity_root(&canonical_root);
+        Self::open_in_identity_dir(fs, canonical_root, &identity_root)
     }
 
-    fn open_in_data_dir(fs: &dyn Fs, root: PathBuf, data_dir: &Path) -> IdentityResult<Self> {
-        // Step 1: Resolve the root
-        let canonical_root = fs.canonicalize(&root)?;
-
+    fn open_in_identity_dir(
+        fs: &dyn Fs,
+        canonical_root: PathBuf,
+        identity_root: &Path,
+    ) -> IdentityResult<Self> {
         // Step 2: Acquire root guard
         let root_key = compute_root_key(fs, &canonical_root)?;
-        let root_guard =
-            RootGuard::acquire_at(root_key.clone(), root_guard_path_in(data_dir, &root_key))?;
+        let root_guard = RootGuard::acquire_at(
+            root_key.clone(),
+            root_guard_path_in(identity_root, &root_key),
+        )?;
 
         // Step 3: Read vault.toml and registry
         let root_key = root_guard.root_key().to_vec();
         let toml_uuid = read_vault_toml(&canonical_root)?;
-        let registry_entry = read_registry_entry_in(data_dir, &root_key)?;
+        let registry_entry = read_registry_entry_in(identity_root, &root_key)?;
 
         // Step 4: Select identity in memory
         let uuid = match (toml_uuid, registry_entry) {
@@ -475,7 +525,7 @@ impl IdentityManager {
         };
 
         // Step 5: Acquire UUID lock
-        let uuid_lock_path = uuid_lock_path_in(data_dir, uuid);
+        let uuid_lock_path = uuid_lock_path_in(identity_root, uuid);
 
         if uuid_lock_path.exists() && !uuid_lock_is_stale(&uuid_lock_path) {
             // Another live process holds the lock.
@@ -493,7 +543,7 @@ impl IdentityManager {
         // Write/update registry
         let entry =
             RegistryEntry::new(uuid, root_key.clone(), canonical_root.display().to_string());
-        write_registry_entry_in(data_dir, &root_key, &entry)?;
+        write_registry_entry_in(identity_root, &root_key, &entry)?;
 
         let identity = VaultIdentity::new(uuid, canonical_root, root_key);
 
@@ -665,22 +715,25 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let root = vault.path().to_path_buf();
         let fs = flavite_fs::OsFs::new();
+        let identity_root = data.path().join("identity");
 
-        let first = IdentityManager::open_in_data_dir(&fs, root.clone(), data.path()).unwrap();
+        let first =
+            IdentityManager::open_in_identity_dir(&fs, root.clone(), &identity_root).unwrap();
         let uuid = first.uuid();
         let root_key = first.root_key().to_vec();
         drop(first);
 
-        let reopened = IdentityManager::open_in_data_dir(&fs, root.clone(), data.path()).unwrap();
+        let reopened =
+            IdentityManager::open_in_identity_dir(&fs, root.clone(), &identity_root).unwrap();
         assert_eq!(reopened.uuid(), uuid);
         assert_eq!(reopened.root(), &root);
         drop(reopened);
 
-        let registry = registry_path_in(data.path(), &root_key);
+        let registry = registry_path_in(&identity_root, &root_key);
         let conflicting = RegistryEntry::new(Uuid::now_v7(), root_key, root.display().to_string());
         write_registry_entry_path(&registry, &conflicting).unwrap();
         assert!(matches!(
-            IdentityManager::open_in_data_dir(&fs, root, data.path()),
+            IdentityManager::open_in_identity_dir(&fs, root, &identity_root),
             Err(IdentityError::ConflictingBinding)
         ));
     }
@@ -691,13 +744,14 @@ mod tests {
 
         let toml_vault = tempfile::tempdir().unwrap();
         let toml_data = tempfile::tempdir().unwrap();
+        let toml_identity = toml_data.path().join("identity");
         let toml_uuid = Uuid::now_v7();
         ensure_flavite_dir(toml_vault.path()).unwrap();
         write_vault_toml(toml_vault.path(), toml_uuid).unwrap();
-        let opened = IdentityManager::open_in_data_dir(
+        let opened = IdentityManager::open_in_identity_dir(
             &fs,
             toml_vault.path().to_path_buf(),
-            toml_data.path(),
+            &toml_identity,
         )
         .unwrap();
         assert_eq!(opened.uuid(), toml_uuid);
@@ -705,6 +759,7 @@ mod tests {
 
         let registry_vault = tempfile::tempdir().unwrap();
         let registry_data = tempfile::tempdir().unwrap();
+        let registry_identity = registry_data.path().join("identity");
         let root_key = compute_root_key(&fs, registry_vault.path()).unwrap();
         let registry_uuid = Uuid::now_v7();
         let entry = RegistryEntry::new(
@@ -712,11 +767,11 @@ mod tests {
             root_key.clone(),
             registry_vault.path().display().to_string(),
         );
-        write_registry_entry_in(registry_data.path(), &root_key, &entry).unwrap();
-        let opened = IdentityManager::open_in_data_dir(
+        write_registry_entry_in(&registry_identity, &root_key, &entry).unwrap();
+        let opened = IdentityManager::open_in_identity_dir(
             &fs,
             registry_vault.path().to_path_buf(),
-            registry_data.path(),
+            &registry_identity,
         )
         .unwrap();
         assert_eq!(opened.uuid(), registry_uuid);
@@ -724,33 +779,34 @@ mod tests {
 
         let locked_vault = tempfile::tempdir().unwrap();
         let locked_data = tempfile::tempdir().unwrap();
+        let locked_identity = locked_data.path().join("identity");
         let locked_uuid = Uuid::now_v7();
         ensure_flavite_dir(locked_vault.path()).unwrap();
         write_vault_toml(locked_vault.path(), locked_uuid).unwrap();
         let root_key = compute_root_key(&fs, locked_vault.path()).unwrap();
-        let lock = uuid_lock_path_in(locked_data.path(), locked_uuid);
+        let lock = uuid_lock_path_in(&locked_identity, locked_uuid);
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         // A lock naming OUR pid is stale (a crashed earlier run of this
         // process) and is recovered; a lock naming a live foreign pid is
         // refused (FR-17 recovery vs. single-writer exclusion).
         std::fs::write(&lock, std::process::id().to_string().as_bytes()).unwrap();
-        let recovered = IdentityManager::open_in_data_dir(
+        let recovered = IdentityManager::open_in_identity_dir(
             &fs,
             locked_vault.path().to_path_buf(),
-            locked_data.path(),
+            &locked_identity,
         )
         .expect("stale lock is recovered");
         drop(recovered);
         // PID 1 always exists and is never us: a live foreign holder.
         std::fs::write(&lock, b"1").unwrap();
         assert!(matches!(
-            IdentityManager::open_in_data_dir(
+            IdentityManager::open_in_identity_dir(
                 &fs,
                 locked_vault.path().to_path_buf(),
-                locked_data.path()
+                &locked_identity
             ),
             Err(IdentityError::UuidLockFailed(_))
         ));
-        assert!(!root_guard_path_in(locked_data.path(), &root_key).exists());
+        assert!(!root_guard_path_in(&locked_identity, &root_key).exists());
     }
 }

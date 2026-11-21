@@ -1,17 +1,21 @@
 #![forbid(unsafe_code)]
 
-//! Tier 1 — durability-critical. `EditorModel` over ropey text with
-//! multi-selection, undo tree with time-based coalescing, per-line EOL side
-//! table, and the D7 buffer state machine. Zero UI dependencies (§4.1, D14,
-//! §4.16.1).
+//! Tier 1 — durability-critical. `EditorModel` over a persistent COW chunk
+//! tree with multi-selection, undo tree with time-based coalescing holding
+//! immutable version roots, per-line EOL side state, and the D7 buffer state
+//! machine. Zero UI dependencies (§4.1, D14, §4.16.1).
 
 pub mod budget;
+pub mod chunks;
 pub mod commands;
 pub mod eol;
 pub mod history;
+pub mod indent;
 pub mod manager;
 pub mod model;
 pub mod motion;
+pub mod numbers;
+pub mod pairs;
 pub mod positions;
 pub mod recovery;
 pub mod revision;

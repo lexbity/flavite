@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use flavite_text_search::matcher::MatchMode;
 use flavite_text_search::protocol::{
-    self, FRAME_MAX_BYTES, FailureCode, FrameError, FromHelper, RequestKind, SOURCE_MAX_BYTES,
-    ToHelper, WireMatch, encode, read_reply, write_frame,
+    self, FRAME_MAX_BYTES, FailureCode, FrameError, FromHelper, MAX_SCOPE_SPANS, RequestKind,
+    SOURCE_MAX_BYTES, SPANS_PER_FRAME, ToHelper, WireMatch, encode, read_reply, write_frame,
 };
 use flavite_text_search::template::{ReplacementTemplate, TemplateGrammar};
 
@@ -166,9 +166,10 @@ pub struct HelperRequest<'a> {
     pub mode: MatchMode,
     pub case_sensitive: bool,
     pub whole_word: bool,
-    /// Frozen scope in text-byte coordinates, validated by the caller
-    /// against the same source before dispatch (helper re-validates).
-    pub scope: Option<(usize, usize)>,
+    /// Frozen scope spans in text-byte coordinates (FEUX-0006: multi-span scope).
+    /// Sorted, non-overlapping, char-boundary endpoints. Empty vec = whole source.
+    /// Validated by the caller against the same source before dispatch.
+    pub scope_spans: Vec<(usize, usize)>,
     /// Match-count budget (NFR-8). Exceeding it is a typed refusal.
     pub max_matches: usize,
     /// Matches reported back at most; `usize::MAX` means "report every
@@ -280,16 +281,25 @@ fn run_match_locked(
     if request.source.len() as u64 > SOURCE_MAX_BYTES {
         return Err(TextWorkerError::Failure(FailureCode::Source));
     }
-    // Scope endpoints are validated against the source the helper will
+    // Scope spans are validated against the source the helper will
     // receive; a frozen selection that no longer fits is refused here and
-    // never silently widened (D-05).
-    if let Some((start, end)) = request.scope
-        && (end < start
-            || end > request.source.len()
-            || !request.source.is_char_boundary(start)
-            || !request.source.is_char_boundary(end))
-    {
-        return Err(TextWorkerError::Failure(FailureCode::Source));
+    // never silently widened (FEUX-0006: multi-span scope).
+    if !request.scope_spans.is_empty() {
+        if request.scope_spans.len() > MAX_SCOPE_SPANS {
+            return Err(TextWorkerError::Failure(FailureCode::Limit));
+        }
+        let mut prev_end: usize = 0;
+        for &(start, end) in &request.scope_spans {
+            if start > end
+                || end > request.source.len()
+                || !request.source.is_char_boundary(start)
+                || !request.source.is_char_boundary(end)
+                || start < prev_end
+            {
+                return Err(TextWorkerError::Failure(FailureCode::Source));
+            }
+            prev_end = end;
+        }
     }
     let request_id = next_request_id();
     let started = Instant::now();
@@ -405,7 +415,7 @@ fn drive_helper(
         }
     }
 
-    // 2. Begin with kind, scope, report cap and output bound.
+    // 2. Begin with kind, report cap and output bound (scope_spans come next).
     let report_matches = u64::try_from(request.report_matches).unwrap_or(u64::MAX);
     send_frame(
         &write_tx,
@@ -425,16 +435,33 @@ fn drive_helper(
             },
             skip_matches: request.skip_matches,
             max_output: u64::try_from(request.max_output).unwrap_or(u64::MAX),
-            scope: request.scope.map(|(start, end)| {
-                (
-                    u64::try_from(start).unwrap_or(u64::MAX),
-                    u64::try_from(end).unwrap_or(u64::MAX),
-                )
-            }),
             source_total: request.source.len() as u64,
             pattern: request.pattern.as_bytes().to_vec(),
         },
     )?;
+
+    // 2b. Send scope spans as paginated frames before Template.
+    // Empty spans = whole source, no frames needed.
+    if !request.scope_spans.is_empty() {
+        for chunk in request.scope_spans.chunks(SPANS_PER_FRAME) {
+            let spans_u64: Vec<(u64, u64)> = chunk
+                .iter()
+                .map(|&(start, end)| {
+                    (
+                        u64::try_from(start).unwrap_or(u64::MAX),
+                        u64::try_from(end).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect();
+            send_frame(
+                &write_tx,
+                &ToHelper::SpanFrame {
+                    request_id,
+                    spans: spans_u64,
+                },
+            )?;
+        }
+    }
 
     // 3. Template for replace requests (validated locally and in the
     //    helper against its own copy).

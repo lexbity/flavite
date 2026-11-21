@@ -4,7 +4,8 @@ use crate::app::{App, Message};
 use crate::host::editor_diagnostics::{EventKind, ModeEnum as DiagMode, Outcome};
 use flavite_api::{ExecutionResult, Invocation, Origin};
 use flavite_edit_context::{
-    ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event, menu_key, reduce,
+    BindingId, ContextCommand, ContextMenu, ContextMode, ContextState, Effect, Event,
+    PendingCommand, reduce,
 };
 use flavite_editor::{
     context::{native_code, native_modifiers},
@@ -14,6 +15,25 @@ use flavite_editor::{
 use flavite_workspace::{LayoutAction, TabId};
 use iced::{Rectangle, Task};
 use std::collections::BTreeMap;
+
+/// FEUX-0004 X06: Convert a digit KeyCode to its numeric value (E-4).
+/// Returns None for non-digit positions.
+#[must_use]
+fn digit_value(code: flavite_edit_context::KeyCode) -> Option<u32> {
+    match code {
+        flavite_edit_context::KeyCode::Digit0 => Some(0),
+        flavite_edit_context::KeyCode::Digit1 => Some(1),
+        flavite_edit_context::KeyCode::Digit2 => Some(2),
+        flavite_edit_context::KeyCode::Digit3 => Some(3),
+        flavite_edit_context::KeyCode::Digit4 => Some(4),
+        flavite_edit_context::KeyCode::Digit5 => Some(5),
+        flavite_edit_context::KeyCode::Digit6 => Some(6),
+        flavite_edit_context::KeyCode::Digit7 => Some(7),
+        flavite_edit_context::KeyCode::Digit8 => Some(8),
+        flavite_edit_context::KeyCode::Digit9 => Some(9),
+        _ => None,
+    }
+}
 
 /// A control captures its editor identity and selection set, not global
 /// focus. The whole committed set rides along (FEUX-0002 X04, E-5): `selection`
@@ -119,6 +139,10 @@ pub struct ContextSession {
     /// classifies admission, forwards events and interprets effects.
     pub state: ContextState,
     pub menu_target: Option<EditorTarget>,
+    /// Pending typing-run text for `.` repeat (FEUX-0004 E-5): set when a
+    /// typing-entry command begins its run, accumulated by the input host,
+    /// finalized with `InvocationRecord` at the run's end (group seal).
+    pub typing_record: Option<(&'static str, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -256,7 +280,7 @@ pub fn preview_command(app: &App, tab: TabId) -> Option<ContextCommand> {
     // §5.4.1: while `AwaitChar` captures, the state row shows the capture
     // hint — the Command-mode default preview (Delete) must not paint over
     // it, and the next key resolves find-char, not a delete.
-    if session.state.await_char().is_some() {
+    if session.state.await_args().is_some() {
         return None;
     }
     let target = EditorTarget::capture(app, tab)?;
@@ -288,7 +312,8 @@ pub fn effect_caption(app: &App, tab: TabId) -> Option<String> {
     }
     let command = preview_command(app, tab)?;
     let view = app.note_editor_view(tab)?;
-    flavite_edit_context::effect::plan(&view.text, target.selection, command)
+    let text = view.text.materialize();
+    flavite_edit_context::effect::plan(&text, target.selection, command)
         .map(|effect| effect.description(command))
 }
 
@@ -306,13 +331,23 @@ pub fn available(app: &App, target: EditorTarget, command: ContextCommand) -> bo
     {
         return false;
     }
+    let requires_write = command.mutates() || command.enters_typing();
+    // ReplaceRegex opens its draft even in read-only vaults: the live
+    // preview is compute-only ReadNotes; commit is refused at Enter when
+    // the vault state demands it (E-12). Every other mutating command keeps
+    // the delivered write gate.
+    let write_ok = if command == ContextCommand::ReplaceRegex {
+        !too_narrow(app, target.tab)
+    } else {
+        !requires_write
+            || (!too_narrow(app, target.tab)
+                && app.flavite.as_ref().is_some_and(|api| !api.is_read_only()))
+    };
     valid(app, target.clone(), false)
         && !app.has_composition()
         && app.dialog.is_none()
         && app.shutdown.is_none()
-        && (!(command.mutates() || command.enters_typing())
-            || (!too_narrow(app, target.tab)
-                && app.flavite.as_ref().is_some_and(|api| !api.is_read_only())))
+        && write_ok
 }
 
 pub(crate) fn seal(app: &App, tab: TabId) {
@@ -358,7 +393,7 @@ pub(crate) fn focus(app: &mut App, tab: TabId) -> Task<Message> {
         let mut interaction = session.interaction().clone();
         interaction.focused = true;
         interaction.sequence = interaction.sequence.saturating_add(1);
-        let _ = app.acknowledge_editor_interaction(interaction, &view.text);
+        let _ = app.acknowledge_editor_interaction(interaction, &view.text.materialize());
     }
     iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus())
         .chain(iced::advanced::widget::operate(
@@ -380,6 +415,7 @@ pub fn resume_focus(app: &mut App) -> Task<Message> {
         || app.strip_menu.is_some()
         || super::note_search::blocks_typing(app, &s.tab)
         || super::selection_search::blocks_typing(app, &s.tab)
+        || super::command_args::blocks_typing(app, &s.tab)
     {
         return Task::none();
     }
@@ -403,6 +439,7 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
         || app.has_composition()
         || super::note_search::blocks_typing(app, &s.tab)
         || super::selection_search::blocks_typing(app, &s.tab)
+        || super::command_args::blocks_typing(app, &s.tab)
     {
         return None;
     }
@@ -435,8 +472,40 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
                 let Physical::Code(code) = physical_key else {
                     return None;
                 };
-                let command = native_code(*code)
-                    .and_then(|code| menu_key(menu, code, native_modifiers(*modifiers)));
+                let native_mods = native_modifiers(*modifiers);
+
+                // Ctrl/Alt/Logo never enter the Context grammar
+                if native_mods.control || native_mods.alt || native_mods.logo {
+                    return None;
+                }
+
+                // Look up in keymap: try menu accelerator first, then root
+                let command = native_code(*code).and_then(|code| {
+                    let slot = flavite_edit_context::Slot {
+                        position: code,
+                        shift: native_mods.shift,
+                    };
+                    // Try menu accelerator lookup
+                    app.appearance
+                        .context_keys
+                        .lookup_menu(menu, slot.position)
+                        // Fall through to root if it's a command in this menu
+                        .or_else(|| {
+                            app.appearance.context_keys.lookup_root(slot).and_then(
+                                |bid| match bid {
+                                    BindingId::Command(cmd) => {
+                                        if menu.commands().contains(cmd) {
+                                            Some(*cmd)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                },
+                            )
+                        })
+                });
+
                 if *repeat {
                     return None;
                 }
@@ -451,6 +520,8 @@ pub fn keyboard_message(app: &App, event: &iced::keyboard::Event) -> Option<Mess
 }
 
 fn exit(app: &mut App) {
+    // FEUX-0004 X05: any unfinished typing run records at session exit.
+    finalize_typing_record(app);
     app.context_mode.clear_preview();
     app.diagnostics.clear_burst_hint();
     app.context_mode.history = Default::default();
@@ -471,6 +542,8 @@ fn exit(app: &mut App) {
         // overlay.
         super::selection_search::cancel_tab(app, session.tab);
         app.selection_search.detach(session.tab);
+        super::command_args::cancel_tab(app, session.tab);
+        app.command_args.detach(session.tab);
         app.palette_open = false;
         app.picker = Default::default();
     }
@@ -557,7 +630,6 @@ pub fn native_key(
     target: EditorTarget,
     mut key: flavite_editor::context::ContextKey,
 ) -> Task<Message> {
-    use flavite_edit_context::{command_key, menu_key, motion_key};
     if !valid(app, target.clone(), true)
         || app.context_mode.history.open
         || too_narrow(app, target.tab)
@@ -573,15 +645,15 @@ pub fn native_key(
     }
     let mode = app.context_mode.mode(target.tab);
     if mode.active() {
-        // AwaitChar capture (FEUX-0002 E-8, §5.4.1): the first event with
-        // produced text resolves the find-char; Esc cancels through the
-        // session's escape pop; menu keys cancel then process; Dead and
-        // modifier-only events are never published here at all.
+        // AwaitArgs capture (FEUX-0004 E-6, supersedes FEUX-0002 E-8, §5.4.1):
+        // the first event with produced text resolves one argument; Esc cancels
+        // through the session's escape pop; menu keys cancel then process;
+        // Dead and modifier-only events are never published here at all.
         if let Some(request) = app
             .context_mode
             .session
             .as_ref()
-            .and_then(|s| s.state.await_char())
+            .and_then(|s| s.state.await_args())
         {
             let produced = key
                 .input
@@ -591,26 +663,72 @@ pub fn native_key(
                 .filter(|_| !key.input.text.is_empty())
                 .filter(|_| !key.input.text.chars().nth(1).is_some());
             if let Some(produced) = produced {
-                let extend = key.modifiers.shift;
+                // Collect this argument and potentially dispatch
                 if let Some(s) = &mut app.context_mode.session {
-                    s.state.end_await_char();
-                    // The capture hint must not outlive the capture: the
-                    // resolved command names the outcome (§5.4.1).
-                    s.state.admit_run(ContextCommand::FindChar {
-                        forward: request.forward,
-                    });
+                    // Use the new collect_char method to add the char and potentially complete
+                    if let Some(collected) = s.state.collect_char(produced) {
+                        // All arguments collected - dispatch based on the command
+                        // FEUX-0004 X06: For FindChar, dispatch directly with count if present
+                        match request.command {
+                            PendingCommand::FindChar { forward } => {
+                                // Get the count from AwaitArgs
+                                let count_arg = s.state.await_args().and_then(|args| args.count);
+                                let direction = if forward { "fwd" } else { "back" };
+                                let mut json_args = serde_json::json!({
+                                    "direction": direction,
+                                    "char": collected[0].to_string(),
+                                    "extend": false
+                                });
+                                if let Some(n) = count_arg {
+                                    json_args["count"] = serde_json::Value::from(n);
+                                }
+                                return kernel_task(
+                                    app,
+                                    &target,
+                                    "editor.find_char",
+                                    json_args,
+                                    "Find char was refused; source changed",
+                                );
+                            }
+                            PendingCommand::SurroundAdd if collected.len() == 1 => {
+                                return kernel_task(
+                                    app,
+                                    &target,
+                                    "editor.surround_add",
+                                    serde_json::json!({ "char": collected[0].to_string() }),
+                                    "Surround add was refused; source changed",
+                                );
+                            }
+                            PendingCommand::SurroundDelete if collected.len() == 1 => {
+                                return kernel_task(
+                                    app,
+                                    &target,
+                                    "editor.surround_delete",
+                                    serde_json::json!({ "char": collected[0].to_string() }),
+                                    "Surround delete was refused; source changed",
+                                );
+                            }
+                            PendingCommand::SurroundChange if collected.len() == 2 => {
+                                return kernel_task(
+                                    app,
+                                    &target,
+                                    "editor.surround_change",
+                                    serde_json::json!({
+                                        "old_char": collected[0].to_string(),
+                                        "new_char": collected[1].to_string()
+                                    }),
+                                    "Surround change was refused; source changed",
+                                );
+                            }
+                            _ => {
+                                // Should not happen - argument count mismatch
+                                s.state.cancel_await_args();
+                            }
+                        }
+                    }
+                    // If collect_char returned None, we advanced to next arg and don't need to do anything
                 }
-                let extra = serde_json::json!({
-                    "direction": if request.forward { "fwd" } else { "back" },
-                    "char": produced.to_string(),
-                    "extend": extend,
-                });
-                let installed = selections_only(app, &target, "editor.find_char", extra);
-                return if installed.is_some() {
-                    focus(app, target.tab)
-                } else {
-                    Task::none()
-                };
+                return Task::none();
             }
             // A menu key cancels the capture and processes the menu; every
             // other non-character key is ignored (the capture stays).
@@ -626,7 +744,7 @@ pub fn native_key(
                 )
             {
                 if let Some(s) = &mut app.context_mode.session {
-                    s.state.end_await_char();
+                    s.state.cancel_await_args();
                 }
                 // Fall through to the delivered menu handling below.
             } else {
@@ -663,40 +781,136 @@ pub fn native_key(
             if key.repeat {
                 return Task::none();
             }
-            let command = key
-                .code
-                .and_then(|code| menu_key(menu, code, key.modifiers));
+            let command = key.code.and_then(|code| {
+                // Look up in keymap: try menu accelerator first, then root
+                let slot = flavite_edit_context::Slot {
+                    position: code,
+                    shift: key.modifiers.shift,
+                };
+                app.appearance
+                    .context_keys
+                    .lookup_menu(menu, slot.position)
+                    // Fall through to root if it's a command in this menu
+                    .or_else(|| {
+                        app.appearance
+                            .context_keys
+                            .lookup_root(slot)
+                            .and_then(|bid| match bid {
+                                BindingId::Command(cmd) => {
+                                    if menu.commands().contains(cmd) {
+                                        Some(*cmd)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            })
+                    })
+            });
             return command.map_or_else(Task::none, |command| run(app, target, command));
         }
     }
     if mode == ContextMode::Command {
         if let Some(code) = key.code {
-            if let Some(command) = command_key(code, key.modifiers) {
-                return if key.repeat {
-                    Task::none()
-                } else {
-                    run(app, target, command)
-                };
-            }
-            let menu = if key.modifiers.control || key.modifiers.alt || key.modifiers.logo {
-                None
+            // Ctrl/Alt/Logo never enter the Context grammar
+            if key.modifiers.control || key.modifiers.alt || key.modifiers.logo {
+                // They are handled by chord matching, not Context Mode
             } else {
-                match code {
-                    flavite_edit_context::KeyCode::KeyV => Some(ContextMenu::Select),
-                    flavite_edit_context::KeyCode::KeyG => Some(ContextMenu::Go),
-                    flavite_edit_context::KeyCode::KeyT => Some(ContextMenu::Type),
-                    _ => None,
+                // FEUX-0004 X06: Digit interception (E-4)
+                // Digits are grammar-owned: intercept before keymap lookup
+                // Conditions: Command mode, no menu open, no AwaitArgs pending
+                let no_menu = app
+                    .context_mode
+                    .session
+                    .as_ref()
+                    .is_none_or(|s| s.state.menu().is_none());
+                let no_await_args = app
+                    .context_mode
+                    .session
+                    .as_ref()
+                    .is_none_or(|s| s.state.await_args().is_none());
+
+                if no_menu && no_await_args {
+                    // Check if this is a digit
+                    if let Some(digit_value) = digit_value(code) {
+                        // Send CountDigit event to statechart
+                        // Get the inputs before the mutable borrow
+                        let now_ms = app.now_ms();
+                        let burst_enabled = app.appearance.burst_hint_enabled();
+                        if let Some(s) = &mut app.context_mode.session {
+                            use flavite_edit_context::session::Event;
+                            let effects = flavite_edit_context::session::reduce(
+                                &mut s.state,
+                                &Event::CountDigit(digit_value),
+                                now_ms,
+                                burst_enabled,
+                            );
+                            run_effects(app, target.tab, effects);
+                        }
+                        return Task::none();
+                    }
                 }
-            };
-            if let Some(menu) = menu {
-                return if key.repeat {
-                    Task::none()
-                } else {
-                    handle(app, ContextMessage::OpenMenu(target, menu))
+
+                let slot = flavite_edit_context::Slot {
+                    position: code,
+                    shift: key.modifiers.shift,
                 };
-            }
-            if let Some(motion) = motion_key(code, key.modifiers) {
-                key.input.action = flavite_editor::context::motion_action(motion);
+
+                // Look up in keymap. The resolved binding is cloned out so
+                // the keymap borrow does not span the dispatch (which may
+                // mutate the app).
+                if let Some(binding_id) = app.appearance.context_keys.lookup_root(slot).cloned() {
+                    match binding_id {
+                        BindingId::Command(command) => {
+                            return if key.repeat {
+                                Task::none()
+                            } else {
+                                run(app, target, command)
+                            };
+                        }
+                        BindingId::Motion(motion) => {
+                            // FEUX-0004 X06: a pending count multiplies the
+                            // motion (E-4 §5.3). The count is consumed by the
+                            // dispatch (cleared even on refusal); motions are
+                            // acceptors, so a count must never survive the
+                            // key to silently multiply a later command.
+                            let count = app
+                                .context_mode
+                                .session
+                                .as_ref()
+                                .and_then(|s| s.state.count());
+                            if let Some(n) = count {
+                                let (now_ms, burst_enabled) = chart_inputs(app);
+                                if let Some(s) = &mut app.context_mode.session {
+                                    let effects = reduce(
+                                        &mut s.state,
+                                        &Event::ClearCount,
+                                        now_ms,
+                                        burst_enabled,
+                                    );
+                                    let _ = run_effects(app, target.tab, effects);
+                                }
+                                return counted_motion(app, &target, motion, n);
+                            }
+                            key.input.action = flavite_editor::context::motion_action(motion);
+                        }
+                        BindingId::FindChar { forward } => {
+                            let command = ContextCommand::FindChar { forward };
+                            return if key.repeat {
+                                Task::none()
+                            } else {
+                                run(app, target, command)
+                            };
+                        }
+                        BindingId::MenuOpener(menu) => {
+                            return if key.repeat {
+                                Task::none()
+                            } else {
+                                handle(app, ContextMessage::OpenMenu(target, menu))
+                            };
+                        }
+                    }
+                }
             }
         }
         if !matches!(
@@ -765,7 +979,7 @@ fn install_pairs(app: &mut App, target: &EditorTarget, pairs: &[(usize, usize)])
         return false;
     };
     if app
-        .acknowledge_editor_interaction(interaction, &view.text)
+        .acknowledge_editor_interaction(interaction, &view.text.materialize())
         .is_err()
     {
         app.input_chains.remove(&target.tab);
@@ -876,6 +1090,152 @@ pub(crate) fn kernel_mutate(
     Some(success)
 }
 
+/// Commit a computed regex-replace plan through the delivered editor kernel
+/// (FEUX-0006 E-5): the worker computed the ops; this path issues the
+/// operation ticket, validates the ops at admission (ascending,
+/// non-overlapping, in-bounds scalar boundaries), maps the live selection
+/// set through the ops to the exact recorded after-set (§5.5), and runs
+/// `apply_edits` with one origin-sealed undo node. The initiating view gets
+/// its exact after-set (never the passive clamp); passive views map through
+/// the delivered movement-delta path.
+pub(crate) fn replace_commit(
+    app: &mut App,
+    tab: TabId,
+    target: &EditorTarget,
+    ops: Vec<(usize, usize, String)>,
+) -> Result<(), String> {
+    let Some(view) = app.note_editor_view(tab) else {
+        return Err("Source changed; replace was refused".into());
+    };
+    let text = view.text.materialize();
+    // Admission validation of the worker-computed ops — primary here, the
+    // worker guarantee is defense-in-depth (mirrors §5.4 layering).
+    let mut cursor = 0usize;
+    for (start, end, _) in &ops {
+        if *start > *end
+            || *end > text.len()
+            || *start < cursor
+            || !text.is_char_boundary(*start)
+            || !text.is_char_boundary(*end)
+        {
+            return Err("Replace plan ops are invalid; refusing".into());
+        }
+        cursor = *end;
+    }
+    let Some(api) = &app.flavite else {
+        return Err("Vault unavailable".into());
+    };
+    let issue = Invocation::new(
+        api.command_registry().next_request_id(),
+        "editor.issue_operation",
+        serde_json::json!({
+            "buffer_id": target.buffer,
+            "revision": target.revision,
+            "view": {
+                "view": format!("{:032x}", tab.raw()),
+                "incarnation": target.incarnation,
+                "selection_version": target.selection_version,
+            },
+        }),
+        Origin::Gui,
+    );
+    let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = api.execute(issue)
+    else {
+        return Err("Operation could not be started".into());
+    };
+    let Some(operation) = success.data.get("operation").cloned() else {
+        return Err("Operation could not be started".into());
+    };
+    // The recorded before-set from the live selection set (canonical
+    // triples), then the exact after-set mapped through the ops (§5.5).
+    let candidates: Vec<flavite_buffer::selection::RawSelection> = target
+        .selections
+        .iter()
+        .enumerate()
+        .map(
+            |(index, &(anchor, head))| flavite_buffer::selection::RawSelection {
+                id: Some(u32::try_from(index).unwrap_or(u32::MAX)),
+                anchor,
+                head,
+            },
+        )
+        .collect();
+    let hint = u32::try_from(target.primary).ok();
+    let (before, _) = flavite_buffer::selection::SelectionSet::normalize(&text, candidates, hint)
+        .map_err(|error| error.to_string())?;
+    let edits: Vec<flavite_buffer::selection::SpanEdit> = ops
+        .iter()
+        .map(|&(start, end, ref replacement)| {
+            flavite_buffer::selection::SpanEdit::new(start, end, replacement.len())
+        })
+        .collect();
+    let (after, _) = before.map_through(&edits);
+    let before_triples = before.to_triples();
+    let after_triples = after.to_triples();
+    let before_primary = before_triples
+        .iter()
+        .position(|triple| triple[0] == before.primary_id().as_raw() as usize)
+        .unwrap_or(0);
+    let after_primary = after_triples
+        .iter()
+        .position(|triple| triple[0] == after.primary_id().as_raw() as usize)
+        .unwrap_or(0);
+    let record = flavite_buffer::history::EditorEdit {
+        before_primary,
+        origin: format!("{:032x}", tab.raw()),
+        kind: flavite_buffer::history::EditKind::Replace,
+        before: before_triples,
+        after: after_triples,
+        primary: after_primary,
+    };
+    let ops_wire: Vec<serde_json::Value> = ops
+        .into_iter()
+        .map(|(start, end, replacement)| {
+            serde_json::json!({"range": [start, end], "replacement": replacement})
+        })
+        .collect();
+    let result = api.execute(Invocation::new(
+        api.command_registry().next_request_id(),
+        "apply_edits",
+        serde_json::json!({
+            "buffer_id": target.buffer,
+            "revision": target.revision,
+            "operation": operation,
+            "ops": ops_wire,
+            "undo_policy": "isolated",
+            "editor": record,
+        }),
+        Origin::Gui,
+    ));
+    let ExecutionResult::Local(flavite_api::LocalResult::Success(success)) = result else {
+        let message = match &result {
+            ExecutionResult::Rejected(rejected) => rejected
+                .message
+                .clone()
+                .unwrap_or_else(|| "Replace was refused".into()),
+            ExecutionResult::Local(flavite_api::LocalResult::Error(error)) => error.message.clone(),
+            _ => "Replace was refused".into(),
+        };
+        diag(
+            app,
+            tab,
+            EventKind::OperationRefused,
+            Outcome::Refused,
+            Some(target.selections.len() as u32),
+        );
+        return Err(message);
+    };
+    install_receipt(app, target, &success);
+    diag(
+        app,
+        tab,
+        EventKind::OperationApplied,
+        Outcome::Applied,
+        Some(target.selections.len() as u32),
+    );
+    Ok(())
+}
+
 /// Interpret a mutating receipt: map passive views once, install the exact
 /// after-set on the requesting view, and keep the acknowledged-input chain
 /// resolvable against the new revision.
@@ -922,6 +1282,7 @@ pub(crate) fn install_receipt(
         if !next_selections.is_empty() {
             interaction.selections = next_selections;
         } else if let Some(view) = app.note_editor_view(target.tab) {
+            let text = view.text.materialize();
             interaction.selections = if movement.truncated || !movement.valid_frames() {
                 interaction
                     .selections
@@ -929,18 +1290,18 @@ pub(crate) fn install_receipt(
                     .map(|selection| {
                         flavite_workspace::CommittedSelection::new(
                             flavite_editor::viewport::clamp_grapheme_boundary(
-                                &view.text,
+                                &text,
                                 selection.anchor,
                             ),
                             flavite_editor::viewport::clamp_grapheme_boundary(
-                                &view.text,
+                                &text,
                                 selection.head,
                             ),
                         )
                     })
                     .collect()
             } else {
-                super::input::map_selections(&view.text, &interaction.selections, &movement)
+                super::input::map_selections(&text, &interaction.selections, &movement)
             };
         }
         if let Some(primary) = movement.primary
@@ -960,7 +1321,7 @@ pub(crate) fn install_receipt(
             return;
         };
         if app
-            .acknowledge_editor_interaction(interaction, &view.text)
+            .acknowledge_editor_interaction(interaction, &view.text.materialize())
             .is_err()
         {
             app.input_chains.remove(&target.tab);
@@ -1004,9 +1365,72 @@ fn kernel_task(
     args: serde_json::Value,
     refused: &'static str,
 ) -> Task<Message> {
+    // Clone args for recording after mutation
+    let args_for_record = args.clone();
     match kernel_mutate(app, target, api_id, args, refused) {
         Some(success) => {
             install_receipt(app, target, &success);
+            // FEUX-0005 E-9: the completion message names the unit the planner
+            // used (rides the receipt — never re-detected from the edited
+            // text). Zero-effect no-ops stay silent (delivered no-op rule):
+            // the revision is unchanged when the batch was empty.
+            if matches!(
+                api_id,
+                "editor.indent"
+                    | "editor.dedent"
+                    | "editor.tabs_to_spaces"
+                    | "editor.spaces_to_tabs"
+            ) {
+                let zero_effect = success.data["revision"].as_u64() == Some(target.revision);
+                if !zero_effect && let Some(unit) = success.data["unit"].as_str() {
+                    let title = match api_id {
+                        "editor.indent" => "Indent",
+                        "editor.dedent" => "Dedent",
+                        "editor.tabs_to_spaces" => "Tabs → Spaces",
+                        "editor.spaces_to_tabs" => "Spaces → Tabs",
+                        _ => "",
+                    };
+                    app.context_mode.notice(format!("{title} · unit: {unit}"));
+                }
+            }
+
+            // FEUX-0004 X05: Record successful mutations for `.` repeat
+            // Exclude non-mutating commands and commands that shouldn't be repeated
+            let should_record = !matches!(
+                api_id,
+                // Selection-only commands (class-S)
+                "editor.select_word" | "editor.select_line" | "editor.select_all" |
+                "editor.collapse" | "editor.clear_selection" | "editor.keep_primary" |
+                "editor.add_caret_above" | "editor.add_caret_below" | "editor.rotate_primary" |
+                "editor.flip_selections" | "editor.trim_selections" | "editor.invert_selections" |
+                "editor.select_matches" | "editor.split_selection" |
+                // Non-mutating operations
+                "editor.copy" | "editor.goto_line" | "buffer.undo" | "buffer.redo" |
+                // Menu openers (not actual commands)
+                "editor.menu_select" | "editor.menu_go" | "editor.menu_more" |
+                "editor.menu_transform" | "editor.menu_lines" | "editor.menu_surround" |
+                // Typing-entry commands record their run text at group seal
+                // (FEUX-0004 E-5): the admission-time args are empty and would
+                // otherwise overwrite the register with an untyped record.
+                "editor.change" | "editor.insert_start" | "editor.insert_end" |
+                "editor.insert_line_start" | "editor.insert_line_end" |
+                "editor.open_above" | "editor.open_below" |
+                // Repeat itself (would be recursive)
+                "editor.repeat_last"
+            );
+
+            if should_record {
+                // Extract args as BTreeMap for recording
+                let mut args_map = std::collections::BTreeMap::new();
+                if let serde_json::Value::Object(obj) = args_for_record {
+                    for (k, v) in obj {
+                        if let serde_json::Value::String(s) = v {
+                            args_map.insert(k, s);
+                        }
+                    }
+                }
+                record_invocation(app, api_id, args_map);
+            }
             focus(app, target.tab)
         }
         None => Task::none(),
@@ -1097,7 +1521,7 @@ pub(crate) fn selections_only(
         interaction.sequence += 1;
         let view = app.note_editor_view(target.tab)?;
         if app
-            .acknowledge_editor_interaction(interaction, &view.text)
+            .acknowledge_editor_interaction(interaction, &view.text.materialize())
             .is_err()
         {
             app.input_chains.remove(&target.tab);
@@ -1154,8 +1578,9 @@ fn row_targets(app: &App, target: &EditorTarget, rows: i32) -> Result<Vec<usize>
         metrics: metrics.editor_type(),
     };
     let mut positions = Vec::with_capacity(target.selections.len());
+    let text = view.text.materialize();
     for &(_, head) in &target.selections {
-        let (at, _) = vertical_target(&view.text, head, motion, None);
+        let (at, _) = vertical_target(&text, head, motion, None);
         if at == head {
             return Err(if rows < 0 {
                 "No row above to add a caret on"
@@ -1166,6 +1591,80 @@ fn row_targets(app: &App, target: &EditorTarget, rows: i32) -> Result<Vec<usize>
         positions.push(at);
     }
     Ok(positions)
+}
+
+/// A counted motion dispatch (FEUX-0004 X06, E-4 §5.3): the count is applied
+/// per member in one plan through the delivered `editor.move` path.
+/// Horizontal (text-pure) motions pass the count to `apply_with_count`;
+/// visual up/down recompute the N-row target heads through the same vertical
+/// geometry the widget paints (clamped per member, the delivered rule).
+fn counted_motion(
+    app: &mut App,
+    target: &EditorTarget,
+    motion: flavite_edit_context::Motion,
+    n: u32,
+) -> Task<Message> {
+    let api_name = match motion {
+        flavite_edit_context::Motion::Previous => "char_left",
+        flavite_edit_context::Motion::Next => "char_right",
+        flavite_edit_context::Motion::Up => "line_up",
+        flavite_edit_context::Motion::Down => "line_down",
+        flavite_edit_context::Motion::NextWord => "word_next",
+        flavite_edit_context::Motion::PreviousWord => "word_prev",
+        flavite_edit_context::Motion::NextWordEnd => "word_end",
+    };
+    if matches!(
+        motion,
+        flavite_edit_context::Motion::Up | flavite_edit_context::Motion::Down
+    ) {
+        let rows = if matches!(motion, flavite_edit_context::Motion::Up) {
+            -(n as i32)
+        } else {
+            n as i32
+        };
+        match counted_vertical_targets(app, target, rows) {
+            Some(positions) => selections_only_task(
+                app,
+                target,
+                "editor.move",
+                serde_json::json!({"motion": api_name, "positions": positions}),
+            ),
+            None => Task::none(),
+        }
+    } else {
+        selections_only_task(
+            app,
+            target,
+            "editor.move",
+            serde_json::json!({"motion": api_name, "count": n}),
+        )
+    }
+}
+
+/// Vertical target heads for a counted up/down motion: N visual rows per
+/// member, clamped by the delivered vertical geometry (no refusal — the
+/// motion simply stops at the document edge).
+fn counted_vertical_targets(app: &App, target: &EditorTarget, rows: i32) -> Option<Vec<usize>> {
+    use flavite_editor::navigation::{VerticalMotion, vertical_target};
+    let view = app.note_editor_view(target.tab)?;
+    let bounds = app
+        .editor_bounds
+        .get(&target.tab)
+        .map_or(640.0, |b| b.width);
+    let metrics = app.appearance.metrics();
+    let width = flavite_editor::widget::wrap_width_for(bounds, metrics.editor_max_line_width());
+    let motion = VerticalMotion {
+        rows,
+        width,
+        metrics: metrics.editor_type(),
+    };
+    let mut positions = Vec::with_capacity(target.selections.len());
+    let text = view.text.materialize();
+    for &(_, head) in &target.selections {
+        let (at, _) = vertical_target(&text, head, motion, None);
+        positions.push(at);
+    }
+    Some(positions)
 }
 
 /// A selection-only verb, ending in focus.
@@ -1324,9 +1823,15 @@ pub fn handle(app: &mut App, message: ContextMessage) -> Task<Message> {
             Task::none()
         }
         ContextMessage::Unbound(target) => {
-            if valid(app, target, false) {
+            if valid(app, target.clone(), false) {
                 app.context_mode
-                    .notice("No command on this key · choose a menu or Type");
+                    .notice("No command on this key · choose a menu");
+                // FEUX-0004 E-4: an unbound key clears a pending count.
+                let (now_ms, burst_enabled) = chart_inputs(app);
+                if let Some(s) = &mut app.context_mode.session {
+                    let effects = reduce(&mut s.state, &Event::ClearCount, now_ms, burst_enabled);
+                    let _ = run_effects(app, target.tab, effects);
+                }
             }
             Task::none()
         }
@@ -1362,7 +1867,53 @@ fn enter(app: &mut App, target: EditorTarget) {
         buffer: target.buffer,
         state: ContextState::activated(),
         menu_target: None,
+        typing_record: None,
     });
+}
+
+/// Enter AwaitArgs state for a command requiring character arguments (FEUX-0004 E-6).
+fn enter_await_args(app: &mut App, target: &EditorTarget, pending: PendingCommand) {
+    use flavite_edit_context::session::AwaitArgs;
+    // Ensure we have an active session
+    if app.context_mode.session.is_none() {
+        enter(app, target.clone());
+    }
+    let (now_ms, burst_enabled) = chart_inputs(app);
+    let session = app.context_mode.session.as_mut().unwrap();
+    // FEUX-0004 X06: Capture the current count for find_char (E-4)
+    // Count is retained through AwaitArgs entry
+    let count = session.state.count();
+    // Close any open menu
+    session.state.close_menu();
+    // Start awaiting the first argument based on the pending command
+    let args = match pending {
+        PendingCommand::FindChar { forward } => {
+            let mut args = AwaitArgs::find_char(forward);
+            args.count = count;
+            args
+        }
+        PendingCommand::SurroundAdd => {
+            let mut args = AwaitArgs::surround_add();
+            args.count = count;
+            args
+        }
+        PendingCommand::SurroundChange => {
+            let mut args = AwaitArgs::surround_change();
+            args.count = count;
+            args
+        }
+        PendingCommand::SurroundDelete => {
+            let mut args = AwaitArgs::surround_delete();
+            args.count = count;
+            args
+        }
+    };
+    let _ = reduce(
+        &mut session.state,
+        &Event::EnterAwaitArgs(args),
+        now_ms,
+        burst_enabled,
+    );
 }
 
 fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Message> {
@@ -1417,6 +1968,8 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
                 ),
             );
         }
+        // FEUX-0004 X05: escaping a typing run seals it for `.` replay.
+        finalize_typing_record(app);
         let (now_ms, burst_enabled) = chart_inputs(app);
         let effects = app
             .context_mode
@@ -1436,6 +1989,9 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         let task = run_effects(app, target.tab, effects);
         return task.unwrap_or_else(|| focus(app, target.tab));
     }
+    // FEUX-0004 X05: a command dispatch ends any prior typing run; record it
+    // before the new invocation replaces the register.
+    finalize_typing_record(app);
     seal(app, target.tab);
     super::editor_history::invalidate(app);
     if command != History {
@@ -1444,8 +2000,22 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     if !valid(app, target.clone(), true) {
         app.context_mode
             .notice("Source changed; command was not applied");
+        // FEUX-0004 E-4: the dispatch attempt consumes the count even when
+        // refused; a stale refusal must not leave it pending.
+        let (now_ms, burst_enabled) = chart_inputs(app);
+        if let Some(s) = &mut app.context_mode.session {
+            let effects = reduce(&mut s.state, &Event::ClearCount, now_ms, burst_enabled);
+            let _ = run_effects(app, target.tab, effects);
+        }
         return Task::none();
     }
+    // FEUX-0004 X06: Capture count before RunAdmitted clears it (E-4)
+    let count = app
+        .context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.count());
+
     let (now_ms, burst_enabled) = chart_inputs(app);
     let effects = if let Some(s) = &mut app.context_mode.session {
         s.menu_target = None;
@@ -1500,7 +2070,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     let Some(view) = app.note_editor_view(target.tab) else {
         return Task::none();
     };
-    let text = &view.text;
+    let text = view.text.materialize();
     // Select all replaces the set whole at every N (set-aware by shape).
     if command == SelectAll {
         select(app, target.clone(), 0, text.len());
@@ -1511,6 +2081,7 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     if let Some(kind) = match command {
         SelectMatches => Some(super::selection_search::ApplyKind::Select),
         SplitSelection => Some(super::selection_search::ApplyKind::Split),
+        KeepMatching { keep } => Some(super::selection_search::ApplyKind::Keep { keep }),
         _ => None,
     } {
         return super::selection_search::handle(
@@ -1525,6 +2096,9 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
     // (FEUX-0002 X04/X05, E-1/E-6): the whole captured set rides the
     // command. The Go-menu motions became `editor.move` per-member verbs.
     let typing_entry = command.enters_typing();
+    // Capture before the match consumes `command` (FEUX-0004 X05: typing
+    // runs record their accumulated text at group seal).
+    let typing_entry_id = typing_entry.then(|| command.id());
     let task = match command {
         SelectAll => unreachable!("handled by the host-side whole-set select"),
         LineStart => selections_only_task(
@@ -1552,7 +2126,13 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             serde_json::json!({"motion": "doc_end"}),
         ),
         SelectLine => {
-            selections_only_task(app, &target, "editor.select_line", serde_json::json!({}))
+            // FEUX-0004 X06: select_line accepts count (count = N lines)
+            let args = if let Some(n) = count {
+                serde_json::json!({"count": n})
+            } else {
+                serde_json::json!({})
+            };
+            selections_only_task(app, &target, "editor.select_line", args)
         }
         SelectWord => {
             selections_only_task(app, &target, "editor.select_word", serde_json::json!({}))
@@ -1613,17 +2193,10 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             }
         }
         FindChar { forward } => {
-            // E-8: entry opens the one new statechart state; the next
+            // E-8/X06: entry opens the one new statechart state; the next
             // produced character resolves it (native_key intercepts).
-            let (now_ms, burst_enabled) = chart_inputs(app);
-            if let Some(s) = &mut app.context_mode.session {
-                let _ = reduce(
-                    &mut s.state,
-                    &Event::EnterAwaitChar(flavite_edit_context::AwaitChar { forward }),
-                    now_ms,
-                    burst_enabled,
-                );
-            }
+            // Count is captured at entry time (E-4).
+            enter_await_args(app, &target, PendingCommand::FindChar { forward });
             focus(app, target.tab)
         }
         InsertStart => {
@@ -1736,8 +2309,232 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
             let generation = app.context_mode.generation;
             return super::editor_clipboard::write_for_cut(target, generation, copied);
         }
-        Toggle | Exit | Escape | Paste | Undo | Redo | Commands | Find | Replace | History
-        | SelectMatches | SplitSelection => {
+        // FEUX-0004 X01: Transform family
+        CaseUpper => kernel_task(
+            app,
+            &target,
+            "editor.case_upper",
+            serde_json::json!({}),
+            "Uppercase was refused; source changed",
+        ),
+        CaseLower => kernel_task(
+            app,
+            &target,
+            "editor.case_lower",
+            serde_json::json!({}),
+            "Lowercase was refused; source changed",
+        ),
+        CaseSwap => kernel_task(
+            app,
+            &target,
+            "editor.case_swap",
+            serde_json::json!({}),
+            "Swap case was refused; source changed",
+        ),
+        CaseTitle => kernel_task(
+            app,
+            &target,
+            "editor.case_title",
+            serde_json::json!({}),
+            "Title case was refused; source changed",
+        ),
+        NumberInc => kernel_task(
+            app,
+            &target,
+            "editor.number_inc",
+            serde_json::json!({}),
+            "Increment was refused; source changed",
+        ),
+        NumberDec => kernel_task(
+            app,
+            &target,
+            "editor.number_dec",
+            serde_json::json!({}),
+            "Decrement was refused; source changed",
+        ),
+        NumberSequence => kernel_task(
+            app,
+            &target,
+            "editor.number_sequence",
+            serde_json::json!({}),
+            "Number sequence was refused; source changed",
+        ),
+        // FEUX-0004 X01: Lines family
+        LinesSortAsc => kernel_task(
+            app,
+            &target,
+            "editor.lines_sort_asc",
+            serde_json::json!({}),
+            "Sort lines ascending was refused; source changed",
+        ),
+        LinesSortDesc => kernel_task(
+            app,
+            &target,
+            "editor.lines_sort_desc",
+            serde_json::json!({}),
+            "Sort lines descending was refused; source changed",
+        ),
+        LinesSortNumeric => kernel_task(
+            app,
+            &target,
+            "editor.lines_sort_numeric",
+            serde_json::json!({}),
+            "Sort lines numeric was refused; source changed",
+        ),
+        LinesJoin => kernel_task(
+            app,
+            &target,
+            "editor.lines_join",
+            serde_json::json!({}),
+            "Join lines was refused; source changed",
+        ),
+        LinesDuplicate => kernel_task(
+            app,
+            &target,
+            "editor.lines_duplicate",
+            serde_json::json!({}),
+            "Duplicate lines was refused; source changed",
+        ),
+        LinesDedupe => kernel_task(
+            app,
+            &target,
+            "editor.lines_dedupe",
+            serde_json::json!({}),
+            "Deduplicate lines was refused; source changed",
+        ),
+        LinesShuffle => kernel_task(
+            app,
+            &target,
+            "editor.lines_shuffle",
+            serde_json::json!({}),
+            "Shuffle lines was refused; source changed",
+        ),
+        LinesMoveUp => kernel_task(
+            app,
+            &target,
+            "editor.lines_move_up",
+            serde_json::json!({}),
+            "Move lines up was refused; source changed",
+        ),
+        LinesMoveDown => kernel_task(
+            app,
+            &target,
+            "editor.lines_move_down",
+            serde_json::json!({}),
+            "Move lines down was refused; source changed",
+        ),
+        // FEUX-0004 X03: LinesAlign and GotoLine
+        LinesAlign => {
+            // LinesAlign requires a delimiter argument - open draft host
+            super::command_args::open_lines_align(app, target.clone());
+            iced::Task::none()
+        }
+        ReplaceRegex => {
+            // ReplaceRegex requires pattern and template arguments - open draft host
+            super::command_args::open_replace_regex(app, target.clone());
+            iced::Task::none()
+        }
+        GotoLine => {
+            // FEUX-0004 X06: GotoLine with count jumps directly (E-12)
+            if let Some(line_num) = count {
+                // Jump to line line_num directly
+                if line_num == 0 {
+                    app.context_mode.notice("Document line numbers start at 1");
+                    iced::Task::none()
+                } else {
+                    // Use editor.move with Line motion
+                    selections_only_task(
+                        app,
+                        &target,
+                        "editor.move",
+                        serde_json::json!({"motion": {"Line": line_num}}),
+                    )
+                }
+            } else {
+                // No count - open draft host
+                super::command_args::open_goto_line(app, target.clone());
+                iced::Task::none()
+            }
+        }
+        // FEUX-0004 X04: Surround family (E-6: AwaitArgs)
+        SurroundAdd => {
+            // SurroundAdd requires a single character argument - enter AwaitArgs
+            enter_await_args(app, &target, PendingCommand::SurroundAdd);
+            iced::Task::none()
+        }
+        SurroundDelete => {
+            // SurroundDelete requires a single character argument - enter AwaitArgs
+            enter_await_args(app, &target, PendingCommand::SurroundDelete);
+            iced::Task::none()
+        }
+        SurroundChange => {
+            // SurroundChange requires two character arguments - enter AwaitArgs
+            enter_await_args(app, &target, PendingCommand::SurroundChange);
+            iced::Task::none()
+        }
+        // FEUX-0005 X01: Indent family (E-3: count = units)
+        Indent => {
+            let args = if let Some(n) = count {
+                serde_json::json!({"amount": n})
+            } else {
+                serde_json::json!({})
+            };
+            kernel_task(
+                app,
+                &target,
+                "editor.indent",
+                args,
+                "Indent was refused; source changed",
+            )
+        }
+        Dedent => {
+            let args = if let Some(n) = count {
+                serde_json::json!({"amount": n})
+            } else {
+                serde_json::json!({})
+            };
+            kernel_task(
+                app,
+                &target,
+                "editor.dedent",
+                args,
+                "Dedent was refused; source changed",
+            )
+        }
+        // FEUX-0005 X02: Whitespace conversion (E-9: unit display in message)
+        TabsToSpaces => kernel_task(
+            app,
+            &target,
+            "editor.tabs_to_spaces",
+            serde_json::json!({}),
+            "Tabs → Spaces was refused; source changed",
+        ),
+        SpacesToTabs => kernel_task(
+            app,
+            &target,
+            "editor.spaces_to_tabs",
+            serde_json::json!({}),
+            "Spaces → Tabs was refused; source changed",
+        ),
+        // FEUX-0004 X05/X06: Repeat last command (count· for sequential replays)
+        RepeatLast => {
+            // Replay the last recorded invocation against the current selection set
+            // FEUX-0004 X06: if count is present, replay count times
+            replay_last_with_count(app, target.clone(), count)
+        }
+        Toggle
+        | Exit
+        | Escape
+        | Paste
+        | Undo
+        | Redo
+        | Commands
+        | Find
+        | Replace
+        | History
+        | SelectMatches
+        | SplitSelection
+        | KeepMatching { .. } => {
             unreachable!("handled before planning")
         }
     };
@@ -1747,8 +2544,195 @@ fn run(app: &mut App, target: EditorTarget, command: ContextCommand) -> Task<Mes
         }
         let (now_ms, burst_enabled) = chart_inputs(app);
         if let Some(s) = &mut app.context_mode.session {
+            if let Some(id) = typing_entry_id {
+                s.typing_record = Some((id, String::new()));
+            }
             let _ = reduce(&mut s.state, &Event::EnterTyping, now_ms, burst_enabled);
         }
     }
     task
+}
+
+/// Record an invocation for `.` repeat (FEUX-0004 E-5).
+/// Called by the host after a class-E command completes successfully.
+pub(crate) fn record_invocation(
+    app: &mut App,
+    command_id: &'static str,
+    args: std::collections::BTreeMap<String, String>,
+) {
+    use flavite_edit_context::session::InvocationRecord;
+
+    let (now_ms, burst_enabled) = chart_inputs(app);
+    if let Some(s) = &mut app.context_mode.session {
+        let record = InvocationRecord { command_id, args };
+        let _ = reduce(&mut s.state, &Event::Record(record), now_ms, burst_enabled);
+    }
+}
+
+/// Finalize a pending typing-run record at its group seal (FEUX-0004 E-5):
+/// the accumulated run text is recorded for `.` replay. Called wherever a
+/// typing run ends (Escape, next dispatch, session exit); empty runs record
+/// nothing.
+fn finalize_typing_record(app: &mut App) {
+    let (command_id, text) = {
+        let Some(session) = &mut app.context_mode.session else {
+            return;
+        };
+        let Some(record) = session.typing_record.take() else {
+            return;
+        };
+        record
+    };
+    if text.is_empty() {
+        return;
+    }
+    let mut args = std::collections::BTreeMap::new();
+    args.insert("typed_text".to_string(), text);
+    record_invocation(app, command_id, args);
+}
+
+/// Replay the last recorded invocation with optional count (FEUX-0004 E-5/X06).
+/// If count is Some(n), replay n times sequentially (count·).
+/// If count is None, replay once.
+/// Returns Task::none() after synchronous execution; all replay work happens
+/// in the current frame against the live state, so the UI will refresh with
+/// the final result in one pass.
+fn replay_last_with_count(
+    app: &mut App,
+    target: EditorTarget,
+    count: Option<u32>,
+) -> Task<Message> {
+    // Get the last recorded invocation - clone it to avoid borrow issues
+    let record = app
+        .context_mode
+        .session
+        .as_ref()
+        .and_then(|s| s.state.repeat_last().cloned());
+
+    let Some(record) = record else {
+        app.context_mode.notice("No command to repeat");
+        diag(
+            app,
+            target.tab,
+            EventKind::RepeatOutcome,
+            Outcome::NoRegister,
+            None,
+        );
+        return focus(app, target.tab);
+    };
+
+    // FEUX-0004 X06: if count is present, replay count times sequentially
+    let count = count.unwrap_or(1);
+
+    // Resolve replay steps from the record. Typing-entry records carry their
+    // run text and replay as one batch (E-5): change composes to a typed
+    // replacement; the insert_* family inserts the text directly; open-
+    // above/below compose open-then-type.
+    enum ReplayStep {
+        Kernel(&'static str, serde_json::Value),
+        SelectionOnly(&'static str, serde_json::Value),
+    }
+    let typed_text = record.args.get("typed_text").cloned();
+    let steps: Vec<ReplayStep> = match (record.command_id, typed_text) {
+        ("editor.change", Some(text)) => vec![ReplayStep::Kernel(
+            "editor.type",
+            serde_json::json!({"text": text, "undo_policy": "isolated"}),
+        )],
+        (
+            "editor.insert_start"
+            | "editor.insert_end"
+            | "editor.insert_line_start"
+            | "editor.insert_line_end",
+            Some(text),
+        ) => vec![ReplayStep::SelectionOnly(
+            record.command_id,
+            serde_json::json!({"text": text}),
+        )],
+        ("editor.open_above" | "editor.open_below", Some(text)) => vec![
+            ReplayStep::Kernel(record.command_id, serde_json::json!({})),
+            ReplayStep::Kernel(
+                "editor.type",
+                serde_json::json!({"text": text, "undo_policy": "isolated"}),
+            ),
+        ],
+        (id, _) => {
+            let args = serde_json::Value::Object(
+                record
+                    .args
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect(),
+            );
+            vec![ReplayStep::Kernel(id, args)]
+        }
+    };
+
+    // Synchronous replay loop: each dispatch is synchronous, so we apply the
+    // steps in sequence against the live app state. After each successful
+    // step, we re-capture the target to get the updated revision/selection.
+    let mut current_target = target;
+
+    for _ in 0..count {
+        for step in &steps {
+            let succeeded = match step {
+                ReplayStep::Kernel(id, args) => {
+                    match kernel_mutate(
+                        app,
+                        &current_target,
+                        id,
+                        args.clone(),
+                        "Repeat was refused; source changed",
+                    ) {
+                        Some(success) => {
+                            install_receipt(app, &current_target, &success);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                ReplayStep::SelectionOnly(id, args) => {
+                    selections_only(app, &current_target, id, args.clone()).is_some()
+                }
+            };
+            if !succeeded {
+                // A refusing replay stops the run with its reason; the
+                // register is unchanged (E-5).
+                app.context_mode
+                    .notice("Repeat was refused; source changed");
+                diag(
+                    app,
+                    current_target.tab,
+                    EventKind::RepeatOutcome,
+                    Outcome::Refused,
+                    Some(current_target.selections.len() as u32),
+                );
+                return Task::none();
+            }
+            // Update target for the next step/replay - re-capture from app
+            // state.
+            if let Some(new_target) = EditorTarget::capture(app, current_target.tab) {
+                current_target = new_target;
+            } else {
+                app.context_mode.notice("Tab closed during repeat");
+                diag(
+                    app,
+                    current_target.tab,
+                    EventKind::RepeatOutcome,
+                    Outcome::Refused,
+                    Some(current_target.selections.len() as u32),
+                );
+                return Task::none();
+            }
+        }
+    }
+
+    diag(
+        app,
+        current_target.tab,
+        EventKind::RepeatOutcome,
+        Outcome::Replayed,
+        Some(current_target.selections.len() as u32),
+    );
+    // Return focus to ensure UI updates
+    focus(app, current_target.tab)
 }

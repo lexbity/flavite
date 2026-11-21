@@ -4,6 +4,7 @@ use crate::{
     app::{App, Message},
     host::{note_search, reading},
 };
+use flavite_edit_context::ContextMode;
 use flavite_editor::{
     input::{CapturedInput, PreparedInput},
     keymap::KeyAction,
@@ -208,6 +209,15 @@ fn handle_inner(
     mut input: CapturedInput,
     composition_commit: bool,
 ) -> iced::Task<Message> {
+    // RFC-0008 S1 (FR-10): the host turn phase of the keystroke path. The
+    // span covers the whole handler; every early-return path drops the guard.
+    // Fields are plain integers (no string formatting on the hot path).
+    let _host_turn = tracing::info_span!(
+        "edit.host_turn",
+        buffer = input.buffer,
+        revision = input.observed_revision,
+    )
+    .entered();
     if super::context_mode::too_narrow(app, tab) {
         app.context_mode
             .notice("Pane too narrow · expand the pane to continue editing");
@@ -231,6 +241,7 @@ fn handle_inner(
         || !reading::is_edit(app, tab)
         || app.picker.open
         || app.palette_open
+        || app.profile_picker.is_some()
         || app.strip_menu.is_some()
         || app.dialog.is_some()
         || app.shutdown.is_some()
@@ -317,8 +328,9 @@ fn handle_inner(
             head: selection.head,
         })
         .collect();
+    let text = view.text.materialize();
     let Ok((set, _)) = flavite_buffer::selection::SelectionSet::normalize(
-        &view.text,
+        &text,
         committed,
         Some(
             interaction
@@ -335,7 +347,7 @@ fn handle_inner(
     let planning_set = if composition_commit {
         let primary = set.primary();
         flavite_buffer::selection::SelectionSet::normalize(
-            &view.text,
+            &text,
             vec![flavite_buffer::selection::RawSelection {
                 id: Some(primary.id().as_raw()),
                 anchor: primary.anchor(),
@@ -548,13 +560,14 @@ fn handle_inner(
                         // MovementTooComplex: clamp to the document and let
                         // the user re-place the caret; never guess
                         // (FEUX-0002 E-13).
+                        let current_text = current.text.materialize();
                         interaction.selections = interaction
                             .selections
                             .iter()
                             .map(|s| {
                                 let clamp = |at: usize| {
                                     flavite_editor::viewport::clamp_grapheme_boundary(
-                                        &current.text,
+                                        &current_text,
                                         at,
                                     )
                                 };
@@ -564,8 +577,9 @@ fn handle_inner(
                         app.context_mode
                             .notice("Source changed; selections approximated");
                     } else {
+                        let current_text = current.text.materialize();
                         interaction.selections =
-                            map_selections(&current.text, &interaction.selections, movement);
+                            map_selections(&current_text, &interaction.selections, movement);
                     }
                 }
                 // The primary member rides the receipt (E-4/FR-4); when the
@@ -584,6 +598,23 @@ fn handle_inner(
         }
         app.workspace.invalidate_writing_target(view.buffer_id);
         app.linking.invalidate_if_source_changed(None);
+        // FEUX-0004 X05: accumulate typing-run text for `.` repeat (E-5).
+        // Insert/newline apply in typing mode is the run's raw material; the
+        // accumulated run is recorded at group seal by the context host.
+        if matches!(input.action, KeyAction::Insert | KeyAction::Newline)
+            && app.context_mode.mode(tab) == ContextMode::Typing
+        {
+            let text = if input.action == KeyAction::Newline {
+                "\n".to_string()
+            } else {
+                input.text.clone()
+            };
+            if let Some(session) = &mut app.context_mode.session
+                && let Some((_, accumulated)) = &mut session.typing_record
+            {
+                accumulated.push_str(&text);
+            }
+        }
     }
     let Some(current) = app.note_editor_view(tab) else {
         return iced::Task::none();
@@ -596,11 +627,12 @@ fn handle_inner(
     interaction.revision = current.revision;
     interaction.sequence = input.sequence;
     interaction.viewport_anchor = interaction.viewport_anchor.min(current.text.len());
-    while !current.text.is_char_boundary(interaction.viewport_anchor) {
+    let current_text = current.text.materialize();
+    while !current_text.is_char_boundary(interaction.viewport_anchor) {
         interaction.viewport_anchor -= 1;
     }
     if app
-        .acknowledge_editor_interaction(interaction, &current.text)
+        .acknowledge_editor_interaction(interaction, &current_text)
         .is_err()
     {
         app.input_chains.remove(&tab);
@@ -734,32 +766,28 @@ pub fn reconcile_buffer_revisions(app: &mut App) {
         if let Some(movement) =
             movement.filter(|movement| !movement.truncated && movement.valid_frames())
         {
-            interaction.selections = map_selections(&view.text, &interaction.selections, &movement);
+            let text = view.text.materialize();
+            interaction.selections = map_selections(&text, &interaction.selections, &movement);
             interaction.viewport_anchor = map_history_point(
-                &view.text,
+                &text,
                 interaction.viewport_anchor,
                 &movement,
                 flavite_buffer::Affinity::Left,
             );
         } else {
+            let text = view.text.materialize();
             interaction.selections = interaction
                 .selections
                 .iter()
                 .map(|selection| {
                     CommittedSelection::new(
-                        flavite_editor::viewport::clamp_grapheme_boundary(
-                            &view.text,
-                            selection.anchor,
-                        ),
-                        flavite_editor::viewport::clamp_grapheme_boundary(
-                            &view.text,
-                            selection.head,
-                        ),
+                        flavite_editor::viewport::clamp_grapheme_boundary(&text, selection.anchor),
+                        flavite_editor::viewport::clamp_grapheme_boundary(&text, selection.head),
                     )
                 })
                 .collect();
             interaction.viewport_anchor = flavite_editor::viewport::clamp_grapheme_boundary(
-                &view.text,
+                &text,
                 interaction.viewport_anchor,
             );
             app.status = "Source changed; selections approximated".into();
@@ -768,7 +796,7 @@ pub fn reconcile_buffer_revisions(app: &mut App) {
         interaction.revision = view.revision;
         interaction.sequence += 1;
         if app
-            .acknowledge_editor_interaction(interaction, &view.text)
+            .acknowledge_editor_interaction(interaction, &view.text.materialize())
             .is_ok()
         {
             app.input_chains.remove(&tab);
@@ -808,16 +836,17 @@ pub fn apply_history_movement(
                 // MovementTooComplex: clamp, never guess. The notice is
                 // published by the initiating view's handler; the passive
                 // view only avoids stale coordinates.
+                let text = view.text.materialize();
                 let clamp =
-                    |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&view.text, at);
+                    |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&text, at);
                 interaction.selections = interaction
                     .selections
                     .iter()
                     .map(|s| CommittedSelection::new(clamp(s.anchor), clamp(s.head)))
                     .collect();
             } else {
-                interaction.selections =
-                    map_selections(&view.text, &interaction.selections, movement);
+                let text = view.text.materialize();
+                interaction.selections = map_selections(&text, &interaction.selections, movement);
             }
             // The mapped set may have merged members: keep this view's own
             // primary member when its cardinality allows (E-4/FR-4). The
@@ -826,8 +855,9 @@ pub fn apply_history_movement(
             interaction.primary = interaction.primary.min(interaction.selections.len() - 1);
             interaction.revision = after;
             interaction.sequence += 1;
+            let text = view.text.materialize();
             interaction.viewport_anchor = map_history_point(
-                &view.text,
+                &text,
                 interaction.viewport_anchor,
                 movement,
                 flavite_buffer::Affinity::Left,
@@ -836,6 +866,6 @@ pub fn apply_history_movement(
         })
         .collect();
     for interaction in mapped {
-        let _ = app.acknowledge_editor_interaction(interaction, &view.text);
+        let _ = app.acknowledge_editor_interaction(interaction, &view.text.materialize());
     }
 }

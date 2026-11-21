@@ -34,6 +34,8 @@ struct Harness {
     identity: VaultIdentity,
     db: PathBuf,
     #[allow(dead_code)]
+    root_dir: tempfile::TempDir,
+    #[allow(dead_code)]
     db_dir: tempfile::TempDir,
     #[allow(dead_code)]
     data_dir: tempfile::TempDir,
@@ -41,7 +43,10 @@ struct Harness {
 
 fn harness() -> Harness {
     let fs = MemFs::new();
-    let root = PathBuf::from("/test/vault");
+    // Real vault root: `.flavite/` (operation key, recovery, hints) is
+    // OS-addressable; note content flows through MemFs.
+    let root_dir = tempfile::tempdir().expect("vault root");
+    let root = root_dir.path().to_path_buf();
     fs.create_dir_all(&root).expect("vault root");
     let db_dir = tempfile::tempdir().expect("index dir");
     let db = db_dir.path().join("index.sqlite3");
@@ -76,6 +81,7 @@ fn harness() -> Harness {
         root,
         identity,
         db,
+        root_dir,
         db_dir,
         data_dir,
     }
@@ -421,6 +427,9 @@ fn unsupported_filesystem_refuses_with_typed_outcome() {
         fn remove(&self, p: &std::path::Path) -> flavite_fs::Result<()> {
             self.0.remove(p)
         }
+        fn remove_dir_all(&self, p: &std::path::Path) -> flavite_fs::Result<()> {
+            self.0.remove_dir_all(p)
+        }
         fn rename_replace(
             &self,
             f: &std::path::Path,
@@ -447,7 +456,8 @@ fn unsupported_filesystem_refuses_with_typed_outcome() {
     }
 
     let fs = NoRetained(MemFs::new());
-    let root = PathBuf::from("/test/vault");
+    let root_dir = tempfile::tempdir().expect("vault root");
+    let root = root_dir.path().to_path_buf();
     fs.create_dir_all(&root).expect("vault root");
     let db_dir = tempfile::tempdir().expect("index dir");
     let db = db_dir.path().join("index.sqlite3");
@@ -539,7 +549,8 @@ fn external_race_at_exchange_retains_displaced_bytes_and_reports_conflict() {
     // retained object. The item must be AppliedConflict and the racing
     // bytes must survive in history/disk layout (our bytes installed).
     let memory = MemFs::new();
-    let root = PathBuf::from("/test/vault");
+    let root_dir = tempfile::tempdir().expect("vault root");
+    let root = root_dir.path().to_path_buf();
     memory.create_dir_all(&root).unwrap();
     let target = root.join("race.md");
     memory.write_new(&target, b"hello race").unwrap();

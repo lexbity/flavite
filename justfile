@@ -14,6 +14,13 @@ fmt-fix:
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
 
+# Build with the system ld instead of mold: the empty-but-set RUSTFLAGS
+# overrides the tracked -fuse-ld=mold in .cargo/config.toml (verified — the
+# flag never reaches rustc). For hosts where mold cannot be installed.
+# Toggling fingerprints the dev graph: one full rebuild per switch.
+build-nomold:
+    RUSTFLAGS= cargo build --locked
+
 # Run all workspace tests. On failure, the failed-test lines are appended to
 # $GITHUB_STEP_SUMMARY in CI (audit L1) and the full log is kept in
 # target/last-test.log.
@@ -57,6 +64,13 @@ reconcile-bench:
 # allocation gates, and the flavite-graph 50k-node build smoke.
 bench-scale:
     cargo test --workspace --release -- --ignored --nocapture
+
+# RFC-0008 S1: scoped release benches for the edit/shaping paths (S1-T3).
+# Runs the ignored `perf_keystroke.rs` (buffer) and `perf_shaping.rs`
+# (editor) benches in release. Absolute hard-fail gates engage only with
+# FLAVITE_REFERENCE_PERF set (selection_performance.rs convention).
+bench-edit:
+    cargo test -p flavite-buffer -p flavite-editor --release --locked -- --ignored --nocapture
 
 # Architecture debt gates from RFC-0002 §7; zero matches are required.
 lint-arch:
@@ -498,10 +512,12 @@ gc:
     cargo xtask gc
 
 # Budget-independent sweep of previous-build artifacts (default: older than
-# 14 days): keeps the current build, drops what cargo would otherwise retain
-# forever. Cheap enough to run after heavy build sessions.
-gc-stale:
-    cargo xtask gc --stale-only
+# 1 day — variant sets accumulate within minutes, not days, so the window is
+# tight on purpose; the cost of sweeping a still-valid old artifact is one
+# cheap recompile). `just gc-stale` keeps everything from the last 24h;
+# `just gc-stale 0` is equivalent to a full clean.
+gc-stale days="1":
+    cargo xtask gc --stale-only --stale-days {{days}}
 
 # --- Releases (GoReleaser, see .goreleaser.yaml and docs/RELEASING.md) ---
 # CI (release.yml) runs these verbatim, so local == CI (D-9). All three need

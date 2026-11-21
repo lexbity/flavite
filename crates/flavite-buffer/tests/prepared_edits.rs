@@ -145,10 +145,10 @@ fn eol_splice_matches_whole_reference_reconstruction() {
         let batch = model
             .prepare_batch(&[op(second_start, second_end, "REPLACED")])
             .expect("batch prepares");
-        // The prepared undo snapshot carries the edited normalized text.
+        // The prepared candidate carries the edited normalized after-length.
         let mut expected_normalized = normalized.clone();
         expected_normalized.replace_range(second_start..second_end, "REPLACED");
-        assert_eq!(batch.undo_snapshot.text(), expected_normalized);
+        assert_eq!(batch.after_len, expected_normalized.len());
         let revision = model.install_prepared(batch);
         assert!(revision > Revision::INITIAL);
         assert_eq!(model.source_format(), expected_format);

@@ -46,6 +46,16 @@ pub struct Picker {
     pub replace_tab: Option<TabId>,
 }
 
+/// The profile chooser overlay state (FEUX-0003 E-15): a picker-style
+/// surface listing saved profiles by name. Enter applies the selection.
+#[derive(Debug, Clone, Default)]
+pub struct ProfilePickerState {
+    /// Filter text.
+    pub query: String,
+    /// Selected row.
+    pub selected: usize,
+}
+
 /// Lossless notice retained until the user dismisses its visible entry.
 #[derive(Debug, Clone)]
 pub struct NoticePresentation {
@@ -81,6 +91,8 @@ pub struct App {
     pub note_search: crate::host::note_search::NoteSearchHost,
     /// FEUX-0002 X06: match-driven selection drafts/previews (E-10/E-11).
     pub selection_search: crate::host::selection_search::SelectionSearchHost,
+    /// FEUX-0004 X03: command argument drafts (E-11).
+    pub command_args: crate::host::command_args::CommandArgsHost,
     /// FEUX-0002 X07: the content-free diagnostics ring and the burst-hint
     /// banner state (E-15).
     pub diagnostics: crate::host::editor_diagnostics::DiagnosticsHost,
@@ -146,6 +158,8 @@ pub struct App {
     /// Named layouts carried for the next layout save (W06).
     pub named_layouts: Vec<flavite_workspace::NamedLayout>,
     pub picker: Picker,
+    /// The profile chooser overlay (FEUX-0003 E-15); `None` when closed.
+    pub profile_picker: Option<crate::app::ProfilePickerState>,
     /// Presentation state for the collapsible vault navigator and app menus.
     /// Open/width truth lives in the device preferences; the preview here is
     /// the live drag width before its commit.
@@ -277,6 +291,10 @@ pub enum Message {
     Settings(crate::host::settings::SettingsMessage),
     /// The native theme-package dialog resolved (xpi themes).
     ThemePackagePicked(Option<std::path::PathBuf>),
+    /// FEUX-0003 X07: The native profile import dialog resolved.
+    ProfileImportPicked(Option<std::path::PathBuf>),
+    /// FEUX-0003 X07: The native profile export dialog resolved.
+    ProfileExportPicked(Option<(String, std::path::PathBuf)>),
     /// Begin a close for one tab (W12): decide or close.
     RequestCloseTab(TabId),
     /// Begin a close for a whole group (W12): plan per tab.
@@ -320,6 +338,8 @@ pub enum Message {
     NoteSearch(crate::host::note_search::NoteSearchMessage),
     /// FEUX-0002 X06: match-selection host messages.
     SelectionSearch(crate::host::selection_search::SelectionSearchMessage),
+    /// FEUX-0004 X03: command-args draft host messages.
+    CommandArgs(crate::host::command_args::CommandArgsMessage),
     /// FEUX-0002 X07: diagnostics ring and burst-hint host messages.
     EditorDiagnostics(crate::host::editor_diagnostics::DiagnosticsMessage),
     ToggleNoteMode(TabId),
@@ -587,6 +607,15 @@ pub enum Message {
     PickerSubmit,
     /// A picker result row was clicked.
     PickerPick(usize),
+    /// Open the profile chooser overlay (FEUX-0003 E-15).
+    ProfilePickerOpen,
+    ProfilePickerClose,
+    ProfilePickerQuery(String),
+    ProfilePickerNext,
+    ProfilePickerPrevious,
+    ProfilePickerSubmit,
+    /// A profile chooser row was clicked: apply that profile.
+    ProfilePickerPick(usize),
     /// Dispatch a host (UI) command by catalog id.
     RunHostCommand(&'static str),
     /// Dispatch a core command through the API for the focused note tab.
@@ -714,6 +743,7 @@ impl App {
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             selection_search: crate::host::selection_search::SelectionSearchHost::default(),
+            command_args: crate::host::command_args::CommandArgsHost::default(),
             diagnostics: crate::host::editor_diagnostics::DiagnosticsHost::default(),
             started_at: std::time::Instant::now(),
             replace: crate::host::replace::ReplaceHost::default(),
@@ -746,6 +776,7 @@ impl App {
             shutdown: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
+            profile_picker: None,
             sidebar_filter: String::new(),
             file_browser: Default::default(),
             vault_search: Default::default(),
@@ -799,6 +830,7 @@ impl App {
         }
         // Settings and preferences now load from the unified settings store (RFC-0007 S3)
         self.appearance.load(&flavite);
+        self.record_keymap_adoption();
         // The Settings tab host loads its own resolved view (RFC-0007 S6).
         self.settings.load(&flavite);
         if let Some(note) = self.appearance.status_note() {
@@ -1763,6 +1795,7 @@ impl App {
                 .get_shared_buffer_view(flavite_buffer::BufferId::from(buffer), None)
                 .ok()?
                 .text
+                .materialize()
                 .to_string(),
         )
     }
@@ -1986,7 +2019,7 @@ impl App {
                             *tab,
                             view.buffer_id,
                             view.revision,
-                            &view.text,
+                            &view.text.materialize(),
                         )
                     {
                         self.status = error.into();
@@ -2110,7 +2143,7 @@ impl App {
                 let Some(view) = self.note_editor_view(tab) else {
                     return;
                 };
-                if !valid || view.text.get(start..end) != Some(prefix.as_str()) {
+                if !valid || view.text.materialize().get(start..end) != Some(prefix.as_str()) {
                     self.status =
                         "Completion source changed; place the caret and choose again".into();
                     return;
@@ -2207,7 +2240,8 @@ impl App {
                     }
                     self.workspace.release_editor_focus(Some(tab));
                 }
-                if let Err(error) = self.acknowledge_editor_interaction(interaction, &current.text)
+                if let Err(error) =
+                    self.acknowledge_editor_interaction(interaction, &current.text.materialize())
                 {
                     self.status = format!("Editor state was not accepted: {error}");
                 } else {
@@ -2639,6 +2673,9 @@ impl App {
             }
             Message::SelectionSearch(message) => {
                 return crate::host::selection_search::handle(self, message);
+            }
+            Message::CommandArgs(message) => {
+                return crate::host::command_args::handle(self, message);
             }
             Message::EditorDiagnostics(message) => {
                 return crate::host::editor_diagnostics::handle(self, message);
@@ -3269,6 +3306,35 @@ impl App {
                 return self.run_picker_selection(selected);
             }
             Message::PickerPick(index) => return self.run_picker_selection(index),
+            Message::ProfilePickerOpen => {
+                self.profile_picker = Some(crate::app::ProfilePickerState::default());
+                return iced::widget::operation::focus(
+                    crate::workspace_shell::PROFILE_PICKER_INPUT_ID,
+                );
+            }
+            Message::ProfilePickerClose => self.profile_picker = None,
+            Message::ProfilePickerQuery(query) => {
+                if let Some(state) = &mut self.profile_picker {
+                    state.query = query;
+                    state.selected = 0;
+                }
+            }
+            Message::ProfilePickerNext => {
+                let last = self.profile_picker_matches().len().saturating_sub(1);
+                if let Some(state) = &mut self.profile_picker {
+                    state.selected = (state.selected + 1).min(last);
+                }
+            }
+            Message::ProfilePickerPrevious => {
+                if let Some(state) = &mut self.profile_picker {
+                    state.selected = state.selected.saturating_sub(1);
+                }
+            }
+            Message::ProfilePickerSubmit => {
+                let selected = self.profile_picker.as_ref().map_or(0, |s| s.selected);
+                return self.run_profile_picker_selection(selected);
+            }
+            Message::ProfilePickerPick(index) => return self.run_profile_picker_selection(index),
             Message::RunHostCommand(id) => return host_commands::dispatch(self, id),
             Message::RunCoreCommand(id) => return self.run_core_command(id),
             Message::RefreshCatalog => self.request_catalog_refresh(),
@@ -3451,6 +3517,22 @@ impl App {
                     return crate::host::settings::handle(
                         self,
                         crate::host::settings::SettingsMessage::ThemeInstallFromPath(path),
+                    );
+                }
+            }
+            Message::ProfileImportPicked(path) => {
+                if let Some(p) = path {
+                    return crate::host::settings::handle(
+                        self,
+                        crate::host::settings::SettingsMessage::ProfilesImportPath(p),
+                    );
+                }
+            }
+            Message::ProfileExportPicked(result) => {
+                if let Some((id, path)) = result {
+                    return crate::host::settings::handle(
+                        self,
+                        crate::host::settings::SettingsMessage::ProfilesExportPath { id, path },
                     );
                 }
             }
@@ -4065,6 +4147,9 @@ impl App {
         if crate::host::selection_search::completion(self, &completion) {
             return;
         }
+        if crate::host::command_args::completion(self, &completion) {
+            return;
+        }
         if self.replace.observe(&completion) {
             return;
         }
@@ -4327,8 +4412,11 @@ impl App {
                                 vec![flavite_workspace::CommittedSelection::caret(caret)];
                             interaction.primary = 0;
                             interaction.focused = true;
-                            self.acknowledge_editor_interaction(interaction, &view.text)
-                                .is_ok()
+                            self.acknowledge_editor_interaction(
+                                interaction,
+                                &view.text.materialize(),
+                            )
+                            .is_ok()
                         });
                     if !acknowledged {
                         self.workspace.invalidate_writing_target(target.buffer_id);
@@ -4710,9 +4798,57 @@ impl App {
         Task::none()
     }
 
+    /// Filtered profile chooser rows: `(id, name)` pairs matching the
+    /// current query (case-insensitive substring on the display name).
+    #[must_use]
+    pub fn profile_picker_matches(&self) -> Vec<(String, String)> {
+        let Some(state) = &self.profile_picker else {
+            return Vec::new();
+        };
+        let query = state.query.trim().to_lowercase();
+        self.settings
+            .profiles
+            .iter()
+            .filter(|profile| query.is_empty() || profile.name().to_lowercase().contains(&query))
+            .map(|profile| (profile.profile_id().to_string(), profile.name().to_string()))
+            .collect()
+    }
+
+    /// Apply the profile at `index` in the chooser rows and close the
+    /// overlay. Routes through the Settings message arm so status and the
+    /// `ProfileApplied` diagnostics event are shared (FEUX-0003 E-15).
+    fn run_profile_picker_selection(&mut self, index: usize) -> Task<Message> {
+        let matches = self.profile_picker_matches();
+        self.profile_picker = None;
+        let Some((id, _)) = matches.get(index.min(matches.len().saturating_sub(1))) else {
+            return Task::none();
+        };
+        self.update(Message::Settings(
+            crate::host::settings::SettingsMessage::ProfilesApply { id: id.clone() },
+        ))
+    }
+
     /// Rebuild the accessibility routing map from current state.
     pub fn refresh_semantics(&mut self) {
         self.a11y_nodes = crate::accessibility::tree::build_node_map(self);
+    }
+
+    /// Adopt-time keymap rejection hook: emit
+    /// [`EventKind::KeymapLayerRejected`] once when the last settings
+    /// adoption refused the whole user keymap layer (FR-5 / E-6). Every
+    /// adoption path (attach, focus-gained, apply, backup restore) calls
+    /// this right after `appearance.load`/`apply_resolved`.
+    pub fn record_keymap_adoption(&mut self) {
+        if let Some(reasons) = self.appearance.take_keymap_rejection() {
+            self.diagnostics.record(
+                None,
+                crate::host::editor_diagnostics::ModeEnum::Off,
+                crate::host::editor_diagnostics::EventKind::KeymapLayerRejected,
+                crate::host::editor_diagnostics::Outcome::Refused,
+                Some(reasons as u32),
+                None,
+            );
+        }
     }
 
     /// Bridge vault channels and operation replies.
@@ -5094,6 +5230,7 @@ mod tests {
             catalog_host: crate::host::catalog::CatalogHost::default(),
             note_search: crate::host::note_search::NoteSearchHost::default(),
             selection_search: crate::host::selection_search::SelectionSearchHost::default(),
+            command_args: crate::host::command_args::CommandArgsHost::default(),
             diagnostics: crate::host::editor_diagnostics::DiagnosticsHost::default(),
             started_at: std::time::Instant::now(),
             replace: crate::host::replace::ReplaceHost::default(),
@@ -5126,6 +5263,7 @@ mod tests {
             shutdown: None,
             named_layouts: Vec::new(),
             picker: Picker::default(),
+            profile_picker: None,
             sidebar_filter: String::new(),
             file_browser: Default::default(),
             vault_search: Default::default(),

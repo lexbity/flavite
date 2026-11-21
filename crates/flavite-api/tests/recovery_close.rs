@@ -590,6 +590,9 @@ mod fault_injected {
         fn remove(&self, path: &Path) -> Result<()> {
             self.0.remove(path)
         }
+        fn remove_dir_all(&self, path: &Path) -> Result<()> {
+            self.0.remove_dir_all(path)
+        }
         fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {
             self.0.rename_replace(from, to)
         }

@@ -180,7 +180,7 @@ fn load_inner(
             .shared_buffer_snapshot(id, Some(revision))
             .map_err(|_| "Source changed; retry reading")?;
         (
-            view.text,
+            view.text.materialize(),
             Some((id.as_u64(), revision.as_u64())),
             view.state != flavite_buffer::state::BufferState::Clean,
             view.source_format,

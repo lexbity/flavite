@@ -309,6 +309,18 @@ impl<'a> JournalExecutor<'a> {
             if manifest.state == TransactionState::Complete
                 || manifest.state == TransactionState::Abandoned
             {
+                // Terminal transactions keep no scratch: remove the
+                // hidden `<txn>.data` payload directory if one survived a
+                // pre-cleanup crash (FEUX vault hygiene).
+                if self
+                    .fs
+                    .exists(&manifest.data_dir(&self.journal_dir))
+                    .unwrap_or(false)
+                {
+                    let _ = self
+                        .fs
+                        .remove_dir_all(&manifest.data_dir(&self.journal_dir));
+                }
                 report.done.push(manifest.txn_id.clone());
                 tracing::info!(counter = "journal.recoveries_total", txn = %manifest.txn_id, outcome = "done", "journal already terminal");
                 continue;
@@ -325,6 +337,15 @@ impl<'a> JournalExecutor<'a> {
                 // prevent the vault from opening; leaving its unreferenced
                 // files is safer than traversing a path from this manifest.
                 let _ = self.fs.remove(&entry.path);
+                if self
+                    .fs
+                    .exists(&manifest.data_dir(&self.journal_dir))
+                    .unwrap_or(false)
+                {
+                    let _ = self
+                        .fs
+                        .remove_dir_all(&manifest.data_dir(&self.journal_dir));
+                }
                 self.fs.fsync_dir(&self.journal_dir).map_err(display)?;
                 report.done.push(manifest.txn_id.clone());
                 tracing::info!(counter = "journal.recoveries_total", txn = %manifest.txn_id, outcome = "done", "discarded uncommitted journal");
@@ -427,9 +448,9 @@ impl<'a> JournalExecutor<'a> {
         let staged = self.staged_payload_path(txn_id, item_id)?;
         if self.fs.exists(&staged).map_err(display)? {
             self.fs.remove(&staged).map_err(display)?;
-        }
-        if let Some(parent) = staged.parent() {
-            self.fs.fsync_dir(parent).map_err(display)?;
+            if let Some(parent) = staged.parent() {
+                self.fs.fsync_dir(parent).map_err(display)?;
+            }
         }
         self.persist(&manifest)
     }
@@ -551,14 +572,14 @@ impl<'a> JournalExecutor<'a> {
     }
 
     fn cleanup(&self, manifest: &JournalManifest) -> Result<(), String> {
+        // Terminal transactions leave no scratch behind: the `<txn>.data`
+        // payload directory (hidden, hash-named) is removed wholesale now
+        // that `Fs` supports recursive directory removal. Recovery ignores
+        // the `.data` dirs of terminal manifests for the same reason.
         let data = manifest.data_dir(&self.journal_dir);
         if self.fs.exists(&data).unwrap_or(false) {
-            for entry in self.fs.read_dir(&data).map_err(display)? {
-                if !entry.is_dir {
-                    let _ = self.fs.remove(&entry.path);
-                }
-            }
-            // Fs has no remove-directory operation; empty transaction data dirs are harmless.
+            self.fs.remove_dir_all(&data).map_err(display)?;
+            self.fs.fsync_dir(&self.journal_dir).map_err(display)?;
         }
         if manifest.is_terminal() && manifest.items.iter().all(|item| item.buffer_id.is_none()) {
             let path = manifest.manifest_path(&self.journal_dir);

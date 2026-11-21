@@ -56,5 +56,5 @@ pub use descriptor::{
 pub use document::{Parsed, SettingsDoc};
 pub use error::SettingsCodecError;
 pub use registry::SettingRegistry;
-pub use resolve::Resolved;
+pub use resolve::{Resolved, capture_delta, defaults_document};
 pub use value::SettingValue;

@@ -134,7 +134,7 @@ fn publish_builds_a_multi_member_set_and_kernel_delete_applies_across_all() {
 
     // Both leading characters were deleted in one atomic batch.
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "ne café\necond line\nthird row\n"
     );
     let after_revision = f.app.note_editor_view(tab).unwrap().revision;
@@ -175,7 +175,7 @@ fn paste_broadcast_through_the_clipboard_seam_reaches_every_member() {
         }));
 
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "·X·one café\n·X·second line\nthird row\n"
     );
     // Both members collapsed past their own insertion (stick right). "·X·"
@@ -219,7 +219,7 @@ fn cut_collapses_every_member_and_a_stale_target_is_a_zero_effect_refusal() {
     // Clipboard ordering (\u{a7}5.5): the write completion revalidates the
     // source before the deletion. Until then the text is untouched.
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "one caf\u{e9}\nsecond line\nthird row\n",
         "the cut must not delete before the clipboard write completed"
     );
@@ -231,7 +231,10 @@ fn cut_collapses_every_member_and_a_stale_target_is_a_zero_effect_refusal() {
         }));
 
     // D-11 cut of two carets takes each containing line including its break.
-    assert_eq!(&*f.app.note_editor_view(tab).unwrap().text, "third row\n");
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
+        "third row\n"
+    );
 
     // Replaying the stale target through the revalidated seam is a
     // zero-effect refusal: the source no longer matches the capture.
@@ -333,9 +336,10 @@ fn nfr_latency_bench_at_rising_cardinality() {
     let _view = flavite_editor::EditorView {
         buffer_id: 7,
         revision: 1,
-        text: std::sync::Arc::from(doc.as_str()),
+        text: flavite_buffer::chunks::DocumentText::from(doc.as_str()),
         path: "bench.md".into(),
         state: flavite_buffer::state::BufferState::Clean,
+        last_edit: None,
     };
     let raw: Vec<flavite_buffer::selection::RawSelection> =
         vec![flavite_buffer::selection::RawSelection {
@@ -429,7 +433,7 @@ fn passive_view_maps_once_for_a_multi_member_edit() {
     run(&mut f.app, tab_a, Command::Delete);
 
     assert_eq!(
-        &*f.app.note_editor_view(tab_b).unwrap().text,
+        &*f.app.note_editor_view(tab_b).unwrap().text.materialize(),
         "ne café\necond line\nthird row\n"
     );
     // B's selection 0..2 ("on") maps through the deletion of [0, 1):
@@ -533,7 +537,7 @@ fn ime_commit_lands_at_the_primary_only() {
         },
     });
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "Xone café\nsecond line\nthird row\n",
         "the composed text lands at the primary only"
     );
@@ -612,7 +616,7 @@ fn completed_typing_paste_installs_the_acquired_text_without_reacquiring() {
             text: Some("X".into()),
         }));
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "Xone café\nsecond line\nthird row\n",
         "the completed paste installs the clipboard text"
     );
@@ -639,7 +643,7 @@ fn completed_typing_paste_installs_the_acquired_text_without_reacquiring() {
             text: None,
         }));
     assert_eq!(
-        &*f.app.note_editor_view(tab).unwrap().text,
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
         "Xone café\nsecond line\nthird row\n",
         "an empty clipboard stays a no-op"
     );

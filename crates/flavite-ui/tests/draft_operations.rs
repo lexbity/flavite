@@ -149,7 +149,11 @@ fn draft_apply_and_revert_flow_through_app_pump() {
     let mut f = fixture();
     // Dirty a.md through the real facade (notes/a.md becomes "alpha one more\n").
     let api = f.app.flavite.as_ref().expect("flavite");
-    dirty(api, "/test/semantic-links/notes/a.md", " more");
+    dirty(
+        api,
+        &f.app.root().join("notes/a.md").display().to_string(),
+        " more",
+    );
     let tab = open_replace(&mut f.app);
     prepare_draft_preview(&mut f.app, tab);
 
@@ -187,13 +191,13 @@ fn draft_apply_and_revert_flow_through_app_pump() {
     assert_eq!(job.saved, 1);
     // The draft was not force-saved; the saved note was replaced.
     assert_eq!(
-        f.fs.read_if_exists(&std::path::PathBuf::from("/test/semantic-links/notes/a.md"))
+        f.fs.read_if_exists(&f.app.root().join("notes/a.md"))
             .unwrap()
             .unwrap(),
         b"alpha one\n"
     );
     assert_eq!(
-        f.fs.read_if_exists(&std::path::PathBuf::from("/test/semantic-links/notes/b.md"))
+        f.fs.read_if_exists(&f.app.root().join("notes/b.md"))
             .unwrap()
             .unwrap(),
         b"omega two\n"
@@ -226,13 +230,13 @@ fn draft_apply_and_revert_flow_through_app_pump() {
     assert_eq!(job.reverted, 1);
     assert_eq!(job.reverted_drafts, 1);
     assert_eq!(
-        f.fs.read_if_exists(&std::path::PathBuf::from("/test/semantic-links/notes/b.md"))
+        f.fs.read_if_exists(&f.app.root().join("notes/b.md"))
             .unwrap()
             .unwrap(),
         b"alpha two\n"
     );
     assert_eq!(
-        f.fs.read_if_exists(&std::path::PathBuf::from("/test/semantic-links/notes/a.md"))
+        f.fs.read_if_exists(&f.app.root().join("notes/a.md"))
             .unwrap()
             .unwrap(),
         b"alpha one\n"

@@ -65,6 +65,37 @@ pub struct EolTable {
 }
 
 impl EolTable {
+    /// Derive the EOL table by scanning `text`'s literal bytes: each line
+    /// split on `\n` records its physical ending (`\r\n` → Crlf, `\n` →
+    /// Lf, unterminated → None). Used at save/recovery/snapshot-legacy
+    /// sites and for building tables from scratch (D-04).
+    #[must_use]
+    pub fn from_text(text: &str) -> Self {
+        if text.is_empty() {
+            return Self {
+                line_endings: vec![LineEnding::None],
+                has_trailing_newline: false,
+            };
+        }
+        let mut line_endings = Vec::new();
+        let mut has_trailing_newline = false;
+        for line in text.split_inclusive('\n') {
+            let ending = if line.ends_with("\r\n") {
+                LineEnding::Crlf
+            } else if line.ends_with('\n') {
+                LineEnding::Lf
+            } else {
+                LineEnding::None
+            };
+            has_trailing_newline = ending != LineEnding::None;
+            line_endings.push(ending);
+        }
+        Self {
+            line_endings,
+            has_trailing_newline,
+        }
+    }
+
     /// Create a new EOL table from a TextSnapshot.
     #[must_use]
     pub fn from_snapshot(snapshot: &TextSnapshot) -> Self {
@@ -258,6 +289,29 @@ impl EolTable {
     }
 }
 
+/// The recorded ending of one split-inclusive line slice.
+#[must_use]
+pub(crate) fn line_ending_of(line: &str) -> LineEnding {
+    if line.ends_with("\r\n") {
+        LineEnding::Crlf
+    } else if line.ends_with('\n') {
+        LineEnding::Lf
+    } else {
+        LineEnding::None
+    }
+}
+
+/// Split text into split-inclusive lines (an empty text yields one phantom
+/// line — matching the snapshot serializer's line model).
+#[must_use]
+pub(crate) fn logical_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        vec![""]
+    } else {
+        text.split_inclusive('\n').collect()
+    }
+}
+
 /// Statistics about line endings for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EolStats {
@@ -272,6 +326,135 @@ pub struct EolStats {
 }
 
 impl EolTable {
+    /// Splice this table across one edited window (RFC-0011 D-04): the
+    /// windowed reference splice RFC-0008 D6 windowed reference splice.
+    ///
+    /// `window_first` is the table index of the window's first line;
+    /// `window_old` is the pre-edit bytes of `[window_start, tail_end)`;
+    /// `window_new` is the post-edit bytes of that window; `window_reaches_end`
+    /// says whether the window runs to the end of the document (trailing
+    /// newline state is then derived from the new window, else preserved).
+    ///
+    /// Unchanged prefix/suffix entries keep their recorded endings; changed
+    /// lines inherit the old dominant ending; a new final unterminated line
+    /// stays unterminated.
+    #[must_use]
+    pub fn splice_window(
+        &self,
+        window_first: usize,
+        window_old: &str,
+        window_new: &str,
+        window_reaches_end: bool,
+    ) -> EolTable {
+        let old_count = self.line_count();
+        if window_new.is_empty() {
+            // The whole run was deleted. The surviving document is the
+            // unchanged, line-aligned head and tail: the run contributes no
+            // lines (a wholly deleted run is not a phantom unterminated line).
+            if window_first == 0 && window_reaches_end {
+                // The document is now empty: one unterminated line (§6.10).
+                return EolTable {
+                    line_endings: vec![LineEnding::None],
+                    has_trailing_newline: false,
+                };
+            }
+            let removed = old_count
+                .saturating_sub(window_first)
+                .min(window_old.split_inclusive('\n').count());
+            let mut table = self.clone();
+            table
+                .line_endings
+                .splice(window_first..window_first + removed, []);
+            // The surviving document tail is unchanged: the old final line
+            // when the tail survives, otherwise the (terminated) last head
+            // line.
+            table.has_trailing_newline = if !window_reaches_end {
+                self.has_trailing_newline
+            } else {
+                window_first > 0
+            };
+            return table;
+        }
+        let dominant = match self.dominant_eol() {
+            LineEnding::None => LineEnding::Lf,
+            ending => ending,
+        };
+        // `logical_lines` maps an empty run to its one phantom line, matching
+        // the whole-document reference.
+        let old_lines = logical_lines(window_old);
+        let new_lines = logical_lines(window_new);
+        let removed = old_count.saturating_sub(window_first).min(old_lines.len());
+        let new_count = old_count - removed + new_lines.len();
+
+        let mut head = 0;
+        while head < old_lines.len() && head < new_lines.len() && old_lines[head] == new_lines[head]
+        {
+            head += 1;
+        }
+        let prefix = window_first + head;
+        let mut suffix = 0;
+        while suffix < old_lines.len().saturating_sub(head)
+            && suffix < new_lines.len().saturating_sub(head)
+            && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        // The unchanged lines beyond the window are equal on both sides and
+        // always extend the whole-document suffix (the reference compares
+        // them line by line); the window tail matches stack on top of them.
+        let beyond_window = old_count
+            .saturating_sub(window_first)
+            .saturating_sub(removed);
+        let suffix = (suffix + beyond_window)
+            .min(old_count.saturating_sub(prefix))
+            .min(new_count.saturating_sub(prefix));
+        let old_middle = old_count.saturating_sub(prefix + suffix);
+        let new_middle = new_count.saturating_sub(prefix + suffix);
+
+        let mut table = EolTable::default();
+        table.line_endings.reserve(new_count);
+        for line in 0..new_count {
+            // The scanned terminator of the new text at this line: a
+            // replacement line without a newline is authoritative and never
+            // inherits one.
+            let scanned = if line < window_first {
+                self.get(line)
+            } else if line < window_first + new_lines.len() {
+                Some(line_ending_of(new_lines[line - window_first]))
+            } else {
+                self.get(old_count - (new_count - line))
+            };
+            if scanned == Some(LineEnding::None) {
+                table.line_endings.push(LineEnding::None);
+                continue;
+            }
+            let old_line = if line < prefix {
+                Some(line)
+            } else if line >= new_count - suffix {
+                Some(old_count - (new_count - line))
+            } else if old_middle == new_middle {
+                Some(line)
+            } else {
+                None
+            };
+            let ending = old_line
+                .and_then(|old_line| self.get(old_line))
+                .unwrap_or(dominant);
+            table.line_endings.push(ending);
+        }
+        // The reference's trailing flag comes from the whole-document scan:
+        // the last document line lies beyond the window (the old trailing
+        // state stands) or is the window's final new line.
+        table.has_trailing_newline = if !window_reaches_end {
+            self.has_trailing_newline
+        } else {
+            new_lines
+                .last()
+                .is_some_and(|line| line_ending_of(line) != LineEnding::None)
+        };
+        table
+    }
+
     /// Compute statistics about line endings.
     #[must_use]
     pub fn stats(&self) -> EolStats {

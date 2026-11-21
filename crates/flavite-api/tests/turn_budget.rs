@@ -8,6 +8,11 @@
 //!
 //! The decision state is a process-global rate window, so both tests
 //! serialize on a file-local lock.
+//!
+//! The `turn_budget` surface is `#[cfg(debug_assertions)]` in flavite-api
+//! (NFR-10 debug gate), so this integration suite is debug-only: release
+//! profiles (`just bench-scale`) gate it out (RFC-0008 S9 consolidation).
+#![cfg(debug_assertions)]
 
 use flavite_api::turn_budget::{TURN_BUDGET, reset_for_test, warn_decision};
 use std::sync::Mutex;

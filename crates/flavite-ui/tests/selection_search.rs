@@ -8,6 +8,7 @@
 mod support;
 
 use flavite_edit_context::ContextCommand as Command;
+use flavite_editor::{EditorAction, EditorInteractionSnapshot};
 use flavite_ui::accessibility::program::FlaviteProgram;
 use flavite_ui::app::{App, Message};
 use flavite_ui::host::context_mode::{ContextMessage, EditorTarget};
@@ -94,6 +95,45 @@ fn committed_members(app: &App, tab: TabId) -> Vec<(usize, usize)> {
         .iter()
         .map(|s| (s.anchor, s.head))
         .collect()
+}
+
+/// Publish a full member set through the real acknowledged-interaction
+/// publish path.
+fn publish_members(app: &mut App, tab: TabId, members: &[(usize, usize)]) {
+    let view = app.note_editor_view(tab).unwrap();
+    let sequence = app.workspace.tab(&tab).unwrap().interaction().sequence + 1;
+    let primary = members[0];
+    let snapshot = EditorInteractionSnapshot {
+        sequence,
+        buffer_id: view.buffer_id,
+        revision: view.revision,
+        caret: primary.1,
+        selection: primary,
+        selections: members
+            .iter()
+            .enumerate()
+            .map(|(id, &(anchor, head))| [id, anchor, head])
+            .collect(),
+        primary: 0,
+        viewport_anchor: 0,
+        focused: true,
+        composing: false,
+    };
+    let _ = app.update(Message::EditorAction {
+        tab,
+        incarnation: app.notes.incarnation(tab).unwrap(),
+        action: EditorAction::Interaction(snapshot),
+    });
+    assert_eq!(
+        app.workspace
+            .tab(&tab)
+            .unwrap()
+            .interaction()
+            .selections
+            .len(),
+        members.len(),
+        "the committed set holds every member"
+    );
 }
 
 #[test]
@@ -226,7 +266,15 @@ fn stale_draft_is_rejected_by_key_when_the_selection_changes() {
     );
     // The committed set is untouched byte-identically.
     assert_eq!(committed_members(&f.app, tab), vec![(5, 6)]);
-    assert_eq!(f.app.note_editor_view(tab).unwrap().text.as_ref(), BODY);
+    assert_eq!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
+        BODY
+    );
 }
 
 #[test]
@@ -241,7 +289,12 @@ fn close_discards_the_overlay_byte_identically() {
     assert!(!f.app.selection_search.tabs.contains_key(&tab));
     assert_eq!(committed_members(&f.app, tab), vec![(0, 0)]);
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.as_ref(),
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         BODY,
         "Esc/Close leaves the committed set byte-identical"
     );
@@ -357,8 +410,143 @@ fn a_superseded_draft_cancels_the_old_request_and_the_newest_wins() {
     // The committed set stays untouched until the apply.
     assert_eq!(committed_members(&f.app, tab), vec![(0, 0)]);
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.as_ref(),
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         BODY,
         "cancellation and supersede never mutate the text"
     );
+}
+
+#[test]
+fn in_selections_select_scopes_the_search_to_the_live_members() {
+    // FEUX-0006 E-2: the scope toggle sends the member spans with the
+    // collection; only fully-contained matches are reported and applied.
+    let (mut f, tab) = fixture(9109);
+    publish_members(&mut f.app, tab, &[(0, 8), (14, 17)]);
+    let version_before = f
+        .app
+        .workspace
+        .tab(&tab)
+        .unwrap()
+        .interaction()
+        .selection_version;
+
+    run(&mut f.app, tab, Command::SelectMatches);
+    let _ = f.app.update(Message::SelectionSearch(
+        SelectionSearchMessage::ToggleInSelections(tab),
+    ));
+    draft_query(&mut f.app, tab, "TODO");
+    pump_until(&mut f.app, |app| overlay_spans(app, tab).is_some());
+    let spans = overlay_spans(&f.app, tab).expect("scoped overlay");
+    assert_eq!(
+        spans.len(),
+        1,
+        "only the member containing TODO contributes"
+    );
+    assert_eq!(spans[0], (0, 4));
+
+    let _ = f
+        .app
+        .update(Message::SelectionSearch(SelectionSearchMessage::Apply(tab)));
+    assert_eq!(
+        committed_members(&f.app, tab),
+        vec![(0, 4)],
+        "the scoped selects replace the set"
+    );
+    assert!(
+        f.app
+            .workspace
+            .tab(&tab)
+            .unwrap()
+            .interaction()
+            .selection_version
+            > version_before
+    );
+    assert_eq!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
+        BODY,
+        "selection-only: bytes unchanged"
+    );
+}
+
+#[test]
+fn keep_draft_overlays_survivors_and_apply_filters_the_set() {
+    // FEUX-0006 E-4: keep/drop runs on the same engine, the draft request
+    // carries `keep` (and no scope fields), the overlay outlines the
+    // survivors, and Apply installs the filtered set selection-only.
+    let (mut f, tab) = fixture(9108);
+    let version_before = f
+        .app
+        .workspace
+        .tab(&tab)
+        .unwrap()
+        .interaction()
+        .selection_version;
+    // Member 0 (0..8 = "TODO one") contains "TODO"; member 1 (14..17 =
+    // "two") does not.
+    publish_members(&mut f.app, tab, &[(0, 8), (14, 17)]);
+    let text_before = f
+        .app
+        .note_editor_view(tab)
+        .unwrap()
+        .text
+        .materialize()
+        .to_string();
+
+    run(&mut f.app, tab, Command::KeepMatching { keep: true });
+    draft_query(&mut f.app, tab, "TODO");
+    pump_until(&mut f.app, |app| overlay_spans(app, tab).is_some());
+    let spans = overlay_spans(&f.app, tab).expect("keep overlay");
+    assert_eq!(spans.len(), 1, "only the TODO-containing member survives");
+    assert_eq!(spans[0], (0, 8));
+    // The overlay never mutates the committed set.
+    assert_eq!(committed_members(&f.app, tab), vec![(0, 8), (14, 17)]);
+
+    let _ = f
+        .app
+        .update(Message::SelectionSearch(SelectionSearchMessage::Apply(tab)));
+    assert_eq!(committed_members(&f.app, tab), vec![(0, 8)]);
+    assert!(
+        f.app
+            .workspace
+            .tab(&tab)
+            .unwrap()
+            .interaction()
+            .selection_version
+            > version_before,
+        "apply bumps the committed selection version"
+    );
+    assert_eq!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
+        text_before.as_str(),
+        "keep is selection-only: bytes unchanged"
+    );
+
+    // The complement keeps the non-matching member: re-publish the two
+    // member set and drop the TODO-containing member.
+    publish_members(&mut f.app, tab, &[(0, 8), (14, 17)]);
+    run(&mut f.app, tab, Command::KeepMatching { keep: false });
+    draft_query(&mut f.app, tab, "TODO");
+    pump_until(&mut f.app, |app| overlay_spans(app, tab).is_some());
+    let spans = overlay_spans(&f.app, tab).expect("drop overlay");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0], (14, 17), "the non-matching member survives");
+    let _ = f
+        .app
+        .update(Message::SelectionSearch(SelectionSearchMessage::Apply(tab)));
+    assert_eq!(committed_members(&f.app, tab), vec![(14, 17)]);
 }

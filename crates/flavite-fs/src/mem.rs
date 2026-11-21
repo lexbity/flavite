@@ -445,9 +445,10 @@ enum PathKind {
     Symlink,
 }
 
-impl Fs for MemFs {
-    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
-        let state = self.lock();
+impl MemFs {
+    /// Canonicalize with the state lock already held (shared by
+    /// [`Fs::canonicalize`] and [`Fs::remove_dir_all`]).
+    fn canonicalize_locked(state: &MemState, path: &Path) -> Result<PathBuf> {
         // Resolve `.` and `..` components lexically (no symlink resolution).
         let mut out = PathBuf::new();
         for component in path.components() {
@@ -497,6 +498,13 @@ impl Fs for MemFs {
             }
         }
         Ok(current)
+    }
+}
+
+impl Fs for MemFs {
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+        let state = self.lock();
+        Self::canonicalize_locked(&state, path)
     }
 
     fn resolve_symlink(&self, path: &Path) -> Result<PathBuf> {
@@ -751,6 +759,56 @@ impl Fs for MemFs {
                 Ok(())
             }
         }
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        let mut state = self.lock();
+        let canon = Self::canonicalize_locked(&state, path)?;
+        if !matches!(Self::path_kind(&state, &canon), Some(PathKind::Dir)) {
+            return Err(FsError::Io(format!(
+                "cannot remove non-directory: {}",
+                canon.display()
+            )));
+        }
+        // Remove the whole subtree in every map (matching `move_descendants`
+        // which rewrites the same key sets).
+        let dir_keys: Vec<PathBuf> = state
+            .vol_dirs
+            .keys()
+            .filter(|key| key.starts_with(&canon))
+            .cloned()
+            .collect();
+        let file_keys: Vec<PathBuf> = state
+            .vol_files
+            .keys()
+            .filter(|key| key.starts_with(&canon))
+            .cloned()
+            .collect();
+        let symlink_keys: Vec<PathBuf> = state
+            .symlinks
+            .keys()
+            .filter(|key| key.starts_with(&canon))
+            .cloned()
+            .collect();
+        for dir in &dir_keys {
+            state.vol_dirs.remove(dir);
+            Self::remove_dir_entry(&mut state, dir);
+        }
+        for file in &file_keys {
+            state.vol_files.remove(file);
+            Self::remove_dir_entry(&mut state, file);
+            state.identities.remove(file);
+            state.modes.remove(file);
+            state.mtimes.remove(file);
+        }
+        for link in &symlink_keys {
+            state.symlinks.remove(link);
+            Self::remove_dir_entry(&mut state, link);
+            state.identities.remove(link);
+            state.modes.remove(link);
+            state.mtimes.remove(link);
+        }
+        Ok(())
     }
 
     fn rename_replace(&self, from: &Path, to: &Path) -> Result<()> {

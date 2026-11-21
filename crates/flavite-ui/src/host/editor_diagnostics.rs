@@ -82,6 +82,22 @@ pub enum EventKind {
     BurstHint,
     /// The explicit export action ran.
     DiagnosticExport,
+    /// Keymap layer was rejected (FEUX-0003 X03/X06).
+    KeymapLayerRejected,
+    /// Profile was captured (FEUX-0003 X06).
+    ProfileCaptured,
+    /// Profile was applied (FEUX-0003 X06).
+    ProfileApplied,
+    /// Profile was created (FEUX-0003 X06).
+    ProfileCreated,
+    /// Profile was deleted (FEUX-0003 X06).
+    ProfileDeleted,
+    /// Profile was imported (FEUX-0003 X06).
+    ProfileImported,
+    /// Profile was exported (FEUX-0003 X06).
+    ProfileExported,
+    /// A repeat-last outcome (FEUX-0004 E-5/E-14).
+    RepeatOutcome,
 }
 
 /// The outcome of the recorded event.
@@ -95,6 +111,10 @@ pub enum Outcome {
     Deduplicated,
     Expired,
     Shown,
+    /// No invocation was recorded for repeat (FEUX-0004 E-5).
+    NoRegister,
+    /// The invocation was successfully replayed (FEUX-0004 E-5).
+    Replayed,
 }
 
 /// Classify a terminal api error message into its typed outcome (E-5):

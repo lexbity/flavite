@@ -60,10 +60,33 @@ fn run(
         id: 42,
         scope,
         nominated,
+        ignore_globs: &[],
     };
     let result = scan(fs, &root, &job, &tx, pool);
     drop(tx);
     (collector.join().expect("collector"), result)
+}
+
+/// Run one scan with user ignore-globs (RFC-0007 D-12).
+fn run_with_globs(
+    fs: &dyn Fs,
+    globs: &[String],
+    nominated: &HashSet<PathBuf>,
+    pool: Option<&ThreadPool>,
+) -> ScanResult {
+    let root = PathBuf::from(ROOT);
+    let (tx, rx) = crossbeam::channel::bounded::<WorkerMessage>(16_384);
+    let collector = std::thread::spawn(move || while rx.recv().is_ok() {});
+    let job = ScanJob {
+        id: 43,
+        scope: &ReconcileScope::Full,
+        nominated,
+        ignore_globs: globs,
+    };
+    let result = scan(fs, &root, &job, &tx, pool);
+    drop(tx);
+    let _ = collector.join();
+    result
 }
 
 /// One gate case: same filesystem, three execution modes, identical streams.
@@ -410,4 +433,88 @@ fn missing_and_vanished_paths_emit_identical_missing_outcomes() {
         })
         .count();
     assert_eq!(missing, 50, "every vanished path must report Missing");
+}
+
+/// RFC-0007 D-12 corpus: notes, a `scratch/` subtree, a `*.tmp` file, and
+/// the vault's own `.flavite/` plumbing.
+fn glob_corpus() -> MemFs {
+    let fs = MemFs::new();
+    let root = PathBuf::from(ROOT);
+    fs.create_dir_all(&root).expect("root");
+    fs.create_dir_all(&root.join("scratch")).expect("scratch");
+    fs.create_dir_all(&root.join(".flavite/journal"))
+        .expect("journal");
+    for index in 0..5 {
+        fs.write_new(&root.join(format!("note-{index}.md")), b"# note")
+            .expect("note");
+    }
+    for index in 0..3 {
+        fs.write_new(&root.join(format!("scratch/s-{index}.md")), b"# scratch")
+            .expect("scratch note");
+    }
+    fs.write_new(&root.join("scratch/tmp.tmp"), b"tmp")
+        .expect("tmp");
+    fs.write_new(&root.join("pics.png"), b"png").expect("png");
+    fs.write_new(&root.join(".flavite/settings.toml"), b"schema = 2")
+        .expect("settings");
+    fs
+}
+
+fn key(fs: &MemFs, relative: &str) -> Vec<u8> {
+    fs.encode_path_key(Path::new(relative)).expect("key")
+}
+
+#[test]
+fn ignore_globs_exclude_paths_from_enumeration_and_nominations() {
+    let fs = glob_corpus();
+    let globs: Vec<String> = vec!["scratch/**".into(), "*.tmp".into()];
+    let result = run_with_globs(&fs, &globs, &HashSet::new(), None);
+    assert!(result.present_notes.contains(&key(&fs, "note-0.md")));
+    assert!(!result.present_notes.contains(&key(&fs, "scratch/s-0.md")));
+    assert!(result.present_attachments.contains(&key(&fs, "pics.png")));
+    assert!(
+        !result
+            .present_attachments
+            .contains(&key(&fs, "scratch/tmp.tmp"))
+    );
+    // A watcher-style nomination of an ignored path must be filtered too —
+    // a nomination must never smuggle an ignored file back into the scan.
+    let mut nominated = HashSet::new();
+    nominated.insert(fs_root().join("scratch/s-1.md"));
+    nominated.insert(fs_root().join("note-1.md"));
+    let result = run_with_globs(&fs, &globs, &nominated, None);
+    assert!(!result.present_notes.contains(&key(&fs, "scratch/s-1.md")));
+    assert!(result.present_notes.contains(&key(&fs, "note-1.md")));
+}
+
+#[test]
+fn flavite_plumbing_rule_survives_user_globs() {
+    let fs = glob_corpus();
+    // A `.flavite*` user glob matches `.flavite` itself; the hardcoded
+    // plumbing exclusion is applied after user globs, so the vault's own
+    // state must stay out of every presence set either way.
+    let globs: Vec<String> = vec![".flavite*".into()];
+    let result = run_with_globs(&fs, &globs, &HashSet::new(), None);
+    assert!(
+        !result
+            .present_notes
+            .contains(&key(&fs, ".flavite/settings.toml"))
+    );
+    assert!(
+        !result
+            .present_attachments
+            .contains(&key(&fs, ".flavite/settings.toml"))
+    );
+    // Other files still enumerate normally.
+    assert!(result.present_notes.contains(&key(&fs, "note-0.md")));
+    assert!(result.present_notes.contains(&key(&fs, "scratch/s-0.md")));
+
+    // The same corpus without globs must include `.flavite` neither — the
+    // hard rule is baseline behavior.
+    let plain = run_with_globs(&fs, &[], &HashSet::new(), None);
+    assert!(
+        !plain
+            .present_notes
+            .contains(&key(&fs, ".flavite/settings.toml"))
+    );
 }

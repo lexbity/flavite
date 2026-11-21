@@ -1,0 +1,25 @@
+{
+  "links": [
+    {
+      "start": 16,
+      "end": 29,
+      "target_raw": "crlf-link",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      34,
+      44
+    ]
+  ],
+  "block_ids": [
+    [
+      62,
+      73
+    ]
+  ]
+}

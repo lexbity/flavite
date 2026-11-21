@@ -9,6 +9,7 @@
 
 use crate::style::{self, Metrics, Scheme};
 use flavite_api::{Flavite, InstalledTheme};
+use flavite_edit_context::{self, labels};
 use flavite_settings::resolve::Resolved;
 use flavite_settings::value::SettingValue;
 use flavite_theme::{SemanticTheme, ThemeImage};
@@ -131,9 +132,22 @@ pub struct AppearanceHost {
     pub last_error: Option<String>,
     /// The last shortcut-validation failure for the editor UI.
     pub shortcut_error: Option<String>,
+    /// The last keymap-validation failure for Context Mode keys.
+    pub keymap_error: Option<String>,
+    /// The violation count of the last whole-layer keymap rejection at
+    /// adoption ([`EventKind::KeymapLayerRejected`]); `None` when the last
+    /// adoption accepted the layer. Consumed by the App via
+    /// [`Self::take_keymap_rejection`] so the diagnostics ring records the
+    /// event exactly once per rejection.
+    keymap_layer_rejected: Option<usize>,
     /// The resolved chord table: default chords with any validated
     /// overrides applied. Rebuilt on every adoption.
     pub shortcuts: Vec<(flavite_api::Chord, &'static str)>,
+    /// The effective Context Mode keymap: compiled-in defaults with any validated
+    /// overrides applied. Rebuilt on every adoption (FEUX-0003 X02).
+    pub context_keys: flavite_edit_context::ContextKeymap,
+    /// The declared keyboard layout for Context Mode labels (FEUX-0003 X02).
+    pub keyboard_layout: flavite_edit_context::labels::Layout,
     /// The loaded theme package, when one is selected and loads.
     pub theme_package: Option<ThemePackage>,
     /// The installed theme packages, for the Settings tab.
@@ -157,7 +171,11 @@ impl AppearanceHost {
             system_dark: None,
             last_error: None,
             shortcut_error: None,
+            keymap_error: None,
+            keymap_layer_rejected: None,
             shortcuts: Vec::new(),
+            context_keys: flavite_edit_context::ContextKeymap::defaults(),
+            keyboard_layout: flavite_edit_context::labels::Layout::default(),
             theme_package: None,
             installed_themes: Vec::new(),
             theme_error: None,
@@ -295,6 +313,15 @@ impl AppearanceHost {
     #[must_use]
     pub fn shortcut_overrides(&self) -> std::collections::BTreeMap<String, String> {
         match self.value("shortcuts.overrides") {
+            SettingValue::ShortcutMap(map) => map,
+            _ => std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Context Mode key overrides from settings (FEUX-0003 X02).
+    #[must_use]
+    pub fn context_key_overrides(&self) -> std::collections::BTreeMap<String, String> {
+        match self.value("shortcuts.context_keys") {
             SettingValue::ShortcutMap(map) => map,
             _ => std::collections::BTreeMap::new(),
         }
@@ -471,6 +498,40 @@ impl AppearanceHost {
                 Some((chord, *id))
             })
             .collect();
+
+        // Context Mode keymap: rebuild from resolved settings (FEUX-0003 X02)
+        let context_overrides = self.context_key_overrides();
+        self.context_keys = match flavite_edit_context::ContextKeymap::resolve(&context_overrides) {
+            Ok(keymap) => {
+                self.keymap_layer_rejected = None;
+                keymap
+            }
+            Err(errors) => {
+                // Whole-layer rejection: use defaults (FR-5 / E-6). The
+                // first violation is surfaced in the Settings row and the
+                // violation count is recorded for the diagnostics event
+                // (the App emits `KeymapLayerRejected` after adoption).
+                let message = if let Some(first) = errors.first() {
+                    first.to_string()
+                } else {
+                    "Invalid Context Mode key configuration".to_string()
+                };
+                self.keymap_error = Some(if errors.len() > 1 {
+                    format!("{message} ({} problems total)", errors.len())
+                } else {
+                    message
+                });
+                self.keymap_layer_rejected = Some(errors.len());
+                flavite_edit_context::ContextKeymap::defaults()
+            }
+        };
+
+        // Keyboard layout for Context Mode labels (FEUX-0003 X02)
+        self.keyboard_layout = self
+            .value("appearance.keyboard_layout")
+            .as_str()
+            .and_then(labels::Layout::parse)
+            .unwrap_or_default();
     }
 
     /// Resolve a keyboard event to its bound command id, if any chord
@@ -501,6 +562,23 @@ impl AppearanceHost {
             return Some(error.clone());
         }
         None
+    }
+
+    /// Consume the keymap-rejection record from the last adoption. The App
+    /// calls this after every adoption path (attach, focus-gained, apply)
+    /// to emit [`EventKind::KeymapLayerRejected`] exactly once per
+    /// rejection.
+    #[must_use]
+    pub fn take_keymap_rejection(&mut self) -> Option<usize> {
+        self.keymap_layer_rejected.take()
+    }
+
+    /// Get the binding label for a Context Mode binding id using the effective
+    /// keymap and declared layout (FEUX-0003 E-8).
+    #[must_use]
+    pub fn context_label(&self, binding_id: &str) -> String {
+        self.context_keys
+            .binding_label(self.keyboard_layout, binding_id)
     }
 }
 

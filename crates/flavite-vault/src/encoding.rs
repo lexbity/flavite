@@ -26,6 +26,36 @@ pub const HINTS_SCHEMA: u32 = 1;
 /// Bound raw-byte hash (blake3) of the last confirmed interpretation.
 pub type RawHash = [u8; 32];
 
+/// Bounded NUL probe windows (RFC-0011 S3): binary/binary-shaped content is
+/// detected from the head and tail of a document without scanning the whole
+/// body. Head window 1 MiB, tail window 256 KiB — the regions where binary
+/// signatures (NUL runs, UTF-16-ish zero-padding) actually occur. A NUL in
+/// the excluded middle is not flagged; this is the documented semantic of
+/// the bounded probe, replacing the full-document scan on paths that must
+/// stay O(window).
+pub const NUL_PROBE_HEAD_BYTES: usize = 1024 * 1024;
+pub const NUL_PROBE_TAIL_BYTES: usize = 256 * 1024;
+
+/// Whether `text` contains a NUL within the bounded probe windows.
+/// The head window is taken from the start; the tail window from the end;
+/// windows overlap on documents shorter than their sum (no double work).
+/// Slicing clamps to UTF-8 character boundaries (stepping back/forward at
+/// most a few continuation bytes — never a full scan).
+#[must_use]
+pub fn contains_nul_in_probe_windows(text: &str) -> bool {
+    if text.len() <= NUL_PROBE_HEAD_BYTES + NUL_PROBE_TAIL_BYTES {
+        return text.contains('\0');
+    }
+    let head_end = (0..=NUL_PROBE_HEAD_BYTES)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
+    let tail_start = (text.len().saturating_sub(NUL_PROBE_TAIL_BYTES)..=text.len())
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(text.len());
+    text[..head_end].contains('\0') || text[tail_start..].contains('\0')
+}
+
 /// One confirmed hint for one native source identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -551,7 +581,9 @@ pub fn resolve_source(
             // Core policy boundary: BOM-less Auto content containing NUL is
             // ambiguous/binary input until an explicit choice confirms it —
             // the codec itself never makes this usability decision (§6.10).
-            if !format.bom() && snapshot.text().contains('\0') {
+            // The probe is bounded to head/tail windows (RFC-0011 S3): the
+            // open path stays O(window), not O(document).
+            if !format.bom() && contains_nul_in_probe_windows(snapshot.text()) {
                 return Resolution::NeedsChoice {
                     native_key,
                     reason: ChoiceReason::NulBearingContent {
@@ -859,5 +891,66 @@ mod tests {
         // Without a store, durable confirmation is refused typed.
         let err = state.update(|_| ()).unwrap_err();
         assert_eq!(err, HintsWriteError::NoStore);
+    }
+
+    /// RFC-0011 S3-T4: the bounded NUL probe (RFC-0011 S3) preserves
+    /// binary detection on the head/tail windows without scanning the
+    /// document body.
+    #[test]
+    fn nul_probe_windows_preserve_binary_detection() {
+        use crate::encoding::{
+            NUL_PROBE_HEAD_BYTES, NUL_PROBE_TAIL_BYTES, contains_nul_in_probe_windows,
+        };
+        // Documents within the combined windows keep full-document semantics.
+        assert!(!contains_nul_in_probe_windows("plain text"));
+        assert!(contains_nul_in_probe_windows("a\0b"));
+
+        let head = NUL_PROBE_HEAD_BYTES;
+        let tail = NUL_PROBE_TAIL_BYTES;
+        let make = |at: usize| {
+            let mut bytes = vec![b'x'; head + tail + 1024];
+            bytes[at] = 0;
+            String::from_utf8(bytes).unwrap()
+        };
+
+        // Head window catches a NUL near the start.
+        assert!(contains_nul_in_probe_windows(&make(10)));
+        // Tail window catches a NUL near the end (the binary tail signature).
+        assert!(contains_nul_in_probe_windows(&make(head + tail + 512)));
+        // The excluded middle is not scanned — the documented bounded
+        // semantic of the probe.
+        assert!(!contains_nul_in_probe_windows(&make(head + 512)));
+    }
+
+    /// The encode-side policy boundary uses the same bounded windows: a
+    /// large BOM-less Auto source with a tail NUL still refuses until an
+    /// explicit choice confirms it (the S3-T4 "NUL-at-tail" fixture).
+    #[test]
+    fn auto_decode_refuses_tail_nul_with_bounded_probe() {
+        use crate::encoding::{NUL_PROBE_HEAD_BYTES, NUL_PROBE_TAIL_BYTES};
+        let head = NUL_PROBE_HEAD_BYTES;
+        let tail = NUL_PROBE_TAIL_BYTES;
+        let mut bytes = vec![b'x'; head + tail + 1024];
+        bytes[head + tail + 512] = 0;
+        let res = resolve_source(
+            "k".into(),
+            &bytes,
+            &HintsView {
+                generation: None,
+                record: record(),
+            },
+            None,
+            &DecodeLimits::default(),
+        );
+        assert!(
+            matches!(
+                &res,
+                Resolution::NeedsChoice {
+                    reason: ChoiceReason::NulBearingContent { .. },
+                    ..
+                }
+            ),
+            "tail NUL must still require an explicit choice, got {res:?}"
+        );
     }
 }

@@ -189,6 +189,7 @@ fn main() {
         id: 1,
         scope: &scope,
         nominated: &nominated,
+        ignore_globs: &[],
     };
     if usable < 4 {
         println!(

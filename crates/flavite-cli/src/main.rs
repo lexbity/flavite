@@ -145,6 +145,12 @@ enum Commands {
         action: ThemeAction,
     },
 
+    /// Show and change vault settings (RFC-0007 S9 / AC-9).
+    Settings {
+        #[command(subcommand)]
+        action: SettingsAction,
+    },
+
     /// Durable vault replacement operations (RFC-0006 S08): apply a sealed
     /// preview, report job status, cancel, or resume.
     Replace {
@@ -366,11 +372,10 @@ impl CliRenameStrategy {
     }
 }
 
-/// CLI driver that uses flavite-api for all operations.
 /// Theme package actions (xpi themes). `Convert` is an offline tool that
-/// needs no vault; the other actions manage the vault's theme store
-/// (`<vault>/.flavite/themes/`) through the facade's typed `theme.*`
-/// commands.
+/// converts a theme package without a vault; the other actions manage the
+/// vault's theme store (`<vault>/.flavite/themes/`) through the facade's
+/// typed `theme.*` commands.
 #[derive(Subcommand, Debug)]
 enum ThemeAction {
     /// Convert a standard browser theme package into a `.flavite.xpi`.
@@ -398,6 +403,33 @@ enum ThemeAction {
     /// Remove an installed theme.
     Uninstall {
         /// The theme id.
+        id: String,
+    },
+}
+
+/// Settings actions (RFC-0007 S9 / AC-9). All actions require an opened
+/// vault; they drive the facade's `settings.*` commands.
+#[derive(Subcommand, Debug)]
+enum SettingsAction {
+    /// Show every setting (or one setting, when `id` is given).
+    Show {
+        /// Optional setting id (e.g. `editor.font_size`).
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+    },
+    /// Set a setting from a JSON value (bare words fall back to strings).
+    Set {
+        /// Setting id (e.g. `editor.font_size`).
+        #[arg(value_name = "ID")]
+        id: String,
+        /// JSON value (e.g. `16`, `"dark"`, `["*.tmp"]`).
+        #[arg(value_name = "VALUE")]
+        value: String,
+    },
+    /// Reset a setting to its descriptor default.
+    Reset {
+        /// Setting id (e.g. `editor.font_size`).
+        #[arg(value_name = "ID")]
         id: String,
     },
 }
@@ -441,8 +473,11 @@ impl CliDriver {
             ..Default::default()
         };
 
-        let flavite = Flavite::open_root(vault_path, config)
+        let flavite = Flavite::open_root(vault_path.clone(), config)
             .with_context(|| "Failed to open vault through Flavite API")?;
+        // Vault-only configuration: redirect logs + crash reports to the
+        // vault's `.flavite/logs/` now that the vault is open.
+        set_rotating_log_target(vault_path.join(".flavite").join("logs"));
         let request_id = flavite.command_registry().next_request_id();
         let result = flavite.execute(Invocation::new(
             request_id,
@@ -901,6 +936,128 @@ impl CliDriver {
         Ok(())
     }
 
+    /// Run one `settings.*` command on the facade and return its success
+    /// data (`(command_id, data)`). Failures — capability denials, CAS
+    /// conflicts, unknown ids, read-only vaults — surface as typed errors.
+    fn run_settings_command(
+        &self,
+        id: &'static str,
+        args: serde_json::Value,
+    ) -> Result<(String, serde_json::Value)> {
+        let flavite = self
+            .flavite
+            .as_ref()
+            .context("settings commands require an opened vault")?;
+        let request_id = flavite.command_registry().next_request_id();
+        let result = flavite.execute(Invocation::new(request_id, id, args, Origin::Cli));
+        let result = match result {
+            ExecutionResult::Pending { request_id } => flavite.wait_for_operation(request_id),
+            result => result,
+        };
+        match result {
+            ExecutionResult::Local(LocalResult::Success(success)) => {
+                Ok((id.to_owned(), success.data))
+            }
+            ExecutionResult::Local(LocalResult::Error(error)) => {
+                anyhow::bail!("{id} failed: {} ({})", error.message, error.code)
+            }
+            ExecutionResult::Rejected(rejected) => {
+                let message = rejected
+                    .message
+                    .unwrap_or_else(|| format!("{:?}", rejected.reason));
+                anyhow::bail!("{id} rejected: {message}");
+            }
+            other => anyhow::bail!("{id} did not complete: {other:?}"),
+        }
+    }
+
+    /// `flavite settings show/set/reset` (RFC-0007 AC-9).
+    fn run_settings(&self, action: SettingsAction) -> Result<()> {
+        match action {
+            SettingsAction::Show { id } => {
+                if let Some(id) = id {
+                    let (_, data) =
+                        self.run_settings_command("settings.get", serde_json::json!({ "id": id }))?;
+                    if self.json {
+                        println!("{}", serde_json::to_string(&data)?);
+                    } else {
+                        let value = data
+                            .get("value")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        println!("{id} = {}", serde_json::to_string(&value)?);
+                    }
+                } else {
+                    let (_, data) =
+                        self.run_settings_command("settings.list", serde_json::json!({}))?;
+                    if self.json {
+                        println!("{}", serde_json::to_string(&data)?);
+                    } else {
+                        match data.get("settings").and_then(serde_json::Value::as_array) {
+                            Some(entries) if entries.is_empty() => println!("No settings."),
+                            Some(entries) => {
+                                for entry in entries {
+                                    let entry_id = entry
+                                        .get("id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("?");
+                                    let value = entry
+                                        .get("value")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    let modified = entry
+                                        .get("modified")
+                                        .and_then(serde_json::Value::as_bool)
+                                        .unwrap_or(false);
+                                    let marker = if modified { "  (modified)" } else { "" };
+                                    println!(
+                                        "{entry_id} = {}{marker}",
+                                        serde_json::to_string(&value)?
+                                    );
+                                }
+                            }
+                            None => println!("{}", serde_json::to_string(&data)?),
+                        }
+                    }
+                }
+                Ok(())
+            }
+            SettingsAction::Set { id, value } => {
+                // Try JSON first; a bare word falls back to a JSON string.
+                let value = serde_json::from_str::<serde_json::Value>(&value)
+                    .unwrap_or(serde_json::Value::String(value));
+                let (_, data) = self.run_settings_command(
+                    "settings.set",
+                    serde_json::json!({ "id": id, "value": value }),
+                )?;
+                if self.json {
+                    println!("{}", serde_json::to_string(&data)?);
+                } else {
+                    let generation = data
+                        .get("generation")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    println!("{id} set (generation {generation})");
+                }
+                Ok(())
+            }
+            SettingsAction::Reset { id } => {
+                let (_, data) =
+                    self.run_settings_command("settings.reset", serde_json::json!({ "id": id }))?;
+                if self.json {
+                    println!("{}", serde_json::to_string(&data)?);
+                } else {
+                    let generation = data
+                        .get("generation")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    println!("{id} reset (generation {generation})");
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn run_encoding(&self, note: PathBuf, action: EncodingAction) -> Result<()> {
         let flavite = self
             .flavite
@@ -1206,13 +1363,18 @@ impl CliDriver {
             if !consume_all || (next_note.is_none() && next_match.is_none()) {
                 break;
             }
+            // Continue from the page's *next* note ordinal when one is
+            // advertised; falling back to the current note keeps a match
+            // continuation inside the same note. Using the page start
+            // (`note_index`) again would replay the same page forever.
+            let start_note = next_note.unwrap_or(note_index);
             let request_id = flavite.command_registry().next_request_id();
             let result = flavite.execute(Invocation::new(
                 request_id,
                 "source_find.page",
                 serde_json::json!({
                     "finder_id": finder,
-                    "note_index": note_index,
+                    "note_index": start_note,
                     "match_offset": next_match.unwrap_or(0),
                     "page_len": page_size,
                 }),
@@ -1399,24 +1561,48 @@ impl CliDriver {
 }
 
 /// Initialize tracing with the appropriate level.
+///
+/// The rotating log writer targets a mutable directory: before a vault is
+/// open it falls back to the system temp dir; once a vault opens, the CLI
+/// redirects the target to `<vault>/.flavite/logs/` so every log and
+/// crash report lives inside the vault (vault-only configuration).
 #[derive(Clone)]
 struct RotatingLogWriter {
-    path: PathBuf,
     max_bytes: u64,
+}
+
+/// The shared rotating-log target; `None` = system temp fallback.
+static LOG_TARGET: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<Option<PathBuf>>>> =
+    std::sync::OnceLock::new();
+
+/// Redirect the rotating log (and crash reports) to `dir` (the vault's
+/// `.flavite/logs/`). Called once a vault has opened successfully.
+fn set_rotating_log_target(dir: PathBuf) {
+    let _ = fs::create_dir_all(&dir);
+    let target = LOG_TARGET.get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(None)));
+    *target.write().unwrap() = Some(dir);
+}
+
+fn current_log_path() -> PathBuf {
+    LOG_TARGET
+        .get()
+        .and_then(|target| target.read().unwrap().clone())
+        .unwrap_or_else(|| std::env::temp_dir().join("flavite.log"))
 }
 
 impl<'a> MakeWriter<'a> for RotatingLogWriter {
     type Writer = fs::File;
     fn make_writer(&'a self) -> Self::Writer {
-        if fs::metadata(&self.path).is_ok_and(|metadata| metadata.len() >= self.max_bytes) {
-            let backup = self.path.with_extension("log.1");
+        let path = current_log_path();
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= self.max_bytes) {
+            let backup = path.with_extension("log.1");
             let _ = fs::remove_file(&backup);
-            let _ = fs::rename(&self.path, backup);
+            let _ = fs::rename(&path, backup);
         }
         OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)
+            .open(&path)
             .unwrap_or_else(|_| {
                 OpenOptions::new()
                     .create(true)
@@ -1434,18 +1620,12 @@ fn init_tracing(verbose: bool) {
         tracing::Level::INFO
     };
 
-    let log_path = flavite_api::doctor::diagnostics_log_dir().map(|dir| {
-        let _ = fs::create_dir_all(&dir);
-        dir.join("flavite.log")
-    });
     let prior_hook = std::panic::take_hook();
-    let hook_log_path = log_path.clone();
     std::panic::set_hook(Box::new(move |info| {
-        if let Some(path) = &hook_log_path
-            && let Some(parent) = path.parent()
-        {
+        let path = current_log_path();
+        if let Some(parent) = path.parent() {
             let crash_path = parent.join("crash-report.txt");
-            let tail = fs::read_to_string(path).unwrap_or_default();
+            let tail = fs::read_to_string(&path).unwrap_or_default();
             let last = tail
                 .lines()
                 .rev()
@@ -1460,16 +1640,9 @@ fn init_tracing(verbose: bool) {
         }
         prior_hook(info);
     }));
-    let writer = log_path.map_or_else(
-        || RotatingLogWriter {
-            path: std::env::temp_dir().join("flavite.log"),
-            max_bytes: 5 * 1024 * 1024,
-        },
-        |path| RotatingLogWriter {
-            path,
-            max_bytes: 5 * 1024 * 1024,
-        },
-    );
+    let writer = RotatingLogWriter {
+        max_bytes: 5 * 1024 * 1024,
+    };
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)
@@ -1613,6 +1786,11 @@ fn main() -> Result<()> {
                 driver.run_theme_command("theme.uninstall", serde_json::json!({ "id": id }))?;
             }
         },
+        Commands::Settings { action } => {
+            let vault_path = get_vault_path(None, cli.vault);
+            driver.open_vault(vault_path, cli.no_watch)?;
+            driver.run_settings(action)?;
+        }
         Commands::Info { path } => {
             let vault_path = get_vault_path(path, cli.vault);
             driver.open_vault(vault_path.clone(), cli.no_watch)?;

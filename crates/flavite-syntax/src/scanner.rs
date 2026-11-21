@@ -1,8 +1,9 @@
 //! Inline scanner for Flavite syntax extensions (§4.3, D10).
 //!
 //! The scanner is **pure and IO-free**. It is the single source of link/tag
-//! semantics for both the indexer (pulldown-cmark parse path) and the editor
-//! (tree-sitter parse path). Tree-sitter never decides what a link is (D10).
+//! semantics for the indexer (pulldown-cmark parse path) and the editor
+//! (the segment cache's pulldown bridge). The scanner decides what a link
+//! is; parsing only decides what text reaches it (D10).
 //!
 //! # Syntax covered
 //!
@@ -72,7 +73,15 @@ pub struct ScannedSpan {
 ///
 /// A vector of [`ScannedSpan`]s in ascending byte order, non-overlapping.
 pub fn scan_inline(snapshot: &TextSnapshot, range: Range<usize>) -> Vec<ScannedSpan> {
-    let text = snapshot.text();
+    scan_inline_text(snapshot.text(), range)
+}
+
+/// Run the inline scanner over `text` within `range`.
+///
+/// Same semantics as [`scan_inline`], without needing a full [`TextSnapshot`]
+/// (the incremental structure engine rescans small damaged regions on the hot
+/// path and must not build an O(document) snapshot per keystroke).
+pub fn scan_inline_text(text: &str, range: Range<usize>) -> Vec<ScannedSpan> {
     let bytes = text.as_bytes();
 
     let start = range.start.min(text.len());

@@ -43,8 +43,11 @@ impl Modifiers {
 
 /// The physical key positions the Context grammar names. Positions, not
 /// produced glyphs: an unlisted code can never resolve to a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The full grammar-addressable set: 26 letters + 9 punctuation positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum KeyCode {
+    // Letters A-Z (all 26 positions)
     KeyA,
     KeyB,
     KeyC,
@@ -57,16 +60,97 @@ pub enum KeyCode {
     KeyJ,
     KeyK,
     KeyL,
+    KeyM,
+    KeyN,
     KeyO,
     KeyP,
+    KeyQ,
+    KeyR,
+    KeyS,
     KeyT,
     KeyU,
     KeyV,
     KeyW,
     KeyX,
     KeyY,
+    KeyZ,
+    // Punctuation positions
     Semicolon,
+    Quote,
+    Comma,
+    Period,
     Slash,
+    Backslash,
+    BracketLeft,
+    BracketRight,
+    Minus,
+    Equal,
+    // FEUX-0004 X06: Digits (grammar-owned, E-4)
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
+}
+
+impl KeyCode {
+    /// Returns the canonical token name for this position (variant name).
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            KeyCode::KeyA => "KeyA",
+            KeyCode::KeyB => "KeyB",
+            KeyCode::KeyC => "KeyC",
+            KeyCode::KeyD => "KeyD",
+            KeyCode::KeyE => "KeyE",
+            KeyCode::KeyF => "KeyF",
+            KeyCode::KeyG => "KeyG",
+            KeyCode::KeyH => "KeyH",
+            KeyCode::KeyI => "KeyI",
+            KeyCode::KeyJ => "KeyJ",
+            KeyCode::KeyK => "KeyK",
+            KeyCode::KeyL => "KeyL",
+            KeyCode::KeyM => "KeyM",
+            KeyCode::KeyN => "KeyN",
+            KeyCode::KeyO => "KeyO",
+            KeyCode::KeyP => "KeyP",
+            KeyCode::KeyQ => "KeyQ",
+            KeyCode::KeyR => "KeyR",
+            KeyCode::KeyS => "KeyS",
+            KeyCode::KeyT => "KeyT",
+            KeyCode::KeyU => "KeyU",
+            KeyCode::KeyV => "KeyV",
+            KeyCode::KeyW => "KeyW",
+            KeyCode::KeyX => "KeyX",
+            KeyCode::KeyY => "KeyY",
+            KeyCode::KeyZ => "KeyZ",
+            KeyCode::Semicolon => "Semicolon",
+            KeyCode::Quote => "Quote",
+            KeyCode::Comma => "Comma",
+            KeyCode::Period => "Period",
+            KeyCode::Slash => "Slash",
+            KeyCode::Backslash => "Backslash",
+            KeyCode::BracketLeft => "BracketLeft",
+            KeyCode::BracketRight => "BracketRight",
+            KeyCode::Minus => "Minus",
+            KeyCode::Equal => "Equal",
+            KeyCode::Digit0 => "Digit0",
+            KeyCode::Digit1 => "Digit1",
+            KeyCode::Digit2 => "Digit2",
+            KeyCode::Digit3 => "Digit3",
+            KeyCode::Digit4 => "Digit4",
+            KeyCode::Digit5 => "Digit5",
+            KeyCode::Digit6 => "Digit6",
+            KeyCode::Digit7 => "Digit7",
+            KeyCode::Digit8 => "Digit8",
+            KeyCode::Digit9 => "Digit9",
+        }
+    }
 }
 
 /// Selection motions a physical position resolves to. The editor maps these
@@ -80,4 +164,34 @@ pub enum Motion {
     NextWord,
     PreviousWord,
     NextWordEnd,
+}
+
+impl Motion {
+    /// Returns the synthetic binding id for this motion.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Motion::Previous => "editor.motion.previous",
+            Motion::Next => "editor.motion.next",
+            Motion::Up => "editor.motion.up",
+            Motion::Down => "editor.motion.down",
+            Motion::NextWord => "editor.motion.next_word",
+            Motion::PreviousWord => "editor.motion.previous_word",
+            Motion::NextWordEnd => "editor.motion.next_word_end",
+        }
+    }
+
+    /// Returns a stable token name for this motion variant.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Motion::Previous => "previous",
+            Motion::Next => "next",
+            Motion::Up => "up",
+            Motion::Down => "down",
+            Motion::NextWord => "next_word",
+            Motion::PreviousWord => "previous_word",
+            Motion::NextWordEnd => "next_word_end",
+        }
+    }
 }

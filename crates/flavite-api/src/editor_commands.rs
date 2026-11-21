@@ -227,7 +227,7 @@ pub(crate) fn handle_editor_delete(
             });
         }
     };
-    let text = snapshot.text;
+    let text = snapshot.text.materialize();
     let set = match normalize_set(&text, &args.selections) {
         Ok(set) => set,
         Err(error) => {
@@ -272,6 +272,7 @@ pub(crate) fn handle_editor_delete(
         },
         editor: Some(record),
         operation: op,
+        unit: None,
     }))
 }
 
@@ -295,7 +296,8 @@ pub(crate) fn handle_keep_primary(
                 format!("StaleRevision: expected {expected}, current {actual}")
             }
         })?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let primary_id = set.primary_id().as_raw();
     let kept = set
         .members()
@@ -307,7 +309,7 @@ pub(crate) fn handle_keep_primary(
         })
         .filter(|member| member.id == Some(primary_id))
         .collect::<Vec<_>>();
-    let (kept, _) = SelectionSet::normalize(&snapshot.text, kept, Some(primary_id))
+    let (kept, _) = SelectionSet::normalize(&text, kept, Some(primary_id))
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &kept))
 }
@@ -332,7 +334,8 @@ pub(crate) fn handle_collapse(
                 format!("StaleRevision: expected {expected}, current {actual}")
             }
         })?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let carets = set
         .members()
         .iter()
@@ -343,7 +346,7 @@ pub(crate) fn handle_collapse(
         })
         .collect::<Vec<_>>();
     let (collapsed, _) =
-        SelectionSet::normalize(&snapshot.text, carets, None).map_err(|error| error.to_string())?;
+        SelectionSet::normalize(&text, carets, None).map_err(|error| error.to_string())?;
     Ok(selections_changed(
         args.buffer_id,
         args.revision,
@@ -371,15 +374,16 @@ pub(crate) fn handle_clear_selection(
                 format!("StaleRevision: expected {expected}, current {actual}")
             }
         })?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let head = set.primary().head();
     let caret = RawSelection {
         id: Some(set.primary_id().as_raw()),
         anchor: head,
         head,
     };
-    let (cleared, _) = SelectionSet::normalize(&snapshot.text, vec![caret], None)
-        .map_err(|error| error.to_string())?;
+    let (cleared, _) =
+        SelectionSet::normalize(&text, vec![caret], None).map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &cleared))
 }
 
@@ -440,6 +444,13 @@ pub struct EditorSelectionOnlyArgs {
     buffer_id: u64,
     revision: u64,
     selections: SelectionSetArg,
+    // FEUX-0004 X06: Count for select_line (count = N lines)
+    #[serde(default)]
+    count: Option<u32>,
+    // FEUX-0004 X05: Optional insertion text for `.` replay of the
+    // insert_* typing-entry family (absent = the delivered empty collapse).
+    #[serde(default)]
+    text: Option<String>,
 }
 
 // ---- FEUX-0002 X04/X05: the set-aware verb family ----
@@ -474,6 +485,59 @@ pub struct EditorPasteArgs {
     origin: EditorOriginArg,
     selections: SelectionSetArg,
     text: String,
+}
+
+// FEUX-0004 X03: LinesAlign command with delimiter argument
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorLinesAlignArgs {
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
+    buffer_id: u64,
+    revision: u64,
+    operation: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+    delimiter: String,
+}
+
+// FEUX-0005 X01: Indent command with count (amount = units)
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorIndentArgs {
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
+    buffer_id: u64,
+    revision: u64,
+    operation: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+    #[serde(default)]
+    amount: u32,
+}
+
+// FEUX-0005 X02: Whitespace conversion
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorReWhitespaceArgs {
+    buffer_id: u64,
+    revision: u64,
+    operation: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+    #[serde(default)]
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
+}
+
+// FEUX-0004 X03: GotoLine command with line number argument
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+pub struct EditorGotoLineArgs {
+    buffer_id: u64,
+    revision: u64,
+    operation: OperationArg,
+    origin: EditorOriginArg,
+    selections: SelectionSetArg,
+    line: u64,
 }
 
 /// The shared ticketed mutating path: admit the ticket, take the frozen
@@ -514,7 +578,7 @@ fn handle_ticketed_edit(
             });
         }
     };
-    let text = snapshot.text;
+    let text = snapshot.text.materialize();
     let set = match normalize_set(&text, &selections) {
         Ok(set) => set,
         Err(error) => {
@@ -548,7 +612,7 @@ fn handle_ticketed_edit(
         after: triples(&prepared.after_set),
         primary: primary_index(&prepared.after_set),
     };
-    Ok(session.execute(SessionCommand::ApplyEdits {
+    let result = session.execute(SessionCommand::ApplyEdits {
         buffer_id: BufferId::from(buffer_id),
         revision: Revision::new(revision),
         ops: prepared.ops,
@@ -557,7 +621,12 @@ fn handle_ticketed_edit(
         }),
         editor: Some(record),
         operation,
-    }))
+        // FEUX-0005 E-9: the planner's unit rides the receipt (recording
+        // included) so the host's completion message never re-derives it
+        // from the edited text.
+        unit: prepared.unit,
+    });
+    Ok(result)
 }
 
 /// `editor.change`: delete each member's D-11 effective range; the host
@@ -797,9 +866,10 @@ pub(crate) fn handle_editor_copy(
 ) -> Result<SessionResult, String> {
     let args: EditorSelectionOnlyArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
-    let fragments = flavite_buffer::commands::copy_fragments(&snapshot.text, &set)
-        .map_err(|error| error.to_string())?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let fragments =
+        flavite_buffer::commands::copy_fragments(&text, &set).map_err(|error| error.to_string())?;
     Ok(SessionResult::Success(
         crate::session::CommandResult::TextCopied {
             buffer_id: BufferId::from(args.buffer_id),
@@ -835,12 +905,13 @@ pub(crate) fn handle_select_word(
 ) -> Result<SessionResult, String> {
     let args: EditorSelectionOnlyArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let candidates: Vec<RawSelection> = set
         .members()
         .iter()
         .map(|member| {
-            let (anchor, head) = flavite_edit_context::word_bounds(&snapshot.text, member.head());
+            let (anchor, head) = flavite_edit_context::word_bounds(&text, member.head());
             RawSelection {
                 id: Some(member.id().as_raw()),
                 anchor,
@@ -849,7 +920,7 @@ pub(crate) fn handle_select_word(
         })
         .collect();
     let hint = set.primary_id().as_raw();
-    let (selected, _) = SelectionSet::normalize(&snapshot.text, candidates, Some(hint))
+    let (selected, _) = SelectionSet::normalize(&text, candidates, Some(hint))
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &selected))
 }
@@ -862,24 +933,56 @@ pub(crate) fn handle_select_line(
 ) -> Result<SessionResult, String> {
     let args: EditorSelectionOnlyArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let count = args.count.unwrap_or(1);
     let candidates: Vec<RawSelection> = set
         .members()
         .iter()
         .map(|member| {
-            let (anchor, head) =
-                flavite_buffer::selection::containing_line(&snapshot.text, member.head());
+            // FEUX-0004 X06: select count lines starting from the member's containing line
+            // Get the containing line
+            let (line_anchor, line_start) =
+                flavite_buffer::selection::containing_line(&text, member.head());
+
+            // Find the end position after count lines (including the starting line)
+            let end_pos = count_lines_forward(&text, line_start, count);
+
             RawSelection {
                 id: Some(member.id().as_raw()),
-                anchor,
-                head,
+                anchor: line_anchor,
+                head: end_pos,
             }
         })
         .collect();
     let hint = set.primary_id().as_raw();
-    let (selected, _) = SelectionSet::normalize(&snapshot.text, candidates, Some(hint))
+    let (selected, _) = SelectionSet::normalize(&text, candidates, Some(hint))
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &selected))
+}
+
+/// Helper to find the position after count lines starting from start_pos.
+/// Returns the position at the end of the count-th line (or EOF if fewer lines exist).
+fn count_lines_forward(text: &str, start_pos: usize, count: u32) -> usize {
+    if count == 0 {
+        return start_pos;
+    }
+
+    let start_pos = start_pos.min(text.len());
+    let mut remaining = count;
+    let mut pos = start_pos;
+
+    while remaining > 0 && pos < text.len() {
+        // Find the end of the current line
+        let end_of_line = text[pos..]
+            .find('\n')
+            .map_or(text.len(), |idx| pos + idx + 1); // +1 to include the newline
+
+        pos = end_of_line;
+        remaining -= 1;
+    }
+
+    pos.min(text.len())
 }
 
 /// The `editor.insert_*` family: a zero-effect plan collapses every member
@@ -891,8 +994,9 @@ fn insert_at(
 ) -> Result<SessionResult, String> {
     let args: EditorSelectionOnlyArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
-    let prepared = flavite_buffer::commands::plan(&snapshot.text, &set, &edit_operation)
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let prepared = flavite_buffer::commands::plan(&text, &set, &edit_operation)
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(
         args.buffer_id,
@@ -905,10 +1009,11 @@ pub(crate) fn handle_insert_start(
     session: &Session,
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
     insert_at(
         session,
         invocation,
-        flavite_buffer::commands::EditOperation::InsertAtStarts(String::new()),
+        flavite_buffer::commands::EditOperation::InsertAtStarts(args.text.unwrap_or_default()),
     )
 }
 
@@ -916,10 +1021,11 @@ pub(crate) fn handle_insert_end(
     session: &Session,
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
     insert_at(
         session,
         invocation,
-        flavite_buffer::commands::EditOperation::InsertAtEnds(String::new()),
+        flavite_buffer::commands::EditOperation::InsertAtEnds(args.text.unwrap_or_default()),
     )
 }
 
@@ -927,10 +1033,11 @@ pub(crate) fn handle_insert_line_start(
     session: &Session,
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
     insert_at(
         session,
         invocation,
-        flavite_buffer::commands::EditOperation::InsertAtLineStarts(String::new()),
+        flavite_buffer::commands::EditOperation::InsertAtLineStarts(args.text.unwrap_or_default()),
     )
 }
 
@@ -938,10 +1045,11 @@ pub(crate) fn handle_insert_line_end(
     session: &Session,
     invocation: &Invocation,
 ) -> Result<SessionResult, String> {
+    let args: EditorSelectionOnlyArgs = decode(invocation)?;
     insert_at(
         session,
         invocation,
-        flavite_buffer::commands::EditOperation::InsertAtLineEnds(String::new()),
+        flavite_buffer::commands::EditOperation::InsertAtLineEnds(args.text.unwrap_or_default()),
     )
 }
 
@@ -970,8 +1078,9 @@ pub(crate) fn handle_toggle_caret(
 ) -> Result<SessionResult, String> {
     let args: EditorToggleCaretArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
-    let toggled = flavite_buffer::selection::toggle_caret(&snapshot.text, &set, args.position)
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let toggled = flavite_buffer::selection::toggle_caret(&text, &set, args.position)
         .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &toggled))
 }
@@ -995,6 +1104,8 @@ pub enum MotionArg {
     DocEnd,
     PageUp,
     PageDown,
+    // FEUX-0004 X03/X06: goto-line motion
+    Line(u64),
 }
 
 impl From<MotionArg> for flavite_buffer::motion::Motion {
@@ -1013,6 +1124,7 @@ impl From<MotionArg> for flavite_buffer::motion::Motion {
             MotionArg::DocEnd => Self::DocEnd,
             MotionArg::PageUp => Self::PageUp,
             MotionArg::PageDown => Self::PageDown,
+            MotionArg::Line(n) => Self::Line(n),
         }
     }
 }
@@ -1031,6 +1143,9 @@ pub struct EditorMoveArgs {
     extend: bool,
     #[serde(default)]
     positions: Option<Vec<usize>>,
+    // FEUX-0004 X06: Count for motions (E-4 §5.3)
+    #[serde(default)]
+    count: Option<u32>,
 }
 
 pub(crate) fn handle_editor_move(
@@ -1039,7 +1154,8 @@ pub(crate) fn handle_editor_move(
 ) -> Result<SessionResult, String> {
     let args: EditorMoveArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let motion: flavite_buffer::motion::Motion = args.motion.into();
     let positions = match (motion.is_visual(), &args.positions) {
         (true, Some(positions)) => Some(positions.as_slice()),
@@ -1051,8 +1167,15 @@ pub(crate) fn handle_editor_move(
         }
         (false, None) => None,
     };
-    let moved = flavite_buffer::motion::apply(&snapshot.text, &set, motion, args.extend, positions)
-        .map_err(|error| error.to_string())?;
+    // FEUX-0004 X06: Apply count to motion (E-4 §5.3)
+    let moved = if let Some(n) = args.count {
+        // Apply motion n times
+        flavite_buffer::motion::apply_with_count(&text, &set, motion, args.extend, positions, n)
+    } else {
+        // No count, apply once
+        flavite_buffer::motion::apply(&text, &set, motion, args.extend, positions)
+    }
+    .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &moved))
 }
 
@@ -1068,6 +1191,9 @@ pub struct EditorFindCharArgs {
     char: String,
     #[serde(default)]
     extend: bool,
+    // FEUX-0004 X06: Count for find-char (Nth occurrence)
+    #[serde(default)]
+    count: Option<u32>,
 }
 
 pub(crate) fn handle_find_char(
@@ -1086,10 +1212,22 @@ pub(crate) fn handle_find_char(
         return Err("char must be exactly one character".into());
     };
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
-    let found =
-        flavite_buffer::selection::find_char(&snapshot.text, &set, forward, target, args.extend)
-            .map_err(|error| error.to_string())?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let count = args.count.unwrap_or(1);
+    let found = if count == 1 {
+        flavite_buffer::selection::find_char(&text, &set, forward, target, args.extend)
+    } else {
+        flavite_buffer::selection::find_char_with_count(
+            &text,
+            &set,
+            forward,
+            target,
+            args.extend,
+            count,
+        )
+    }
+    .map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &found))
 }
 
@@ -1106,19 +1244,11 @@ pub struct EditorAddCaretsArgs {
 
 fn handle_add_carets(session: &Session, invocation: &Invocation) -> Result<SessionResult, String> {
     let args: EditorAddCaretsArgs = decode(invocation)?;
-    eprintln!("[add_carets] positions={:?}", args.positions);
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
-    let merged = flavite_buffer::selection::add_carets(&snapshot.text, &set, &args.positions)
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let merged = flavite_buffer::selection::add_carets(&text, &set, &args.positions)
         .map_err(|error| error.to_string())?;
-    eprintln!(
-        "[add_carets] merged={:?}",
-        merged
-            .members()
-            .iter()
-            .map(|m| (m.start(), m.end()))
-            .collect::<Vec<_>>()
-    );
     Ok(selections_changed(args.buffer_id, args.revision, &merged))
 }
 
@@ -1152,7 +1282,8 @@ pub(crate) fn handle_rotate_primary(
 ) -> Result<SessionResult, String> {
     let args: EditorRotateArgs = decode(invocation)?;
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    let set = normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let forward = match args.direction.as_str() {
         "next" => true,
         "previous" => false,
@@ -1174,8 +1305,9 @@ macro_rules! selection_only_set_op {
         ) -> Result<SessionResult, String> {
             let args: EditorSelectionOnlyArgs = decode(invocation)?;
             let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-            let set = normalize_set(&snapshot.text, &args.selections)?;
-            let next = $method(&snapshot.text, &set).map_err(|error| error.to_string())?;
+            let text = snapshot.text.materialize();
+            let set = normalize_set(&text, &args.selections)?;
+            let next = $method(&text, &set).map_err(|error| error.to_string())?;
             Ok(selections_changed(args.buffer_id, args.revision, &next))
         }
     };
@@ -1225,6 +1357,12 @@ pub struct EditorSelectMatchesArgs {
     query: MatchQueryArg,
     #[serde(default)]
     apply: bool,
+    /// Whether to scope the search to the current selections (FEUX-0006 E-2).
+    #[serde(default)]
+    in_selections: bool,
+    /// Optional scope spans when in_selections is true (FEUX-0006 E-2).
+    #[serde(default)]
+    scope_spans: Option<Vec<(usize, usize)>>,
     /// Canonical candidate spans (half-open byte ranges) echoed back on
     /// apply. Refused when absent on apply or present on draft.
     #[serde(default)]
@@ -1235,6 +1373,26 @@ pub struct EditorSelectMatchesArgs {
     /// The collection's exact zero-width hit count (required on apply).
     #[serde(default)]
     zero_width_count: Option<u64>,
+}
+
+/// Arguments for `editor.keep_matching` (FEUX-0006 E-4).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorKeepMatchingArgs {
+    buffer_id: u64,
+    revision: u64,
+    selections: SelectionSetArg,
+    query: MatchQueryArg,
+    /// Whether to keep (true) or drop (false) matching selections.
+    keep: bool,
+    #[serde(default)]
+    apply: bool,
+    /// Canonical candidate spans (the filtered selection indices) echoed back on apply.
+    #[serde(default)]
+    selection_indices: Option<Vec<usize>>,
+    /// The collection's exact match total (required on apply).
+    #[serde(default)]
+    match_count: Option<u64>,
 }
 
 fn decode_mode(regex: bool) -> flavite_text_search::matcher::MatchMode {
@@ -1263,6 +1421,764 @@ pub(crate) fn handle_split_selection(
     handle_match_selection(session, invocation, false)
 }
 
+/// `editor.keep_matching`: filter selections to those containing matches
+/// (FEUX-0006 E-4).
+pub(crate) fn handle_keep_matching(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorKeepMatchingArgs = decode(invocation)?;
+    let buffer_id = BufferId::from(args.buffer_id);
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let mode = decode_mode(args.query.regex);
+
+    if !args.apply {
+        // Draft collection
+        if args.selection_indices.is_some() {
+            return Err("selection_indices only apply to an apply".into());
+        }
+        if args.query.text.len() > flavite_text_search::matcher::PATTERN_MAX_BYTES {
+            return Err("query is too long".into());
+        }
+
+        // Build scope_spans from current selections
+        let scope_spans: Vec<(usize, usize)> = selection_set_to_spans(&args.selections);
+
+        return Ok(session.execute(SessionCommand::KeepMatching {
+            request_id: invocation.request_id,
+            request: flavite_vault::text_select::KeepMatchingRequest {
+                buffer_id,
+                revision: Revision::new(args.revision),
+                query: args.query.text,
+                mode,
+                case_sensitive: args.query.case_sensitive,
+                keep: args.keep,
+                scope_spans,
+            },
+        }));
+    }
+
+    // Apply
+    let Some(selection_indices) = args.selection_indices else {
+        return Err("apply needs the selection indices".into());
+    };
+    let Some(match_count) = args.match_count else {
+        return Err("apply needs the match count".into());
+    };
+
+    apply_keep_matching(
+        &text,
+        &set,
+        &selection_indices,
+        match_count,
+        args.buffer_id,
+        args.revision,
+    )
+}
+
+/// Helper to convert SelectionSetArg to Vec<(usize, usize)> for scope spans.
+fn selection_set_to_spans(args: &SelectionSetArg) -> Vec<(usize, usize)> {
+    args.items
+        .iter()
+        .map(|triple| (triple[1], triple[2]))
+        .collect()
+}
+
+/// Apply keep_matching: filter the current selections to those named by
+/// `selection_indices` (indices into the canonical `set`, in document
+/// order). A filter that would empty the set is refused whole with the count
+/// (E-4), prior set kept. The result is re-normalized with the delivered
+/// primary-hint rule (survivor containing the old primary, else last).
+fn apply_keep_matching(
+    text: &str,
+    set: &SelectionSet,
+    selection_indices: &[usize],
+    match_count: u64,
+    buffer_id: u64,
+    revision: u64,
+) -> Result<SessionResult, String> {
+    if match_count == 0 {
+        return Err(format!("All {} selections would be dropped", set.len()));
+    }
+    let members = set.members();
+    let survivors: Vec<RawSelection> = selection_indices
+        .iter()
+        .map(|&index| {
+            let member = members
+                .get(index)
+                .ok_or_else(|| format!("selection index {index} is out of range"))?;
+            Ok(RawSelection {
+                id: Some(member.id().as_raw()),
+                anchor: member.anchor(),
+                head: member.head(),
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    if survivors.is_empty() {
+        return Err(format!("All {} selections would be dropped", members.len()));
+    }
+    let (filtered, _) = SelectionSet::normalize(text, survivors, Some(set.primary_id().as_raw()))
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(buffer_id, revision, &filtered))
+}
+
+// FEUX-0004 X01: Transform family handlers
+pub(crate) fn handle_case_upper(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::CaseUpper,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_case_lower(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::CaseLower,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_case_swap(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::CaseSwap,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_case_title(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::CaseTitle,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_number_inc(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::NumberInc,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_number_dec(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::NumberDec,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_number_sequence(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::NumberSequence,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+// FEUX-0004 X01: Lines family handlers
+pub(crate) fn handle_lines_sort_asc(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesSortAsc,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_sort_desc(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesSortDesc,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_sort_numeric(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesSortNumeric,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_join(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesJoin,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_duplicate(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesDuplicate,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_dedupe(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesDedupe,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_shuffle(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesShuffle,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_move_up(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesMoveUp,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_lines_move_down(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorMutateArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesMoveDown,
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+// FEUX-0004 X03: LinesAlign handler
+pub(crate) fn handle_lines_align(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorLinesAlignArgs = decode(invocation)?;
+    // Empty delimiter is refused
+    if args.delimiter.is_empty() {
+        return Err("Align delimiter cannot be empty".to_string());
+    }
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::LinesAlign {
+            delimiter: args.delimiter.clone(),
+        },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+// FEUX-0005 X01: Indent handlers
+pub(crate) fn handle_editor_indent(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorIndentArgs = decode(invocation)?;
+    // Default amount is 1 if not specified (count = units)
+    let amount = if args.amount == 0 { 1 } else { args.amount };
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::IndentLines { amount },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_editor_dedent(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorIndentArgs = decode(invocation)?;
+    // Default amount is 1 if not specified (count = units)
+    let amount = if args.amount == 0 { 1 } else { args.amount };
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::DedentLines { amount },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+// FEUX-0005 X02: Whitespace conversion handlers
+pub(crate) fn handle_editor_tabs_to_spaces(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorReWhitespaceArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::ReWhitespace { to_tabs: false },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_editor_spaces_to_tabs(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorReWhitespaceArgs = decode(invocation)?;
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::ReWhitespace { to_tabs: true },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+// FEUX-0004 X03: GotoLine handler
+pub(crate) fn handle_goto_line(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorGotoLineArgs = decode(invocation)?;
+    // Validate line number
+    if args.line == 0 {
+        return Err("Line number must be at least 1".to_string());
+    }
+    // Get the snapshot to check line count
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let text = snapshot.text.materialize();
+    let line_count = text.lines().count() as u64;
+    if args.line > line_count {
+        return Err(format!("Document has {line_count} lines"));
+    }
+    // GotoLine is a selection-only command - it moves each member's head to line N at column 0
+    // We implement this by delegating to editor.move with the Line motion
+    let set = normalize_set(&text, &args.selections)?;
+    let motion = flavite_buffer::motion::Motion::Line(args.line);
+    let moved = flavite_buffer::motion::apply(&text, &set, motion, false, None)
+        .map_err(|error| error.to_string())?;
+    Ok(selections_changed(args.buffer_id, args.revision, &moved))
+}
+
+// FEUX-0004 X04: Surround handlers
+
+/// Arguments for surround_add command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorSurroundAddArgs {
+    pub buffer_id: u64,
+    pub revision: u64,
+    pub operation: OperationArg,
+    pub origin: EditorOriginArg,
+    pub selections: SelectionSetArg,
+    pub char: String,
+    #[serde(default)]
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
+}
+
+/// Arguments for surround_delete command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorSurroundDeleteArgs {
+    pub buffer_id: u64,
+    pub revision: u64,
+    pub operation: OperationArg,
+    pub origin: EditorOriginArg,
+    pub selections: SelectionSetArg,
+    pub char: String,
+    #[serde(default)]
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
+}
+
+/// Arguments for surround_change command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorSurroundChangeArgs {
+    pub buffer_id: u64,
+    pub revision: u64,
+    pub operation: OperationArg,
+    pub origin: EditorOriginArg,
+    pub selections: SelectionSetArg,
+    pub old_char: String,
+    pub new_char: String,
+    #[serde(default)]
+    undo_policy: Option<crate::flavite::UndoPolicyArg>,
+}
+
+pub(crate) fn handle_surround_add(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorSurroundAddArgs = decode(invocation)?;
+    // Validate char is a single character
+    if args.char.chars().count() != 1 {
+        return Err("Surround character must be a single character".to_string());
+    }
+    let char = args.char.chars().next().unwrap();
+    let pair = flavite_buffer::pairs::pair_for_char(char);
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::SurroundAdd {
+            open: pair.open.to_string(),
+            close: pair.close.to_string(),
+        },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_surround_delete(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorSurroundDeleteArgs = decode(invocation)?;
+    // Validate char is a single character
+    if args.char.chars().count() != 1 {
+        return Err("Surround character must be a single character".to_string());
+    }
+    let char = args.char.chars().next().unwrap();
+    let pair = flavite_buffer::pairs::pair_for_char(char);
+    // Validate that all selections have the enclosing pair
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let validation = flavite_buffer::pairs::validate_enclosing_pairs(
+        &text,
+        &set,
+        &flavite_buffer::pairs::Pair::from_open(pair.open).unwrap_or(pair),
+    );
+    if let flavite_buffer::pairs::SurroundValidation::MissingPairs { count, total } = validation {
+        return Err(format!(
+            "{} of {} selections have no enclosing ({})",
+            count, total, pair.open
+        ));
+    }
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::SurroundDelete {
+            open: pair.open.to_string(),
+            close: pair.close.to_string(),
+        },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
+pub(crate) fn handle_surround_change(
+    session: &Session,
+    invocation: &Invocation,
+) -> Result<SessionResult, String> {
+    let args: EditorSurroundChangeArgs = decode(invocation)?;
+    // Validate old_char is a single character
+    if args.old_char.chars().count() != 1 {
+        return Err("Old surround character must be a single character".to_string());
+    }
+    // Validate new_char is a single character
+    if args.new_char.chars().count() != 1 {
+        return Err("New surround character must be a single character".to_string());
+    }
+    let old_char = args.old_char.chars().next().unwrap();
+    let new_char = args.new_char.chars().next().unwrap();
+    let old_pair = flavite_buffer::pairs::pair_for_char(old_char);
+    let new_pair = flavite_buffer::pairs::pair_for_char(new_char);
+    // Validate that all selections have the enclosing old pair
+    let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
+    let validation = flavite_buffer::pairs::validate_enclosing_pairs(
+        &text,
+        &set,
+        &flavite_buffer::pairs::Pair::from_open(old_pair.open).unwrap_or(old_pair),
+    );
+    if let flavite_buffer::pairs::SurroundValidation::MissingPairs { count, total } = validation {
+        return Err(format!(
+            "{} of {} selections have no enclosing ({})",
+            count, total, old_pair.open
+        ));
+    }
+    handle_ticketed_edit(
+        session,
+        args.buffer_id,
+        args.revision,
+        args.operation,
+        args.origin,
+        args.selections,
+        flavite_buffer::commands::EditOperation::SurroundChange {
+            old_open: old_pair.open.to_string(),
+            old_close: old_pair.close.to_string(),
+            new_open: new_pair.open.to_string(),
+            new_close: new_pair.close.to_string(),
+        },
+        flavite_buffer::history::EditKind::Format,
+        args.undo_policy
+            .map(|policy| crate::flavite::decode_undo_policy(Some(policy)))
+            .transpose()?,
+        false,
+    )
+}
+
 fn handle_match_selection(
     session: &Session,
     invocation: &Invocation,
@@ -1273,8 +2189,17 @@ fn handle_match_selection(
     // Both paths validate the committed set against the live snapshot; a
     // stale capture is refused before any collection or install.
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
-    normalize_set(&snapshot.text, &args.selections)?;
+    let text = snapshot.text.materialize();
+    let set = normalize_set(&text, &args.selections)?;
     let mode = decode_mode(args.query.regex);
+
+    // Build scope_spans from current selections if in_selections is true
+    let scope_spans: Vec<(usize, usize)> = if args.in_selections && !args.apply {
+        args.scope_spans.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     if !args.apply {
         if args.spans.is_some() {
             return Err("spans only apply to an apply".into());
@@ -1291,6 +2216,7 @@ fn handle_match_selection(
                 mode,
                 case_sensitive: args.query.case_sensitive,
                 whole_word: false,
+                scope_spans,
             },
         }));
     }
@@ -1308,7 +2234,7 @@ fn handle_match_selection(
     };
     if select {
         apply_select_matches(
-            &snapshot.text,
+            &text,
             &spans,
             total_matches,
             zero_width_count,
@@ -1316,10 +2242,17 @@ fn handle_match_selection(
             args.revision,
         )
     } else {
+        let members: Vec<(usize, usize)> = set
+            .members()
+            .iter()
+            .map(|member| (member.start(), member.end()))
+            .collect();
         apply_split_selection(
-            &snapshot.text,
+            &text,
             &spans,
             total_matches,
+            args.in_selections,
+            &members,
             args.buffer_id,
             args.revision,
         )
@@ -1357,12 +2290,15 @@ fn apply_select_matches(
 
 /// The split apply: refuse an oversize match set with the exact observed
 /// count (a truncated span list cannot derive exact gaps), canonicalize,
-/// compute the document-wide gaps, refuse an empty gap set (`NoGaps`), then
+/// compute the gaps — document-wide by default, per-member (§5.2) when the
+/// search was selection-scoped — refuse an empty gap set (`NoGaps`), then
 /// install the gap set.
 fn apply_split_selection(
     text: &str,
     spans: &[(usize, usize)],
     total_matches: u64,
+    in_selections: bool,
+    members: &[(usize, usize)],
     buffer_id: u64,
     revision: u64,
 ) -> Result<SessionResult, String> {
@@ -1375,14 +2311,11 @@ fn apply_split_selection(
     if spans.len() as u64 != total_matches {
         return Err("collection spans do not match the observed total".into());
     }
-    let set = flavite_buffer::selection::selection_set_from_spans(text, spans, None)
-        .map_err(|error| error.to_string())?;
-    let members: Vec<(usize, usize)> = set
-        .members()
-        .iter()
-        .map(|member| (member.start(), member.end()))
-        .collect();
-    let gaps = flavite_buffer::selection::split_gaps(text, &members);
+    let gaps = if in_selections {
+        flavite_buffer::selection::split_gaps_per_member(text, spans, members)
+    } else {
+        flavite_buffer::selection::split_gaps(text, spans)
+    };
     if gaps.is_empty() {
         return Err("NoGaps".into());
     }

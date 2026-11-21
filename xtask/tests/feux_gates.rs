@@ -816,6 +816,132 @@ fn seed_x08_inputs(root: &Path) {
     seed_file(root, "docs/APP-FEATURES.md", "# Flavite Features\n");
 }
 
+fn seed_feux0003_x01_inputs(root: &Path) {
+    // The checker sources the gate library relative to the repository root.
+    let lib = root.join("scripts/lib/source-gates.sh");
+    fs::create_dir_all(lib.parent().unwrap()).expect("lib parent");
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    fs::copy(repo.join("scripts/lib/source-gates.sh"), &lib).expect("copy gate library");
+
+    seed_file(
+        root,
+        "scripts/check-feux-contracts.sh",
+        "#!/usr/bin/env bash\n",
+    );
+
+    // Seed the keymap.rs with minimal content
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/keymap.rs",
+        "pub struct ContextKeymap {} pub struct Slot {} pub enum BindingId { Command } pub enum Layout { Qwerty } pub fn defaults_keymap_classifies_identically_to_delivered_grammar() {}\n",
+    );
+
+    // Seed labels.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/labels.rs",
+        "pub enum Layout { Qwerty }\n",
+    );
+
+    // Seed text.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/text.rs",
+        "pub fn word_bounds(_: &str, _: usize) -> (usize, usize) { (0, 0) }\npub fn selected_characters(_: &str, _: (usize, usize)) -> usize { 0 }\npub fn clamp_grapheme_boundary(_: &str, _: usize) -> usize { 0 }\n",
+    );
+
+    // Seed key.rs with the 35-position vocabulary
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/key.rs",
+        "pub enum KeyCode { KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ, Semicolon, Quote, Comma, Period, Slash, Backslash, BracketLeft, BracketRight, Minus, Equal }\npub enum Motion { Previous, Next, Up, Down, NextWord, PreviousWord, NextWordEnd }\n",
+    );
+
+    // Seed lib.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/lib.rs",
+        "pub mod key; pub mod keymap; pub mod labels; pub mod text; pub mod grammar; pub mod vocabulary; pub mod session; pub mod effect;\n",
+    );
+
+    // Seed vocabulary.rs (needed for ContextCommand)
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/vocabulary.rs",
+        "pub enum ContextCommand { Delete, Cut } pub enum ContextMenu { Select, Go, Type, More }\n",
+    );
+
+    // Seed session.rs (needed for reduce)
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/session.rs",
+        "pub fn reduce() {}\npub enum Event {}\npub enum Effect {}\n",
+    );
+
+    // Seed effect.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/effect.rs",
+        "// effects\n",
+    );
+
+    // Seed grammar.rs (still exists in X01)
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/grammar.rs",
+        "pub fn command_key(_: KeyCode, _: Modifiers) -> Option<ContextCommand> { None }\npub fn motion_key(_: KeyCode, _: Modifiers) -> Option<Motion> { None }\npub fn menu_key(_: ContextMenu, _: KeyCode, _: Modifiers) -> Option<ContextCommand> { None }\n",
+    );
+
+    // Seed context.rs in editor with extended native_code
+    seed_file(
+        root,
+        "crates/flavite-editor/src/context.rs",
+        "use iced::keyboard::key::Code;\npub fn native_code(c: Code) -> Option<KeyCode> { match c { Code::KeyM => Some(KeyCode::KeyM), Code::KeyN => Some(KeyCode::KeyN), Code::KeyQ => Some(KeyCode::KeyQ), Code::KeyR => Some(KeyCode::KeyR), Code::KeyS => Some(KeyCode::KeyS), Code::KeyZ => Some(KeyCode::KeyZ), Code::Quote => Some(KeyCode::Quote), Code::Comma => Some(KeyCode::Comma), Code::Period => Some(KeyCode::Period), Code::Backslash => Some(KeyCode::Backslash), Code::BracketLeft => Some(KeyCode::BracketLeft), Code::BracketRight => Some(KeyCode::BracketRight), Code::Minus => Some(KeyCode::Minus), Code::Equal => Some(KeyCode::Equal), _ => None } }\npub fn native_converter_covers_the_whole_grammar_vocabulary() {}\npub fn shadow_equivalence_with_delivered_grammar() {}\n",
+    );
+}
+
+#[test]
+fn feux0003_x01_gate_passes_clean_tree_and_rejects_missing_vocabulary() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_feux0003_x01_inputs(temp.path());
+    let clean = run_gate(temp.path(), "FEUX0003-X01");
+    assert!(
+        clean.status.success(),
+        "FEUX0003-X01 gate should pass on clean tree: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Missing KeyM-KeyZ positions should fail the gate
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/key.rs",
+        "pub enum KeyCode { KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL }\npub enum Motion { Previous, Next, Up, Down, NextWord, PreviousWord, NextWordEnd }\n",
+    );
+    let missing = run_gate(temp.path(), "FEUX0003-X01");
+    assert!(
+        !missing.status.success(),
+        "FEUX0003-X01 gate should fail when 35-position vocabulary is missing: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    // Restore and test another negative: missing keymap.rs
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/key.rs",
+        "pub enum KeyCode { KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ, Semicolon, Quote, Comma, Period, Slash, Backslash, BracketLeft, BracketRight, Minus, Equal }\npub enum Motion { Previous, Next, Up, Down, NextWord, PreviousWord, NextWordEnd }\n",
+    );
+    fs::remove_file(
+        temp.path()
+            .join("crates/flavite-edit-context/src/keymap.rs"),
+    )
+    .unwrap();
+    let missing_keymap = run_gate(temp.path(), "FEUX0003-X01");
+    assert!(
+        !missing_keymap.status.success(),
+        "FEUX0003-X01 gate should fail when keymap.rs is missing: {}",
+        String::from_utf8_lossy(&missing_keymap.stderr)
+    );
+}
+
 #[test]
 fn x08_gate_passes_clean_tree_and_rejects_compat_surfaces() {
     let temp = tempfile::tempdir().unwrap();
@@ -893,4 +1019,337 @@ fn feux_gate_rejects_unknown_or_unimplemented_slices() {
         "{}",
         String::from_utf8_lossy(&x08.stderr)
     );
+}
+
+fn seed_feux0004_x07_inputs(root: &Path) {
+    seed_x08_inputs(root);
+    // FEUX-0004 presence targets
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/pairs.rs",
+        "pub fn find_enclosing_pair() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/numbers.rs",
+        "pub fn scan_number() {}\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/command_args.rs",
+        "pub struct CommandArgsState {}\npub enum FieldSpec { Text { placeholder: String, literal_only: true }, Number }\n",
+    );
+    // Digits in key.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/key.rs",
+        "pub enum KeyCode { KeyA, KeyB, Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,\n",
+    );
+    // Digits in native_code (editor context)
+    seed_file(
+        root,
+        "crates/flavite-editor/src/context.rs",
+        "use iced::keyboard::key::Code;\npub fn native_code(c: Code) -> Option<KeyCode> { match c { Code::Digit0 => Some(KeyCode::Digit0),\n",
+    );
+    // Count in session.rs
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/session.rs",
+        "pub count: Option<u32>,\npub struct AwaitArgs { command: PendingCommand, index: usize, count: Option<u32> }\npub struct InvocationRecord { pub command_id: &str, pub args: std::collections::BTreeMap<String, String> }\npub repeat_last: Option<InvocationRecord>,\n",
+    );
+    // Vocabulary additions
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/vocabulary.rs",
+        "pub enum ContextMenu { Select, Go, More, Transform, Lines, Surround }\nSelf::Transform => &[C::CaseUpper, C::CaseLower, C::CaseSwap, C::CaseTitle, C::NumberInc, C::NumberDec, C::NumberSequence],\nSelf::Lines => &[C::LinesSortAsc, C::LinesSortDesc, C::LinesSortNumeric, C::LinesJoin, C::LinesDuplicate, C::LinesDedupe, C::LinesShuffle, C::LinesMoveUp, C::LinesMoveDown, C::LinesAlign],\nSelf::Surround => &[C::SurroundAdd, C::SurroundChange, C::SurroundDelete],\nSelf::RepeatLast => \"editor.repeat_last\", Self::GotoLine => \"editor.goto_line\", Self::CaseUpper => \"editor.case_upper\", Self::NumberInc => \"editor.number_inc\",\n",
+    );
+    // Layout additions
+    seed_file(
+        root,
+        "crates/flavite-editor/src/context/layout.rs",
+        "pub const MENUS: &[M] = &[M::Select, M::Go, M::More, M::Transform, M::Lines, M::Surround];\n",
+    );
+    // Workbench scripts
+    seed_file(
+        root,
+        "scripts/tests/workbench/context_mode_transforms.py",
+        "# FEUX-0004 transforms\n",
+    );
+    seed_file(
+        root,
+        "scripts/tests/workbench/context_mode_counts_repeat.py",
+        "# FEUX-0004 counts and repeat\n",
+    );
+    seed_file(
+        root,
+        "scripts/tests/workbench/context_mode_surround.py",
+        "# FEUX-0004 surround\n",
+    );
+    // Docs updated
+    seed_file(
+        root,
+        "docs/APP-FEATURES.md",
+        "# Flavite Features\n\n## Transform menu\nThe **Transform** menu provides case and number operations\n## Lines menu\nThe **Lines** menu operates on the containing lines\n## Surround menu\nThe **Surround** menu adds, changes, or deletes surrounding delimiter pairs\n## Count prefix\nDigits 1-9 start or extend a pending count prefix\n## Repeat last (.)\nReplays the last recorded class-E command\n## Go to line (Shift+G)\nJumps to a specific line number\n\nOut of scope: Registers and clipboard history, macros\nNote: repeat-last, counts, surround, case/style/line transforms are now shipped\n",
+    );
+    // Buffer planners
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/commands.rs",
+        "EditOperation::CaseUpper, EditOperation::NumberInc, EditOperation::NumberDec, EditOperation::NumberSequence, EditOperation::LinesSortAsc, EditOperation::LinesSortDesc, EditOperation::LinesSortNumeric, EditOperation::LinesJoin, EditOperation::LinesDuplicate, EditOperation::LinesDedupe, EditOperation::LinesShuffle, EditOperation::LinesMoveUp, EditOperation::LinesMoveDown, EditOperation::LinesAlign { delimiter: String }, EditOperation::SurroundAdd { open: String, close: String }, EditOperation::SurroundChange, EditOperation::SurroundDelete,\n",
+    );
+    // API handlers
+    seed_file(
+        root,
+        "crates/flavite-api/src/editor_commands.rs",
+        "handle_case_upper, handle_lines_sort_asc, handle_surround_add,\n",
+    );
+    // Count indicator
+    seed_file(
+        root,
+        "crates/flavite-ui/src/views/context_toolbar.rs",
+        "count_prefix, let count_prefix: String = \"\"\n",
+    );
+    // Diagnostics
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/editor_diagnostics.rs",
+        "EventKind::RepeatOutcome,\n",
+    );
+    // Keymap default root includes new bindings plus the presence-required
+    // patterns (ReservedPosition, digit position, menu ids).
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/keymap.rs",
+        "KeymapError::ReservedPosition { id: String, position: KeyCode }\nfn is_digit_position(position: KeyCode) -> bool { matches!(position, KeyCode::Digit0 | KeyCode::Digit1) }\neditor.menu_transform, editor.menu_lines, editor.menu_surround, editor.repeat_last, editor.goto_line,\nBindingId::MenuOpener(ContextMenu::Transform), Slot::bare(KeyCode::KeyT),\nBindingId::MenuOpener(ContextMenu::Lines), Slot::shifted(KeyCode::KeyT),\nBindingId::MenuOpener(ContextMenu::Surround), Slot::bare(KeyCode::KeyZ),\nBindingId::Command(ContextCommand::RepeatLast), Slot::bare(KeyCode::Period),\nBindingId::Command(ContextCommand::GotoLine), Slot::shifted(KeyCode::KeyG),\n",
+    );
+}
+
+#[test]
+fn feux0004_x07_gate_passes_clean_tree_and_rejects_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_feux0004_x07_inputs(temp.path());
+    let clean = run_gate(temp.path(), "FEUX0004-X07");
+    assert!(
+        clean.status.success(),
+        "FEUX0004-X07 gate should pass on clean tree: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Grave position should not exist in key.rs
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/key.rs",
+        "pub enum KeyCode { KeyA, KeyB, KeyC, Grave, Digit0, }\n",
+    );
+    let rejected = run_gate(temp.path(), "FEUX0004-X07");
+    assert!(!rejected.status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/key.rs",
+        "Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,\n",
+    );
+
+    // AwaitChar should not exist (replaced by AwaitArgs)
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/session.rs",
+        "pub struct AwaitChar {}\npub count: Option<u32>,\n",
+    );
+    let rejected = run_gate(temp.path(), "FEUX0004-X07");
+    assert!(!rejected.status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-edit-context/src/session.rs",
+        "pub count: Option<u32>,\npub struct AwaitArgs { command: PendingCommand, index: usize, count: Option<u32> }\npub struct InvocationRecord { pub command_id: &str, pub args: std::collections::BTreeMap<String, String> }\npub repeat_last: Option<InvocationRecord>,\n",
+    );
+
+    // Missing pairs.rs fails presence
+    fs::remove_file(temp.path().join("crates/flavite-buffer/src/pairs.rs")).unwrap();
+    let missing = run_gate(temp.path(), "FEUX0004-X07");
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("missing/empty"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    seed_file(
+        temp.path(),
+        "crates/flavite-buffer/src/pairs.rs",
+        "pub fn scan_surround_pair() {}\n",
+    );
+
+    // Missing workbench scripts fail presence
+    fs::remove_file(
+        temp.path()
+            .join("scripts/tests/workbench/context_mode_transforms.py"),
+    )
+    .unwrap();
+    let missing = run_gate(temp.path(), "FEUX0004-X07");
+    assert!(!missing.status.success());
+    seed_file(
+        temp.path(),
+        "scripts/tests/workbench/context_mode_transforms.py",
+        "# FEUX-0004 transforms\n",
+    );
+
+    // FEUX-0005 reservation: ⇧Period should not be bound
+    // This is hard to test with presence/absence, so we skip the negative fixture
+    // The gate script itself checks for this
+
+    // FEUX-0006 reservation: no regex draft fields
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/command_args.rs",
+        "pub enum FieldSpec { Text { placeholder: String, literal_only: true }, Number, Regex }\n",
+    );
+    let rejected = run_gate(temp.path(), "FEUX0004-X07");
+    assert!(!rejected.status.success());
+    seed_file(
+        temp.path(),
+        "crates/flavite-ui/src/host/command_args.rs",
+        "pub struct CommandArgsState {}\npub enum FieldSpec { Text { placeholder: String, literal_only: true }, Number }\n",
+    );
+}
+
+fn seed_feux0005_x01_inputs(root: &Path) {
+    seed_feux0004_x07_inputs(root);
+    // FEUX-0005 X01: Indent family
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/indent.rs",
+        "pub enum Style { Tab, Space }\npub struct Unit { pub style: Style, pub width: u8 }\npub fn detect_unit(text: &str) -> Unit { Unit { style: Style::Space, width: 4 } }\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/commands.rs",
+        "IndentLines { amount: u32 },\nDedentLines { amount: u32 },\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/vocabulary.rs",
+        "Indent,\nDedent,\n\"editor.indent\",\n\"editor.dedent\",\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/keymap.rs",
+        "BindingId::Command(ContextCommand::Indent),\nSlot::shifted(KeyCode::Period),\nBindingId::Command(ContextCommand::Dedent),\nSlot::shifted(KeyCode::Comma),\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/src/editor_commands.rs",
+        "pub struct EditorIndentArgs\nhandle_editor_indent\nhandle_editor_dedent\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/src/flavite.rs",
+        "\"editor.indent\"\n\"editor.dedent\"\nhandle_editor_indent\nhandle_editor_dedent\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/context_mode.rs",
+        "Indent =>\nDedent =>\n",
+    );
+}
+
+#[test]
+fn feux0005_x01_gate_passes_clean_tree_and_rejects_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_feux0005_x01_inputs(temp.path());
+    let clean = run_gate(temp.path(), "FEUX0005-X01");
+    assert!(
+        clean.status.success(),
+        "FEUX0005-X01 gate should pass on clean tree: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Missing indent.rs should fail
+    fs::remove_file(temp.path().join("crates/flavite-buffer/src/indent.rs")).unwrap();
+    let missing = run_gate(temp.path(), "FEUX0005-X01");
+    assert!(!missing.status.success());
+}
+
+fn seed_feux0005_x02_inputs(root: &Path) {
+    seed_feux0005_x01_inputs(root);
+    // FEUX-0005 X02: Whitespace conversion family
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/indent.rs",
+        "pub fn tabs_to_spaces_line(line: &str, width: u8)\npub fn spaces_to_tabs_line(line: &str, width: u8)\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/commands.rs",
+        "ReWhitespace { to_tabs: bool },\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/vocabulary.rs",
+        "TabsToSpaces,\nSpacesToTabs,\n\"editor.tabs_to_spaces\",\n\"editor.spaces_to_tabs\",\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-edit-context/src/keymap.rs",
+        "BindingId::Command(ContextCommand::TabsToSpaces),\nKeyCode::KeyE,\nBindingId::Command(ContextCommand::SpacesToTabs),\nKeyCode::KeyR,\nContextMenu::Transform,\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/src/editor_commands.rs",
+        "pub struct EditorReWhitespaceArgs\nhandle_editor_tabs_to_spaces\nhandle_editor_spaces_to_tabs\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-api/src/flavite.rs",
+        "\"editor.tabs_to_spaces\"\n\"editor.spaces_to_tabs\"\nhandle_editor_tabs_to_spaces\nhandle_editor_spaces_to_tabs\n",
+    );
+    seed_file(
+        root,
+        "crates/flavite-ui/src/host/context_mode.rs",
+        "TabsToSpaces =>\nSpacesToTabs =>\n",
+    );
+}
+
+#[test]
+fn feux0005_x02_gate_passes_clean_tree_and_rejects_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_feux0005_x02_inputs(temp.path());
+    let clean = run_gate(temp.path(), "FEUX0005-X02");
+    assert!(
+        clean.status.success(),
+        "FEUX0005-X02 gate should pass on clean tree: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Missing conversion functions should fail
+    fs::remove_file(temp.path().join("crates/flavite-buffer/src/indent.rs")).unwrap();
+    let missing = run_gate(temp.path(), "FEUX0005-X02");
+    assert!(!missing.status.success());
+}
+
+fn seed_feux0005_x03_inputs(root: &Path) {
+    seed_feux0005_x02_inputs(root);
+    // FEUX-0005 X03: Auto-indent for OpenLine
+    // The OpenLine operation should copy leading whitespace
+    seed_file(
+        root,
+        "crates/flavite-buffer/src/commands.rs",
+        "OpenLine { above: bool },\nleading_whitespace\n",
+    );
+}
+
+#[test]
+fn feux0005_x03_gate_passes_clean_tree_and_rejects_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_feux0005_x03_inputs(temp.path());
+    let clean = run_gate(temp.path(), "FEUX0005-X03");
+    assert!(
+        clean.status.success(),
+        "FEUX0005-X03 gate should pass on clean tree: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // Missing leading_whitespace usage in OpenLine should fail
+    // Remove the OpenLine handling
+    fs::remove_file(temp.path().join("crates/flavite-buffer/src/commands.rs")).unwrap();
+    let missing = run_gate(temp.path(), "FEUX0005-X03");
+    assert!(!missing.status.success());
 }
