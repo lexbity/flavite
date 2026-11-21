@@ -133,21 +133,22 @@ lint-arch:
 
 # S3 watcher-truth probe (PLAN-C C1, §9 S3-1): per-OS watcher evidence with a
 # D5 nomination-property self-check. CI runs scenarios 1–3 on Linux headless.
-spike-watcher *args:
+# The probe jobs do not run `just setup`, so mold must be ensured here.
+spike-watcher *args: ensure-mold
     cargo run -p xtask --bin s3_watcher_probe -- {{args}}
 
 # S3 filesystem-semantics probe (PLAN-C C2, §9 S3-2): rename/symlink/fsync/
 # placeholder/advisory-lock/no-clobber evidence feeding the `Fs` trait contract.
 # Scenario 5 (advisory lock after kill -9) is proven by spawning the probe
 # binary, not by `cargo test`.
-spike-fs *args:
+spike-fs *args: ensure-mold
     cargo run -p xtask --bin s3_fs_probe -- {{args}}
 
 # S4 search probe (PLAN-C C3, §9 S4): CJK bigram-tokenizer quality vs a plain
 # pipeline, deferred commits under 1 s autosave load, `committed_generation`
 # replay after a crash, and atomic checkpoint publication (D12 go/no-go on
 # tantivy vs FTS5). CI re-runs the scaled-down (2k-note) self-check on Linux.
-spike-search *args:
+spike-search *args: ensure-mold
     cargo run -p xtask --bin s4_search_probe -- {{args}}
 
 # S4 DB probe (PLAN-C C4, §9 S4): WAL single-writer + read-pool behavior under
@@ -155,7 +156,7 @@ spike-search *args:
 # generation-bump timing, tantivy writer ops during reconcile, open-time
 # generation check. Evidence for C7 (`pool.rs`, `tantivy.rs`) and C8 batch
 # sizing. CI re-runs the scaled-down (2k-note) self-check on Linux.
-spike-db *args:
+spike-db *args: ensure-mold
     cargo run -p xtask --bin s4_db_probe -- {{args}}
 
 # G0 — local fast gate (§10.3): fmt + clippy + test + arch check + workspace
@@ -361,8 +362,50 @@ fuzz-smoke-ci:
 
 # Developer onboarding (§10.8): install tools + nightly. Idempotent.
 # No git hooks are installed — gating lives in CI, not pre-push.
-setup:
+# mold is ensured FIRST (ensure-mold): every link on linux targets goes
+# through it, including the tool source-build fallbacks inside xtask setup —
+# those must never run with `-fuse-ld=mold` unresolvable (CI 2026-11-21:
+# setup died linking proc-macro2 build scripts because install_mold ran
+# after the tool installs).
+setup: ensure-mold
     cargo xtask setup
+
+# Ensure the mold linker is installed AND resolvable as `ld.mold` — the name
+# gcc looks up for `-fuse-ld=mold` (a bare `mold` binary is not enough: with
+# the flag unresolvable, gcc's collect2 fails every link with "cannot find
+# 'ld'"; reproduced locally 2026-11-21). `.cargo/config.toml` passes the flag
+# for linux targets, so this runs before ANY build: `just setup` depends on
+# it, and so do the spike-* probe recipes (their CI jobs do not run full
+# setup). Ubuntu 26.04 runners ship stale apt lists (see xtask setup's
+# ensure_pillow), so a failed install retries once after apt-get update.
+# Non-Debian hosts without mold fail loudly: mold is a hard requirement on
+# Linux (docs/SETUP.md); `just build-nomold` / `RUSTFLAGS=` are the escape
+# hatches. Idempotent.
+ensure-mold:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v mold >/dev/null 2>&1 && command -v ld.mold >/dev/null 2>&1; then
+        exit 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "mold (ld.mold) is required to link linux targets (.cargo/config.toml)" >&2
+        echo "-fuse-ld=mold; install it manually (apt/pacman: mold), or build without" >&2
+        echo "it via 'just build-nomold' / 'RUSTFLAGS= <cargo command>' (system ld; docs/SETUP.md)" >&2
+        exit 1
+    fi
+    if ! sudo apt-get install -y mold; then
+        sudo apt-get update
+        sudo apt-get install -y mold
+    fi
+    command -v mold >/dev/null || {
+        echo "apt reported success but 'mold' is not on PATH" >&2
+        exit 1
+    }
+    command -v ld.mold >/dev/null || {
+        echo "apt reported success but 'ld.mold' is missing (gcc resolves" >&2
+        echo "-fuse-ld=mold through it); the distro mold package is too old" >&2
+        exit 1
+    }
 
 # Headless GPU setup (PLAN-B §5, B2): install lavapipe so a CI runner with no
 # graphics card can still create a wgpu device.

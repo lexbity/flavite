@@ -1,7 +1,10 @@
 //! Developer onboarding (§10.8): `just setup` — the first command after clone.
 //!
-//! Installs Rust components, the nightly toolchain, and cargo sub-tools.
-//! Idempotent: re-running is a no-op success.
+//! The justfile `setup` recipe runs `ensure-mold` first (the mold linker is a
+//! hard requirement for every linux link, and the tool installs below fall
+//! back to source builds that link with the mold flag), then this program,
+//! which installs Rust components, the nightly toolchain, and cargo
+//! sub-tools. Idempotent: re-running is a no-op success.
 //!
 //! No git hooks are installed: gating lives in CI (`just gate` / `just
 //! ci-gate`), not in a local pre-push hook (product decision 2026-11-09).
@@ -97,39 +100,6 @@ fn install_ripgrep() -> Result<()> {
         anyhow::bail!("ripgrep install reported success but `rg --version` still fails");
     }
     println!("  ✓ rg installed and verified");
-    Ok(())
-}
-
-/// Install the mold linker on Linux. `.cargo/config.toml` passes
-/// `-C link-arg=-fuse-ld=mold` for x86_64-unknown-linux-gnu, so a missing
-/// `mold` fails EVERY link on that target — this is a hard requirement, same
-/// class as ripgrep above (bail on failure). macOS/Windows builds use other
-/// targets and never see the flag, so this is a no-op there. Idempotent.
-fn install_mold() -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        println!("  - mold not needed on this platform (linker flag is linux-only)");
-        return Ok(());
-    }
-    if command_exists("mold") {
-        println!("  ✓ mold already installed");
-        return Ok(());
-    }
-    let status = Command::new("sudo")
-        .args(["apt-get", "install", "-y", "mold"])
-        .status()
-        .context("failed to spawn the mold installer")?;
-    if !status.success() {
-        anyhow::bail!(
-            "mold install failed with {status}; .cargo/config.toml requires mold to link \
-             linux targets — install it manually (apt/pacman: mold, or `cargo install mold`), \
-             or build without it via `just build-nomold` / `RUSTFLAGS= <cargo command>` \
-             (system ld; see docs/SETUP.md)"
-        );
-    }
-    if !command_exists("mold") {
-        anyhow::bail!("mold install reported success but `mold --version` still fails");
-    }
-    println!("  ✓ mold installed and verified");
     Ok(())
 }
 
@@ -390,9 +360,10 @@ pub fn setup() -> Result<()> {
     // cannot be installed — a missing `rg` must never silently skip a gate.
     install_ripgrep()?;
 
-    // mold: required by .cargo/config.toml's linux link flags (every build
-    // links through it). Hard failure on linux, no-op elsewhere.
-    install_mold()?;
+    // mold (required by .cargo/config.toml's linux link flags) is NOT
+    // installed here: the justfile `ensure-mold` recipe owns it and runs
+    // BEFORE this program (`setup: ensure-mold`), because the tool installs
+    // above fall back to source builds that link with the mold flag.
 
     // Pillow: workbench visual acceptance (xtask/tests/workbench_runner.rs
     // and scripts/workbench-visual-linux.sh) requires it for pixel checks.

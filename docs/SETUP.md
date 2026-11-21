@@ -45,11 +45,19 @@ If you plan to work on Flavite itself, run:
 just setup
 ```
 
-This runs `cargo xtask setup`, which is idempotent and installs:
+This runs the justfile `ensure-mold` recipe first, then `cargo xtask setup`.
+Both are idempotent and install:
 
-1. The pinned Rust components (`rustfmt`, `clippy`, `llvm-tools-preview`).
-2. The **nightly** toolchain (minimal profile) — used by `cargo-fuzz`.
-3. Cargo tools, if missing: `cargo-fuzz`, `cargo-deny`, `cargo-audit`,
+1. The **mold linker** (`ensure-mold`): `.cargo/config.toml` passes
+   `-C link-arg=-fuse-ld=mold` for linux targets, so a missing mold fails
+   every link. gcc resolves the flag through an `ld.mold` executable (a bare
+   `mold` binary is not enough); the recipe apt-installs mold on Debian-style
+   systems and verifies `ld.mold` resolves. Non-Debian hosts must install
+   mold manually (pacman: `mold`) or build without it via `just build-nomold`
+   / `RUSTFLAGS=` (system ld).
+2. The pinned Rust components (`rustfmt`, `clippy`, `llvm-tools-preview`).
+3. The **nightly** toolchain (minimal profile) — used by `cargo-fuzz`.
+4. Cargo tools, if missing: `cargo-fuzz`, `cargo-deny`, `cargo-audit`,
    `cargo-llvm-cov`, and `cargo-shear` (nightly) — prebuilt via a pinned
    `cargo-binstall` where available.
 
@@ -110,8 +118,11 @@ fail the command.
 - **Linker (mold).** Debug/dev builds link through [mold](https://github.com/rui314/mold) —
   `.cargo/config.toml` passes `-C link-arg=-fuse-ld=mold` for linux targets, because the gate builds
   ~200 static-linked test binaries and BFD `ld` is orders of magnitude slower on them. `just setup`
-  installs mold (apt on Debian-style systems; it is a hard requirement there — without it every
-  build fails at link time). **Fallback without mold:** prefix any cargo command with an empty
+  (and the spike-* probe recipes) run the `ensure-mold` recipe first: it apt-installs mold on
+  Debian-style systems and verifies `ld.mold` resolves (it is a hard requirement there — without it
+  every build fails at link time; gcc looks the flag up as `ld.mold`, a bare `mold` binary is not
+  enough). Release builds are exempt: zig cc links them, and release.yml sets an empty `RUSTFLAGS`.
+  **Fallback without mold:** prefix any cargo command with an empty
   `RUSTFLAGS=` to override the tracked config and link with the system `ld`:
 
   ```sh

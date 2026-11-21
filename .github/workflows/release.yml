@@ -50,6 +50,14 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
+    env:
+      # Empty-but-set RUSTFLAGS overrides .cargo/config.toml's
+      # `-fuse-ld=mold` rustflags entirely (documented fallback): these jobs
+      # never run `just setup`, and zig cc — not the host toolchain — links
+      # the release binaries, so mold can neither be assumed present nor
+      # used. Without this, `cargo install cargo-zigbuild` (a source build in
+      # the repo root) fails every link on a mold-less runner (2026-11-21).
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -121,6 +129,9 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # AUR_KEY is only needed once aur_sources skip_upload is disabled
       # (see .goreleaser.yaml / docs/RELEASING.md).
+      # Empty-but-set RUSTFLAGS: same as release-snapshot above — zig cc
+      # links these builds, mold is neither assumed nor usable.
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

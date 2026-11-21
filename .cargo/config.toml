@@ -11,6 +11,12 @@ xtask = "run -p xtask --"
 # installed: `RUSTFLAGS= cargo build` (empty-but-set env overrides this file's
 # rustflags entirely — system ld links; `just build-nomold` wraps it) or
 # -fuse-ld=gold (present on Arch base installs).
+# CI: `just setup` and the spike-* probe recipes run the justfile
+# `ensure-mold` recipe first — gcc resolves -fuse-ld=mold through `ld.mold`,
+# so a bare mold binary is not enough (CI 2026-11-21: setup died linking
+# proc-macro2 build scripts before mold was installed; probes never ran
+# setup at all). release.yml bypasses the flag with RUSTFLAGS="" because
+# zig cc links those builds and mold is neither assumed nor usable there.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 # rustflags = ["-C", "link-arg=-fuse-ld=gold"]
