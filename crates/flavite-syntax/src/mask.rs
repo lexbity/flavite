@@ -193,10 +193,10 @@ const MATH_FORWARD_LIMIT: usize = 64 * 1024;
 
 /// Finds math spans in `content`, ignoring `excluded` byte ranges.
 ///
-/// This is a deterministic, dependency-free heuristic shared by *both* parse
-/// paths — the tree-sitter Markdown grammar has no math node and pulldown's
-/// math extension is not enabled, so both glues apply this masker instead of
-/// each inventing their own rules. That is what keeps AC-5 parity exact.
+/// This is a deterministic, dependency-free heuristic shared by the
+/// whole-document bridge and the segment cache (pulldown's math extension is
+/// not enabled, so both produce math exclusions from this one masker instead
+/// of inventing per-path rules). That is what keeps AC-5 parity exact.
 ///
 /// Rules (`content` is the note body relative to which `excluded` is indexed):
 /// * `$$` … `$$` is a display span; a closing `$$` must exist on a later line.
@@ -272,9 +272,9 @@ pub fn math_ranges(content: &str, excluded: &[Range<usize>]) -> Vec<Range<usize>
 /// Find the closing `---` or `...` delimiter for frontmatter that opened at
 /// the very first line (the `---\n` prefix is the caller's check).
 ///
-/// This is the single, shared frontmatter-boundary rule used by **both** parse
-/// glues (pulldown and tree-sitter) so AC-5 parity cannot drift on YAML
-/// delimiters (RFC-0008 S6).
+/// This is the single, shared frontmatter-boundary rule used by the
+/// whole-document bridge and the segment cache so AC-5 parity cannot drift on
+/// YAML delimiters.
 pub(crate) fn find_frontmatter_close(text: &str) -> Option<usize> {
     let after_open = 3; // Skip initial "---"
     let rest = &text[after_open..];

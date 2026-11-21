@@ -1,18 +1,17 @@
 //! Structure-path parity through the editor layer (RFC-0008 AC-5 at the
-//! widget's routing; RFC-0011 S4).
+//! widget's routing; RFC-0011 S4/S5/S6).
 //!
-//! RFC-0011 S4 removed the tree-sitter engine from the widget's routing:
-//! the shipped structure source is the pulldown bridge under the plain-mode
-//! gate. The engine seam remains only as a retained test/bench seam until
-//! RFC-0011 S6 deletes it. This test drives the seam functions the widget
-//! itself used and proves the engine's output is byte-identical to the
-//! shipped pulldown path (`links::spans_from_pulldown`) over the S6
-//! acceptance corpus — the semantics record that survives the engine. The
-//! corpus lives in flavite-syntax; the waivered fixture
-//! (`inline_link_anchor.md`) and the documentation file are excluded exactly
-//! as in the S6 parity harness.
+//! RFC-0011 S6 deleted the tree-sitter engine and its flag: the segment
+//! cache ([`SegmentIndex`], RFC-0011 S5) is the only structure producer.
+//! This test proves that producer's output is byte-identical to the
+//! whole-document pulldown bridge (`links::spans_from_pulldown`) over the
+//! acceptance corpus — through the exact conversion the widget uses — the
+//! semantics record that survives the engine. The corpus lives in
+//! flavite-syntax; the documentation file is excluded as in the S5 parity
+//! harness.
 
-use flavite_editor::links::{spans_from_pulldown, ts_structure_spans};
+use flavite_editor::links::spans_from_pulldown;
+use flavite_syntax::segment::SegmentIndex;
 use std::fs;
 use std::path::PathBuf;
 
@@ -21,7 +20,6 @@ const CORPUS_DIR: &str = concat!(
     "/../flavite-syntax/tests/corpus"
 );
 const KNOWN_DIVERGENCES: &str = "KNOWN-DIVERGENCES.md";
-const WAIVED: &[&str] = &["inline_link_anchor.md"];
 
 #[test]
 fn widget_structure_path_matches_pulldown_on_the_corpus() {
@@ -31,9 +29,7 @@ fn widget_structure_path_matches_pulldown_on_the_corpus() {
         .map(|e| e.path())
         .filter(|p| {
             p.extension().is_some_and(|x| x == "md")
-                && p.file_name().is_some_and(|n| {
-                    n != KNOWN_DIVERGENCES && !WAIVED.contains(&n.to_str().unwrap())
-                })
+                && p.file_name().is_some_and(|n| n != KNOWN_DIVERGENCES)
         })
         .collect();
     fixtures.sort();
@@ -52,14 +48,24 @@ fn widget_structure_path_matches_pulldown_on_the_corpus() {
         let parsed =
             flavite_syntax::pulldown_glue::parse_normalized(&text).expect("pulldown parse");
         let pulldown = spans_from_pulldown(parsed);
-        let ts = ts_structure_spans(&text);
+
+        // The widget's producer: the segment cache (first sync = full
+        // build), converted through the same canonical span conversion.
+        let mut segment = SegmentIndex::new();
+        segment.sync(&text, None);
+        let spans = segment.spans();
+        let segment_path = flavite_editor::links::spans_from_canonical(
+            spans.0,
+            spans.1,
+            spans.2,
+        );
         assert_eq!(
-            ts,
+            segment_path,
             pulldown,
-            "tree-sitter structure spans diverge from pulldown on {}",
+            "segment structure spans diverge from pulldown on {}",
             fixture.display()
         );
         checked += 1;
     }
-    eprintln!("[S7-T3] {checked} corpus fixtures agree through the widget layer");
+    eprintln!("[S6] {checked} corpus fixtures agree through the widget layer (segment producer)");
 }

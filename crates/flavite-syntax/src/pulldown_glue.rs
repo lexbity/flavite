@@ -6,8 +6,9 @@
 //! 3. Run the [`crate::scanner`] on the unmasked text to extract link/tag/block-ID spans.
 //!
 //! The scanner is the **single semantics source** for what counts as a link/tag;
-//! tree-sitter never decides this (D10). Both parse paths use the same scanner,
-//! which is what makes AC-5 parity possible.
+//! the parser only decides what text reaches it (D10). The segment cache and
+//! the whole-document bridge share this module, which is what makes AC-5
+//! parity structural.
 
 use crate::mask::{TextMask, find_frontmatter_close, math_ranges};
 use crate::scanner::{ScannedSpan, SpanKind, scan_inline};

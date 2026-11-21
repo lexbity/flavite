@@ -651,37 +651,6 @@ fn bridge_structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<flavite_syntax::Sca
     crate::links::spans_from_pulldown(parsed)
 }
 
-/// The incremental structure engine path (RFC-0008 D7-C) — retained only as
-/// a test/bench seam: the widget no longer routes through it (RFC-0011 S4),
-/// and the engine is deleted in RFC-0011 S6. `engine_structure_spans_for_perf`
-/// drives it directly for the S8-T2/S8-T4 parity-and-cost measurements.
-fn engine_structure_spans(
-    text: &str,
-    hint: Option<flavite_syntax::EditRange>,
-    lines: &[usize],
-    engine: &mut flavite_syntax::StructureEngine,
-) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
-    // D10: render never blocks on structure — a degraded or failed sync
-    // falls back to the bridge, never an error path.
-    match engine.sync(text, lines, hint) {
-        Ok(spans) => crate::links::spans_from_structure(spans),
-        Err(_) => bridge_structure_spans(text),
-    }
-}
-
-/// Test seam for the S8-T5 bench: the engine path, measured directly and
-/// deterministically (independent of the env flag).
-#[doc(hidden)]
-#[must_use]
-pub fn engine_structure_spans_for_perf(
-    text: &str,
-    hint: Option<flavite_syntax::EditRange>,
-    lines: &[usize],
-    engine: &mut flavite_syntax::StructureEngine,
-) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
-    engine_structure_spans(text, hint, lines, engine)
-}
-
 /// Test seam for the S8-T5 bench: the bridge path, measured directly and
 /// deterministically.
 #[doc(hidden)]
@@ -701,10 +670,10 @@ pub struct EditorState {
     link_spans: Vec<LinkSpan>,
     decorations: Vec<flavite_syntax::ScannedSpan>,
     /// Structure source (RFC-0011 S5): the segment-scoped cache owned here,
-    /// defined in flavite-syntax. It consumes the shared `StructureText`
-    /// seam (implemented by `DocumentText`), so the widget never links
-    /// tree-sitter or depends on the whole-document bridge on the typing
-    /// path.
+    /// defined in flavite-syntax — the only structure producer (RFC-0011
+    /// S6). It consumes the shared `StructureText` seam (implemented by
+    /// `DocumentText`), so the widget never links tree-sitter or depends on
+    /// the whole-document bridge on the typing path.
     segment: flavite_syntax::segment::SegmentIndex,
     /// Whether the D10 degradation warning has been emitted for this widget
     /// instance: the segment cache warns once at `warn` when it degrades to
@@ -4977,7 +4946,8 @@ mod tests {
     #[test]
     fn link_activation_emits_target_syntax_and_never_opens_embeds_as_notes() {
         let text = "[[Ideas#Plan|Ideas]] ![[diagram.png]]";
-        let spans = crate::links::ts_structure_spans(text).0;
+        let parsed = flavite_syntax::pulldown_glue::parse_normalized(text).unwrap();
+        let spans = crate::links::spans_from_pulldown(parsed).0;
         let view = EditorView {
             buffer_id: 88,
             revision: 15,
@@ -5325,33 +5295,37 @@ mod tests {
         assert_eq!(state.viewport.first_line, 0);
     }
 
-    /// S8-T4 (structure paths at the widget layer): the engine path's spans
-    /// equal the bridge path's spans equal the pulldown path's spans on
-    /// representative docs — the AC-5 parity through the exact dispatch
-    /// functions the widget uses, independent of the env flag (the engine
-    /// is enabled/disabled by env; both branches are tested directly).
+    /// S8-T4 (structure paths at the widget layer): the segment cache's
+    /// spans (the widget's producer, RFC-0011 S5) equal the bridge path's
+    /// spans equal the pulldown path's spans on representative docs — the
+    /// AC-5 parity through the exact producers the widget uses.
     #[test]
-    fn structure_spans_engine_and_bridge_paths_match_pulldown() {
+    fn structure_spans_segment_and_bridge_paths_match_pulldown() {
         let docs = [
             "# H [[link]] #tag ^block\n\nBody with ![[embed.png]] and `[[code]]`.\n",
             "- item [[a]]\n- [x] task #t\n\n| [[c]] | d |\n|---|---|\n| e | [[f]] |\n",
             "> quote [[q]]\n\n```\n[[fenced]]\n```\n",
         ];
         for doc in docs {
-            // The bridge path (the shipped default routing).
+            // The bridge path (the semantics record).
             let bridge = bridge_structure_spans(doc);
             assert!(!bridge.0.is_empty(), "bridge must yield links: {doc}");
             let parsed = flavite_syntax::pulldown_glue::parse_normalized(doc).unwrap();
             let pulldown = crate::links::spans_from_pulldown(parsed);
             assert_eq!(bridge, pulldown, "bridge must equal pulldown: {doc}");
 
-            // The engine path (flag-enabled routing, first sync is full).
-            let lines = shape_line_starts(doc);
-            let mut engine = flavite_syntax::StructureEngine::new();
-            let engine_spans = engine_structure_spans(doc, None, &lines, &mut engine);
+            // The segment cache (the widget's producer; first sync is a
+            // full build).
+            let mut segment = flavite_syntax::segment::SegmentIndex::new();
+            segment.sync(&doc, None);
+            let segment_spans = crate::links::spans_from_canonical(
+                segment.spans().0,
+                segment.spans().1,
+                segment.spans().2,
+            );
             assert_eq!(
-                engine_spans, pulldown,
-                "engine spans must equal pulldown: {doc}"
+                segment_spans, pulldown,
+                "segment spans must equal pulldown: {doc}"
             );
         }
     }

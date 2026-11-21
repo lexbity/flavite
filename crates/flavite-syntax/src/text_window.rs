@@ -13,6 +13,28 @@
 
 use std::ops::Range;
 
+/// A single-edit changed-range hint, in pre-edit byte coordinates plus the
+/// new end (the structure-sync hint; originally RFC-0008 D1).
+///
+/// `start..old_end` is the replaced range in the pre-edit text; `new_end`
+/// is the end of the replacement (`start + replacement.len()`) in the
+/// post-edit text. `None` means "no trustworthy hint" (external reload,
+/// merge, journal patch, first open, or a multi-op batch).
+///
+/// The type lives here (the lowest shared structure-consumer crate) because
+/// it is *produced* by `flavite-vault`/`flavite-api` and *consumed* by the
+/// segment cache's `sync`; the editor surface re-exports it for the
+/// editor-facing name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditRange {
+    /// Byte offset where the edit started (pre-edit coordinates).
+    pub start: usize,
+    /// Byte offset just past the replaced range (pre-edit coordinates).
+    pub old_end: usize,
+    /// Byte offset just past the replacement (post-edit coordinates).
+    pub new_end: usize,
+}
+
 /// A read-only text view with byte slices and line windows.
 ///
 /// Implementations must satisfy:

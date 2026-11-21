@@ -2,32 +2,29 @@
 //! (AC-1 attribution).
 //!
 //! Ignored release bench; runs under `just bench-edit` (release,
-//! `--ignored`). Measures the four phases of one keystroke as the widget
+//! `--ignored`). Measures the phases of one keystroke as the widget
 //! actually runs them today, at two document sizes:
 //!
-//! * **64 KiB** — engine path (the flag-enabled branch, measured directly)
-//!   vs bridge path (the shipped default routing).
+//! * **64 KiB** — bridge path (the whole-document reference routing).
 //! * **1 MiB** — bridge path (the shipped default routing).
 //!
-//! Phases: model apply (`try_apply_recorded_batch`), structure (the two
-//! dispatch branches), shaping (band splice on a 240-line viewport), paint
-//! collection (per-line painted set). The sum is the AC-1 end-to-end
-//! keystroke cost at each size under each routing.
+//! Phases: model apply (`try_apply_recorded_batch`), structure (the bridge
+//! reference; the segment cache's per-keystroke cost is covered by
+//! `perf_segment.rs` at the syntax layer), shaping (band splice on a
+//! 240-line viewport), paint collection (per-line painted set). The sum is
+//! the AC-1 end-to-end keystroke cost at each size.
 //!
-//! **Routing decision (RFC-0008 Appendix C, 2026-11-19)**: the engine is
-//! correct (AC-5 parity) but not budget-meeting — its incremental reparses
-//! are not local (≈0.6–0.7× full parse) and trip the D10 guard near grammar
-//! boundaries (p99 ≈166 ms at 64 KiB vs ≈1.4 ms for prose edits). The bridge
-//! is therefore the shipped default for all documents; the engine stays
-//! selectable behind `FLAVITE_TS_STRUCTURE=1`.
+//! **Routing (RFC-0011 S5/S6)**: the widget's structure producer is the
+//! segment cache; the whole-document bridge remains the semantics record
+//! and the catastrophic-regression ceiling (the segment path is bounded by
+//! the bridge cost by construction, D-06).
 //!
 //! Printed numbers are advisory. Absolute gates engage only with
 //! `FLAVITE_REFERENCE_PERF` set (repo convention): the shipped 1 MiB chain
 //! must beat the pre-RFC combined reference (full band reshape 30.42 ms +
 //! `scan_note` 6.68 ms + model 3.64 ms). A relative catastrophic-regression
 //! guard always engages: the 1 MiB bridge must stay under 5× the pre-RFC
-//! `scan_note` reference (perf_structure_incremental.rs holds the engine's
-//! own relative guard).
+//! `scan_note` reference.
 
 use flavite_buffer::{
     EditorModel,
@@ -35,10 +32,8 @@ use flavite_buffer::{
     undo::{EditOp, UndoPolicy},
 };
 use flavite_editor::viewport::Viewport;
-use flavite_editor::widget::{
-    EditorState, bridge_structure_spans_for_perf, engine_structure_spans_for_perf,
-};
-use flavite_syntax::structure::EditRange;
+use flavite_editor::widget::{EditorState, bridge_structure_spans_for_perf};
+use flavite_syntax::EditRange;
 use flavite_syntax::text::{Span, TextByte};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -81,12 +76,6 @@ fn record(at: usize, value: &str) -> EditorEdit {
     }
 }
 
-fn line_starts(text: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    starts.extend(text.match_indices('\n').map(|(at, _)| at + 1));
-    starts
-}
-
 /// A markdown-saturated document of at least `bytes` bytes — links, tags,
 /// block ids, fences, tables, quotes (exercises the full scanner).
 fn build_doc(bytes: usize) -> String {
@@ -119,50 +108,9 @@ fn model_phase_ms(size: usize) -> f64 {
     ms(percentile(&mut samples, 99))
 }
 
-/// Phase 2, engine path: the widget's engine branch at a mid-document edit
-/// (seeded full sync, then incremental, measured directly — independent of
-/// the env flag).
-fn structure_engine_phase_ms(doc: &str, edits: usize) -> f64 {
-    let mut engine = flavite_syntax::StructureEngine::new();
-    let lines = line_starts(doc);
-    // Seed: first sync is a full parse (no hint) — not part of the
-    // per-keystroke measurement.
-    let spans = engine_structure_spans_for_perf(doc, None, &lines, &mut engine);
-    assert!(!spans.0.is_empty(), "seed must yield links");
-
-    let mut text = doc.to_string();
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    let mut rng = |range: usize| {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (state >> 33) as usize % range
-    };
-    let mut samples = Vec::with_capacity(edits);
-    for _ in 0..edits {
-        let len = text.len();
-        let mut pos = (len / 3 + rng(len / 3)).min(len.saturating_sub(1));
-        while !text.is_char_boundary(pos) {
-            pos = pos.saturating_sub(1);
-        }
-        let ch = (b'a' + (rng(26) as u8)) as char;
-        let hint = EditRange {
-            start: pos,
-            old_end: pos,
-            new_end: pos + 1,
-        };
-        let l = line_starts(&text);
-        let start = Instant::now();
-        let spans = engine_structure_spans_for_perf(&text, Some(hint), &l, &mut engine);
-        samples.push(start.elapsed());
-        assert!(!spans.0.is_empty(), "clean doc must keep links");
-        text.insert(pos, ch);
-    }
-    ms(percentile(&mut samples, 99))
-}
-
-/// Phase 2, bridge path: the widget's bridge branch (the shipped default
-/// routing) at a mid-document edit.
+/// Phase 2, bridge path: the whole-document bridge reference (the segment
+/// cache's per-keystroke cost is bounded by this by construction, D-06;
+/// measured directly at the syntax layer in `perf_segment.rs`).
 fn structure_bridge_phase_ms(doc: &str, edits: usize) -> f64 {
     let mut samples = Vec::with_capacity(edits);
     for _ in 0..edits {
@@ -245,7 +193,6 @@ fn render_phases_ms() -> (f64, f64) {
 #[ignore = "perf budget; runs under just bench-edit (release, --ignored)"]
 fn end_to_end_keystroke_chain_at_shipped_config() {
     let model_1mib = model_phase_ms(1024 * 1024);
-    let engine_64kib = structure_engine_phase_ms(&build_doc(64 * 1024), 100);
     let bridge_64kib = structure_bridge_phase_ms(&build_doc(64 * 1024), 100);
     let bridge_1mib = structure_bridge_phase_ms(&build_doc(1024 * 1024), 30);
     let (shaping, paint) = render_phases_ms();
@@ -253,28 +200,21 @@ fn end_to_end_keystroke_chain_at_shipped_config() {
     println!("RFC-0008 S8-T5 end-to-end keystroke chain (shipped config, p99)");
     println!("phase,doc_bytes,ms_p99");
     println!("model,1048576,{model_1mib:.3}");
-    println!("structure_engine,65536,{engine_64kib:.3}");
     println!("structure_bridge,65536,{bridge_64kib:.3}");
     println!("structure_bridge,1048576,{bridge_1mib:.3}");
     println!("shaping,band240,{shaping:.3}");
     println!("paint,band240,{paint:.3}");
 
-    // The engine path is the designed route for typical notes; the bridge is
-    // the fallback. If the engine is not faster than the bridge at its own
-    // ceiling, the shipped default should route that size class to the
-    // bridge (recorded in RFC-0008 Appendix C / baselines).
-    println!("engine_vs_bridge_at_64kib: engine={engine_64kib:.3} ms bridge={bridge_64kib:.3} ms");
-
-    let sum_64kib_engine = model_1mib + engine_64kib + shaping + paint;
     let sum_64kib_bridge = model_1mib + bridge_64kib + shaping + paint;
     let sum_1mib = model_1mib + bridge_1mib + shaping + paint;
-    println!("sum_engine_routing,65536,{sum_64kib_engine:.3}");
     println!("sum_bridge_routing,65536,{sum_64kib_bridge:.3}");
     println!("sum_bridge_routing,1048576,{sum_1mib:.3}");
 
     // Relative catastrophic-regression guard (always engages): the 1 MiB
     // bridge must not blow past 5× the pre-RFC `scan_note` reference — the
-    // R8 discipline (relative gates over absolute where possible).
+    // R8 discipline (relative gates over absolute where possible). The
+    // segment path is bounded by the bridge by construction (D-06), so this
+    // ceiling covers the shipped structure producer too.
     assert!(
         bridge_1mib <= SCAN_NOTE_REFERENCE_1MIB_MS * 5.0,
         "1 MiB bridge {bridge_1mib:.3} ms > 5× pre-RFC scan_note {SCAN_NOTE_REFERENCE_1MIB_MS} ms"

@@ -12,11 +12,8 @@ pub mod pulldown_glue;
 pub mod read;
 pub mod scanner;
 pub mod segment;
-pub mod structure;
 pub mod text;
 pub mod text_window;
-pub mod ts_inline;
-pub mod ts_ranges;
 pub mod wellknown;
 
 // Re-export key types for convenience.
@@ -28,6 +25,6 @@ pub use flavite_encoding::{CodecError, DecodePolicy, FileEncoding, FormatStamp, 
 pub use pulldown_glue::{Link, ParsedNote};
 pub use scanner::{LinkPayload, ScannedSpan, SpanKind};
 pub use segment::{SegmentIndex, SegmentKind, SyncReport};
-pub use structure::{EditRange, StructureEngine};
 pub use text::{Eol, LineInfo, SourceByte, Span, TextByte, TextError, TextSnapshot};
+pub use text_window::{EditRange, StructureText};
 pub use wellknown::{WellKnownKey, normalize_tag};

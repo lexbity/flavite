@@ -133,10 +133,6 @@
       "kind": "external"
     },
     {
-      "id": "tree-sitter",
-      "kind": "external"
-    },
-    {
       "id": "xtask",
       "kind": "workspace"
     },
@@ -408,11 +404,6 @@
     {
       "from": "flavite-syntax",
       "to": "pulldown-cmark",
-      "kind": "normal"
-    },
-    {
-      "from": "flavite-syntax",
-      "to": "tree-sitter",
       "kind": "normal"
     },
     {

@@ -1,8 +1,9 @@
 //! Inline scanner for Flavite syntax extensions (§4.3, D10).
 //!
 //! The scanner is **pure and IO-free**. It is the single source of link/tag
-//! semantics for both the indexer (pulldown-cmark parse path) and the editor
-//! (tree-sitter parse path). Tree-sitter never decides what a link is (D10).
+//! semantics for the indexer (pulldown-cmark parse path) and the editor
+//! (the segment cache's pulldown bridge). The scanner decides what a link
+//! is; parsing only decides what text reaches it (D10).
 //!
 //! # Syntax covered
 //!

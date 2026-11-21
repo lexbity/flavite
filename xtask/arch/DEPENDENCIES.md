@@ -156,7 +156,6 @@ Normal/build:
 
 - `flavite-encoding` (normal)
 - `pulldown-cmark` (normal)
-- `tree-sitter` (normal)
 
 ### `flavite-text-search`
 
@@ -257,7 +256,6 @@ Normal/build:
 - `similar` ← flavite-vault
 - `tantivy` ← flavite-index, xtask
 - `tracing` ← flavite-api, flavite-buffer, flavite-cli, flavite-editor, flavite-index, flavite-ui, flavite-vault
-- `tree-sitter` ← flavite-syntax
 - `zip` ← flavite-api, flavite-cli, flavite-theme, flavite-ui
 - `zstd` ← flavite-vault
 

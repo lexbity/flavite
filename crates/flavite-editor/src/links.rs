@@ -49,39 +49,10 @@ pub enum LinkResolution {
     NotApplicable,
 }
 
-/// Scan links and decorations through the **tree-sitter** full-parse path
-/// (the S7 flag-on seam; S8 replaced the widget's use of this with the
-/// incremental `StructureEngine`). Kept for tests, diagnostics, and the
-/// rollback path: same types and scanner-shared semantics as the pulldown
-/// path; the parity corpus proves byte-identical ranges and kinds (AC-5).
-#[must_use]
-pub fn ts_structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
-    let Ok(parsed) = flavite_syntax::ts_ranges::parse_note_ts(text.as_bytes()) else {
-        return (Vec::new(), Vec::new());
-    };
-    spans_from_ts(parsed)
-}
-
-/// Convert a tree-sitter full parse into the widget's span views.
-#[must_use]
-pub fn spans_from_ts(
-    parsed: flavite_syntax::ts_ranges::TsParsedNote,
-) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
-    spans_from_canonical(parsed.links, parsed.tags, parsed.block_ids)
-}
-
-/// Convert the incremental structure engine's spans into the widget's views.
-#[must_use]
-pub fn spans_from_structure(
-    spans: flavite_syntax::structure::StructureSpans,
-) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
-    spans_from_canonical(spans.links, spans.tags, spans.block_ids)
-}
-
-/// Convert a pulldown parse into the widget's span views. The widget no
-/// longer depends on the pulldown parse path (RFC-0011 S5 routes through
-/// the segment cache); this converter exists for parity tests and
-/// diagnostics, and delegates to [`spans_from_canonical`].
+/// Convert a pulldown parse into the widget's span views. The widget routes
+/// through the segment cache (RFC-0011 S5); this converter exists for the
+/// parity tests and diagnostics, and delegates to
+/// [`spans_from_canonical`].
 #[must_use]
 pub fn spans_from_pulldown(
     parsed: flavite_syntax::pulldown_glue::ParsedNote,
@@ -239,11 +210,15 @@ mod tests {
     }
 
     #[test]
-    fn ts_full_path_matches_pulldown_conversion() {
-        // The two converters (ts full path vs pulldown) must agree on the
-        // same spans — the widget's flag-on path equivalence (AC-5).
+    fn segment_cache_matches_pulldown_conversion() {
+        // The segment cache (the widget's structure producer, RFC-0011 S5)
+        // and the pulldown converter must yield the same spans — the single
+        // producer's parity contract (AC-5).
         let text = "[[Ideas]] `[[code]]`\n\n```md\n[[fence]]\n```\n\n$[[math]]$ ![[diagram.png]] #topic ^block\n\n*emphasis* and **strong** with [[Another]]".repeat(20);
-        let (links, decorations) = ts_structure_spans(&text);
+        let mut index = flavite_syntax::segment::SegmentIndex::new();
+        index.sync(&text, None);
+        let (links, decorations) =
+            spans_from_canonical(index.spans().0, index.spans().1, index.spans().2);
         let parsed = flavite_syntax::pulldown_glue::parse_normalized(&text).unwrap();
         let (p_links, p_decorations) = spans_from_pulldown(parsed);
         assert_eq!(links, p_links);
@@ -257,7 +232,11 @@ mod tests {
         // A closed wikilink whose target has no indexed note still scans as
         // a link (the graph's grey node and the create-from-link flow both
         // key off this payload); spaces in the target are legal.
-        let links = ts_structure_spans("# Alpha\n\nalpha body\n[[zz test]]").0;
+        let parsed = flavite_syntax::pulldown_glue::parse_normalized(
+            "# Alpha\n\nalpha body\n[[zz test]]",
+        )
+        .unwrap();
+        let links = spans_from_pulldown(parsed).0;
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].payload.target_raw, "zz test");
         assert!(!links[0].embed);
@@ -266,7 +245,8 @@ mod tests {
     #[test]
     fn links_and_decorations_use_shared_scanner_and_exclusions() {
         let text = "[[Ideas]] `[[code]]`\n\n```md\n[[fence]]\n```\n\n$[[math]]$ ![[diagram.png]] #topic ^block";
-        let (links, decorations) = ts_structure_spans(text);
+        let parsed = flavite_syntax::pulldown_glue::parse_normalized(text).unwrap();
+        let (links, decorations) = spans_from_pulldown(parsed);
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].payload.target_raw, "Ideas");
         assert!(!links[0].embed);
