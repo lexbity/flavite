@@ -501,8 +501,7 @@ fn restore(app: &mut App, source: EditorTarget, target: HistoryTarget) -> Task<M
                 .collect()
         } else if movement.truncated {
             let text = view.text.materialize();
-            let clamp =
-                |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&text, at);
+            let clamp = |at: usize| flavite_editor::viewport::clamp_grapheme_boundary(&text, at);
             interaction
                 .selections
                 .iter()

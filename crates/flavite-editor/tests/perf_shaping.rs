@@ -120,12 +120,10 @@ fn keystroke_splice_cost_stays_sub_half_millisecond() {
         // The real frame order: revision change → reconcile (line index +
         // scan) → layout sync. Only the sync (shaping) phase is measured.
         state.reconcile(&base_view, &HashMap::new());
-        let base_text = base_view.text.materialize();
-        let edited_text = edited_view.text.materialize();
-        state.sync_shaped_for_perf(&base_text, 1, viewport, width);
+        state.sync_shaped_for_perf(&base_view.text, 1, viewport, width);
         state.reconcile(&edited_view, &HashMap::new());
         let start = Instant::now();
-        state.sync_shaped_for_perf(&edited_text, 2, viewport, width);
+        state.sync_shaped_for_perf(&edited_view.text, 2, viewport, width);
         samples.push(start.elapsed());
     }
     let p50 = percentile(&mut samples, 50);
@@ -142,6 +140,134 @@ fn keystroke_splice_cost_stays_sub_half_millisecond() {
             p50 < Duration::from_millis(1),
             "keystroke splice p50 {:.4} ms ≥ 1 ms (budget ≤0.5 ms)",
             ms(p50)
+        );
+    }
+}
+
+/// S3-T5: the paint-collection path (spans + painted-line set + per-line
+/// content) at a 240-line band with one changed line (NFR-1 render
+/// contribution): ≤0.8 ms p50 release. The actual `fill_text` calls are
+/// exercised by the real renderer; this measures everything the widget
+/// computes before them.
+/// NFR-5 line-query evidence (RFC-0011 S4): `line_start_of`/`line_index_of`/
+/// band slicing on a 5 MiB document — O(log n + band), microseconds, no
+/// full-document scan. Ignored release bench; advisory (no absolute gate —
+/// R10: relative assertions only).
+#[test]
+#[ignore = "perf budget; runs under just bench-edit (release, --ignored)"]
+fn s4_nfr5_line_queries_at_5mib_are_microsecond_scale() {
+    use flavite_buffer::chunks::DocumentText;
+
+    let mut text = String::with_capacity(5 * 1024 * 1024 + 128);
+    while text.len() < 5 * 1024 * 1024 {
+        text.push_str("line content with some words\n");
+    }
+    let doc = DocumentText::from(text.as_str());
+    assert!(doc.len() >= 5 * 1024 * 1024);
+
+    let line_count = doc.line_count();
+    let mid_line = line_count / 2;
+    let mid_byte = doc.line_start_of(mid_line);
+
+    // Warm-up, then measure.
+    for _ in 0..100 {
+        black_box(doc.line_start_of(mid_line));
+        black_box(doc.line_index_of(mid_byte));
+        black_box(doc.slice(mid_byte..mid_byte + 4096));
+    }
+    let mut samples = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let start = Instant::now();
+        black_box(doc.line_start_of(mid_line));
+        black_box(doc.line_index_of(mid_byte));
+        black_box(doc.slice(mid_byte..mid_byte + 4096));
+        samples.push(start.elapsed());
+    }
+    let p99 = percentile(&mut samples, 99);
+    assert!(line_count > 100_000);
+    println!(
+        "S4 NFR-5 @5MiB line query triad p99={:.3} µs",
+        ms(p99) * 1000.0
+    );
+    // Relative guard only (R10): the triad must be far below a full
+    // materialization of the same document (~ms).
+    let start = Instant::now();
+    black_box(doc.materialize());
+    let materialize = start.elapsed();
+    assert!(
+        p99 * 200 < materialize,
+        "line queries must be ≪ materialization ({p99:?} vs {materialize:?})"
+    );
+}
+
+/// S4-T4 (NFR-4 phase gate): shaping + paint collection on a 240-line band,
+/// p99 over 200 frames, ≤ 1.0 ms in release. The absolute gate engages only
+/// in release (repo convention); debug prints diagnostics. This is the
+/// RFC-0011 S4 render-phase budget on the tree-backed band path.
+#[test]
+#[ignore = "perf budget; runs under just bench-edit (release, --ignored)"]
+fn s4_t4_shaping_and_paint_band240_p99_sub_millisecond() {
+    use flavite_buffer::state::BufferState;
+    use flavite_editor::widget::EditorState;
+    use flavite_editor::{EditorView, viewport::Viewport};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    let text = (0..240u32)
+        .map(|index| format!("line {index:03} alpha beta gamma delta epsilon zeta eta theta\n"))
+        .collect::<String>();
+    let width = 800.0_f32;
+    let viewport = Viewport {
+        first_line: 80,
+        visible_lines: 80,
+        ..Viewport::default()
+    };
+    let paint_height = 80.0 * 22.0;
+    let base_view = EditorView {
+        buffer_id: 1,
+        revision: 1,
+        text: flavite_buffer::chunks::DocumentText::from(text.as_str()),
+        path: PathBuf::from("note.md"),
+        state: BufferState::Clean,
+        last_edit: None,
+    };
+    let mut edited = text.clone();
+    let target = "line 120 alpha";
+    let at = edited.find(target).expect("line 120") + target.len() - 5;
+    edited.replace_range(at..at + 1, "A");
+    let edited_view = EditorView {
+        revision: 2,
+        text: flavite_buffer::chunks::DocumentText::from(edited.as_str()),
+        last_edit: Some(flavite_syntax::EditRange {
+            start: at,
+            old_end: at + 1,
+            new_end: at + 1,
+        }),
+        ..base_view.clone()
+    };
+
+    let mut samples = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let mut state = EditorState::default();
+        state.reconcile(&base_view, &HashMap::new());
+        state.sync_shaped_for_perf(&base_view.text, 1, viewport, width);
+        state.reconcile(&edited_view, &HashMap::new());
+        let start = Instant::now();
+        state.sync_shaped_for_perf(&edited_view.text, 2, viewport, width);
+        let painted =
+            state.painted_line_count_for_perf(&edited_view.text, 2, viewport, width, paint_height);
+        assert!(painted > 0);
+        samples.push(start.elapsed());
+    }
+    let p99 = percentile(&mut samples, 99);
+    println!("S4-T4 shaping+paint 240-line band p99={:.4} ms", ms(p99));
+    if cfg!(debug_assertions) {
+        println!("debug build: S4-T4 timing is diagnostic (NFR-4), not asserted");
+    } else {
+        assert!(
+            p99 < Duration::from_millis(1),
+            "shaping+paint p99 {:.4} ms ≥ 1 ms (NFR-4 phase gate)",
+            ms(p99)
         );
     }
 }
@@ -197,13 +323,11 @@ fn paint_collection_cost_stays_sub_millisecond() {
     for _ in 0..300 {
         let mut state = EditorState::default();
         state.reconcile(&base_view, &HashMap::new());
-        let base_text = base_view.text.materialize();
-        let edited_text = edited_view.text.materialize();
-        state.sync_shaped_for_perf(&base_text, 1, viewport, width);
+        state.sync_shaped_for_perf(&base_view.text, 1, viewport, width);
         state.reconcile(&edited_view, &HashMap::new());
         let start = Instant::now();
         let painted =
-            state.painted_line_count_for_perf(&edited_text, 2, viewport, width, paint_height);
+            state.painted_line_count_for_perf(&edited_view.text, 2, viewport, width, paint_height);
         samples.push(start.elapsed());
         assert!(painted > 0, "paint collection paints lines");
     }

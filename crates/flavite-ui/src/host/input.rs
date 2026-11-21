@@ -781,14 +781,8 @@ pub fn reconcile_buffer_revisions(app: &mut App) {
                 .iter()
                 .map(|selection| {
                     CommittedSelection::new(
-                        flavite_editor::viewport::clamp_grapheme_boundary(
-                            &text,
-                            selection.anchor,
-                        ),
-                        flavite_editor::viewport::clamp_grapheme_boundary(
-                            &text,
-                            selection.head,
-                        ),
+                        flavite_editor::viewport::clamp_grapheme_boundary(&text, selection.anchor),
+                        flavite_editor::viewport::clamp_grapheme_boundary(&text, selection.head),
                     )
                 })
                 .collect();
@@ -852,8 +846,7 @@ pub fn apply_history_movement(
                     .collect();
             } else {
                 let text = view.text.materialize();
-                interaction.selections =
-                    map_selections(&text, &interaction.selections, movement);
+                interaction.selections = map_selections(&text, &interaction.selections, movement);
             }
             // The mapped set may have merged members: keep this view's own
             // primary member when its cardinality allows (E-4/FR-4). The

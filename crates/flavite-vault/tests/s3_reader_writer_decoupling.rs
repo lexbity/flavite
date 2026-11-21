@@ -11,8 +11,8 @@
 use flavite_buffer::revision::{BufferId, Revision};
 use flavite_buffer::undo::{EditOp, UndoPolicy};
 use flavite_vault::session::{Session, SessionCommand, SessionResult};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 fn fixture() -> (Session, u64) {
@@ -25,7 +25,8 @@ fn fixture() -> (Session, u64) {
     fs.create_dir_all(&root).unwrap();
     // A 1 MiB note: the materialization class the reader loop exercises.
     let body = "x".repeat(1024 * 1024);
-    fs.write_new(&root.join("note.md"), body.as_bytes()).unwrap();
+    fs.write_new(&root.join("note.md"), body.as_bytes())
+        .unwrap();
     let db_dir = tempfile::tempdir().unwrap();
     let db = db_dir.path().join("s3.sqlite3");
     drop(flavite_index::open_or_init(&db).unwrap());
@@ -91,7 +92,11 @@ fn type_keystrokes(session: &Session, buffer: u64, count: usize) -> Vec<u128> {
         .as_u64();
     let mut samples = Vec::with_capacity(count);
     for _ in 0..count {
-        let at = if revision == 1 { 1024 * 1024 } else { usize::MAX };
+        let at = if revision == 1 {
+            1024 * 1024
+        } else {
+            usize::MAX
+        };
         let current_len = session
             .shared_buffer_snapshot(BufferId::from(buffer), None)
             .expect("buffer snapshot")
@@ -195,5 +200,8 @@ fn reader_materialization_loop_does_not_convoy_keystrokes() {
         "keystroke p99 under reader contention {contended_p99}us > 2× isolated ({bound}us) — lock convoy remains"
     );
     // No pathological tail, either.
-    assert!(contended_max < 5_000, "contended keystroke tail {contended_max}us ≥ 5ms");
+    assert!(
+        contended_max < 5_000,
+        "contended keystroke tail {contended_max}us ≥ 5ms"
+    );
 }

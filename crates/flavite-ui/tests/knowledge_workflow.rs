@@ -71,7 +71,8 @@ fn tab_of(app: &App, name: &str) -> Option<TabId> {
 }
 
 fn buffer_text(app: &App, tab: TabId) -> Option<String> {
-    app.note_editor_view(tab).map(|view| view.text.materialize().to_string())
+    app.note_editor_view(tab)
+        .map(|view| view.text.materialize().to_string())
 }
 
 #[test]

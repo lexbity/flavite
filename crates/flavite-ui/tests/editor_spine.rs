@@ -187,7 +187,10 @@ fn kernel_delete_empty_line_creates_no_history_node() {
     let before_revision = f.app.note_editor_view(tab).unwrap().revision;
     run(&mut f.app, tab, Command::Toggle);
     run(&mut f.app, tab, Command::Delete);
-    assert_eq!(&*f.app.note_editor_view(tab).unwrap().text.materialize(), "a\n\nb");
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
+        "a\n\nb"
+    );
     assert_eq!(
         f.app.note_editor_view(tab).unwrap().revision,
         before_revision,

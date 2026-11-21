@@ -1,12 +1,14 @@
-//! S7-T3: structure-path parity through the editor layer (RFC-0008 AC-5 at
-//! the widget's flag-on seam).
+//! Structure-path parity through the editor layer (RFC-0008 AC-5 at the
+//! widget's routing; RFC-0011 S4).
 //!
-//! The widget's flag-on path runs `flavite_syntax::StructureEngine::sync`
-//! (full parse in stage B) and converts the result with
-//! `flavite_editor::links::spans_from_ts`. This test drives the exact same
-//! functions the widget uses and proves their output is byte-identical to
-//! the shipped pulldown path (`links::scan_note`) over the S6 acceptance
-//! corpus. The corpus live in flavite-syntax; the waivered fixture
+//! RFC-0011 S4 removed the tree-sitter engine from the widget's routing:
+//! the shipped structure source is the pulldown bridge under the plain-mode
+//! gate. The engine seam remains only as a retained test/bench seam until
+//! RFC-0011 S6 deletes it. This test drives the seam functions the widget
+//! itself used and proves the engine's output is byte-identical to the
+//! shipped pulldown path (`links::spans_from_pulldown`) over the S6
+//! acceptance corpus — the semantics record that survives the engine. The
+//! corpus lives in flavite-syntax; the waivered fixture
 //! (`inline_link_anchor.md`) and the documentation file are excluded exactly
 //! as in the S6 parity harness.
 

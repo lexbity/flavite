@@ -322,6 +322,22 @@ impl ChunkRoot {
         self.slice(0..self.len())
     }
 
+    /// Whether `pos` is a UTF-8 scalar boundary in this tree (O(log n)).
+    /// `0` and `len` are boundaries; a position inside a multi-byte
+    /// character is not.
+    #[must_use]
+    pub fn is_char_boundary(&self, pos: usize) -> bool {
+        if pos == 0 {
+            return true;
+        }
+        if pos >= self.len() {
+            return pos == self.len();
+        }
+        let (_, leaf, base) = self.locate(pos);
+        let local = pos - base;
+        leaf.bytes.is_char_boundary(local.min(leaf.bytes.len()))
+    }
+
     /// The number of newlines strictly before byte `pos` (i.e. the line
     /// index of the line containing `pos`, clamped).
     #[must_use]
@@ -837,6 +853,18 @@ impl DocumentText {
     #[must_use]
     pub fn line_index_of(&self, pos: usize) -> usize {
         self.root.line_index_of(pos)
+    }
+
+    /// The byte offset of the start of `line` (clamped to the document end).
+    #[must_use]
+    pub fn line_start_of(&self, line: usize) -> usize {
+        self.root.line_start_of(line)
+    }
+
+    /// Whether `pos` is a UTF-8 scalar boundary (O(log n)).
+    #[must_use]
+    pub fn is_char_boundary(&self, pos: usize) -> bool {
+        self.root.is_char_boundary(pos)
     }
 
     /// Materialize the full text (memoization is the holder's choice).

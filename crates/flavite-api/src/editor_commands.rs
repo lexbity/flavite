@@ -382,8 +382,8 @@ pub(crate) fn handle_clear_selection(
         anchor: head,
         head,
     };
-    let (cleared, _) = SelectionSet::normalize(&text, vec![caret], None)
-        .map_err(|error| error.to_string())?;
+    let (cleared, _) =
+        SelectionSet::normalize(&text, vec![caret], None).map_err(|error| error.to_string())?;
     Ok(selections_changed(args.buffer_id, args.revision, &cleared))
 }
 
@@ -868,8 +868,8 @@ pub(crate) fn handle_editor_copy(
     let snapshot = shared_snapshot(session, args.buffer_id, args.revision)?;
     let text = snapshot.text.materialize();
     let set = normalize_set(&text, &args.selections)?;
-    let fragments = flavite_buffer::commands::copy_fragments(&text, &set)
-        .map_err(|error| error.to_string())?;
+    let fragments =
+        flavite_buffer::commands::copy_fragments(&text, &set).map_err(|error| error.to_string())?;
     Ok(SessionResult::Success(
         crate::session::CommandResult::TextCopied {
             buffer_id: BufferId::from(args.buffer_id),
@@ -1170,14 +1170,7 @@ pub(crate) fn handle_editor_move(
     // FEUX-0004 X06: Apply count to motion (E-4 §5.3)
     let moved = if let Some(n) = args.count {
         // Apply motion n times
-        flavite_buffer::motion::apply_with_count(
-            &text,
-            &set,
-            motion,
-            args.extend,
-            positions,
-            n,
-        )
+        flavite_buffer::motion::apply_with_count(&text, &set, motion, args.extend, positions, n)
     } else {
         // No count, apply once
         flavite_buffer::motion::apply(&text, &set, motion, args.extend, positions)

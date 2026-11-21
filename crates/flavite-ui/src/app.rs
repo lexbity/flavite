@@ -4412,8 +4412,11 @@ impl App {
                                 vec![flavite_workspace::CommittedSelection::caret(caret)];
                             interaction.primary = 0;
                             interaction.focused = true;
-                            self.acknowledge_editor_interaction(interaction, &view.text.materialize())
-                                .is_ok()
+                            self.acknowledge_editor_interaction(
+                                interaction,
+                                &view.text.materialize(),
+                            )
+                            .is_ok()
                         });
                     if !acknowledged {
                         self.workspace.invalidate_writing_target(target.buffer_id);

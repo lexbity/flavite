@@ -158,7 +158,11 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         action: edit,
     });
     assert_eq!(
-        app.note_editor_view(first).unwrap().text.materialize().as_ref(),
+        app.note_editor_view(first)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\nbeta\n!"
     );
     let after_edit_first = app.note_editor_view(first).unwrap();
@@ -180,7 +184,11 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         action: undo,
     });
     assert_eq!(
-        app.note_editor_view(first).unwrap().text.materialize().as_ref(),
+        app.note_editor_view(first)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\nbeta\n"
     );
     // Redo from the other view restores the same one-edit boundary.
@@ -193,7 +201,11 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         action: redo,
     });
     assert_eq!(
-        app.note_editor_view(first).unwrap().text.materialize().as_ref(),
+        app.note_editor_view(first)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\nbeta\n!",
         "redo restores the shared edit"
     );
@@ -207,7 +219,11 @@ fn split_views_share_revision_text_and_history_but_keep_independent_carets() {
         action: undo_again,
     });
     assert_eq!(
-        app.note_editor_view(first).unwrap().text.materialize().as_ref(),
+        app.note_editor_view(first)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\nbeta\n"
     );
     let _ = app.update(Message::RunHostCommand("note.save"));
@@ -402,7 +418,11 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
         },
     });
     assert_eq!(
-        app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
+        app.note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\n\n"
     );
     let _ = app.update(Message::EditorInput {
@@ -422,7 +442,11 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
         },
     });
     assert_eq!(
-        app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
+        app.note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "alpha\n雪\n"
     );
     assert_eq!(
@@ -438,7 +462,11 @@ fn queued_navigation_and_word_edits_follow_acknowledged_carets_without_redraw() 
         action: EditorAction::history(&current, false),
     });
     assert!(
-        !app.note_editor_view(tab).unwrap().text.materialize().contains('雪'),
+        !app.note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .contains('雪'),
         "undo remains Session-owned"
     );
 }

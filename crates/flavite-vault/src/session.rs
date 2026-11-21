@@ -1726,8 +1726,9 @@ impl Session {
                             .collect::<Vec<_>>();
                         drop(buffer_manager);
                         for (key, base, staged) in dirty {
-                            let snapshot =
-                                flavite_buffer::recovery::RecoveryFile::from_staged(staged, 0, false);
+                            let snapshot = flavite_buffer::recovery::RecoveryFile::from_staged(
+                                staged, 0, false,
+                            );
                             let due = writer.lock_recovering().should_write_snapshot(&snapshot);
                             if due && actor.pin_merge_base(key.clone(), base).is_ok() {
                                 writer.lock_recovering().write_snapshot(&key, snapshot);
@@ -11293,7 +11294,10 @@ mod tests {
 
     /// The hint the model's own last-transition ops imply (the rule the
     /// cache fill uses for undo/redo/restore transitions).
-    fn model_transition_hint(session: &Session, buffer_id: BufferId) -> Option<flavite_syntax::EditRange> {
+    fn model_transition_hint(
+        session: &Session,
+        buffer_id: BufferId,
+    ) -> Option<flavite_syntax::EditRange> {
         let manager_arc = session.buffer_manager();
         let manager = manager_arc.lock().unwrap();
         let ops = manager
@@ -11487,7 +11491,9 @@ mod tests {
                 .issue_editor_operation(buffer_id, undone2, None)
                 .expect("fixture activation"),
         }) {
-            SessionResult::Success(CommandResult::EditingStateRestored { revision, .. }) => revision,
+            SessionResult::Success(CommandResult::EditingStateRestored { revision, .. }) => {
+                revision
+            }
             result => panic!("restore failed: {result:?}"),
         };
         let hint = model_transition_hint(&session, buffer_id);
