@@ -3,9 +3,7 @@ use crate::session::{Session, SessionResult};
 use flavite_buffer::{BufferId, EditOp, Revision};
 pub use flavite_syntax::properties::ScalarValue;
 use flavite_syntax::{Span, TextByte};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Debug, Clone)]
 pub enum StructureEdit {
     Property { key: String, value: ScalarValue },

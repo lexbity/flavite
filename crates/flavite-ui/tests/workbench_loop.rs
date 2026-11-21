@@ -530,12 +530,20 @@ fn pair_activates_while_newer_frame_pending_and_insert_refuses() {
         .map(|(tab, _)| *tab)
         .expect("b tab");
     assert_eq!(
-        &*app.note_editor_view(b_tab).expect("b view").text.materialize(),
+        &*app
+            .note_editor_view(b_tab)
+            .expect("b view")
+            .text
+            .materialize(),
         "# B\n\nb body\n",
         "the double-click inserted nothing into the activated note"
     );
     assert_eq!(
-        &*app.note_editor_view(a_tab).expect("a view").text.materialize(),
+        &*app
+            .note_editor_view(a_tab)
+            .expect("a view")
+            .text
+            .materialize(),
         expected_a,
         "the writing note kept exactly its own edits"
     );

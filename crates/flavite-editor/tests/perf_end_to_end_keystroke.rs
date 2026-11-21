@@ -232,7 +232,8 @@ fn render_phases_ms() -> (f64, f64) {
         state.sync_shaped_for_perf(&edited_text, 2, viewport, width);
         shaping.push(start.elapsed());
         let start = Instant::now();
-        let painted = state.painted_line_count_for_perf(&edited_text, 2, viewport, width, paint_height);
+        let painted =
+            state.painted_line_count_for_perf(&edited_text, 2, viewport, width, paint_height);
         assert!(painted > 0, "paint collection paints lines");
         paint.push(start.elapsed());
     }

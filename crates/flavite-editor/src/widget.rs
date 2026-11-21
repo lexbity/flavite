@@ -2312,12 +2312,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         let local_buffer;
         let local_visible;
         let local_starts;
-        let shaped_view: ShapedView<'_> = if let Some(view) = state.cached_shaped_view(
-            &text,
-            self.view.revision,
-            state.viewport,
-            text_width,
-        ) {
+        let shaped_view: ShapedView<'_> = if let Some(view) =
+            state.cached_shaped_view(&text, self.view.revision, state.viewport, text_width)
+        {
             view
         } else {
             let (band_start, band_lines) =
@@ -2419,11 +2416,9 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
         {
             // The implicit-effect outline generalizes to every member before
             // a destructive invocation (FEUX-0002 X04, E-6).
-            for range in flavite_edit_context::effect::implicit_ranges(
-                &text,
-                visible_members,
-                command,
-            ) {
+            for range in
+                flavite_edit_context::effect::implicit_ranges(&text, visible_members, command)
+            {
                 for rect in command_preview_rects(
                     paint_text,
                     source_start,
@@ -3244,8 +3239,7 @@ impl<Message: 'static> Widget<Message, Theme, iced::Renderer> for EditorWidget<'
             let caret_byte = state.selections.caret();
             let viewport = state.viewport;
             let (x, y) = {
-                let shaped =
-                    state.sync_shaped(&text, self.view.revision, viewport, width);
+                let shaped = state.sync_shaped(&text, self.view.revision, viewport, width);
                 let runs = shaped.buffer.layout_runs().collect::<Vec<_>>();
                 let paint_offset = shaped.paint_offset(viewport);
                 let caret = caret_byte
@@ -4045,10 +4039,7 @@ mod tests {
             view.text = flavite_buffer::chunks::DocumentText::from(text);
             state.reconcile(&view, &HashMap::new());
             let text = view.text.materialize();
-            assert_eq!(
-                state.source_line_count(&text),
-                logical_line_count(&text)
-            );
+            assert_eq!(state.source_line_count(&text), logical_line_count(&text));
             for first_line in [0, 1, 3, 999] {
                 for lines in [0, 1, 3] {
                     let viewport = Viewport {

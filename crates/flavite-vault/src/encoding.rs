@@ -943,7 +943,13 @@ mod tests {
             &DecodeLimits::default(),
         );
         assert!(
-            matches!(&res, Resolution::NeedsChoice { reason: ChoiceReason::NulBearingContent { .. }, .. }),
+            matches!(
+                &res,
+                Resolution::NeedsChoice {
+                    reason: ChoiceReason::NulBearingContent { .. },
+                    ..
+                }
+            ),
             "tail NUL must still require an explicit choice, got {res:?}"
         );
     }

@@ -15,7 +15,13 @@ use flavite_vault::actor::VaultActorBuilder;
 use flavite_vault::channels::ChannelSet;
 use flavite_vault::session::{Session, SessionCommand, SessionResult};
 use std::path::PathBuf;
-fn fixture() -> (Flavite, u64, flavite_buffer::revision::Revision, PathBuf, tempfile::TempDir) {
+fn fixture() -> (
+    Flavite,
+    u64,
+    flavite_buffer::revision::Revision,
+    PathBuf,
+    tempfile::TempDir,
+) {
     let fs = flavite_fs::MemFs::new();
     let root = PathBuf::from("/test/s3json");
     fs.create_dir_all(&root).expect("vault root");
@@ -24,11 +30,8 @@ fn fixture() -> (Flavite, u64, flavite_buffer::revision::Revision, PathBuf, temp
     let cache = tempfile::tempdir().expect("fixture cache directory");
     let db = cache.path().join("s3json-index.sqlite3");
     drop(flavite_index::open_or_init(&db).expect("index database"));
-    let identity = flavite_api::VaultIdentity::new(
-        uuid::Uuid::now_v7(),
-        root.clone(),
-        vec![3, 3, 7],
-    );
+    let identity =
+        flavite_api::VaultIdentity::new(uuid::Uuid::now_v7(), root.clone(), vec![3, 3, 7]);
     let actor = VaultActorBuilder::new()
         .with_fs(Box::new(fs) as Box<dyn Fs + Send + Sync>)
         .with_identity(identity.clone())
@@ -61,8 +64,7 @@ fn fixture() -> (Flavite, u64, flavite_buffer::revision::Revision, PathBuf, temp
         }) => (buffer_id, revision),
         other => panic!("open failed: {other:?}"),
     };
-    let flavite = Flavite::open(identity, session, VaultConfig::default())
-        .expect("flavite facade");
+    let flavite = Flavite::open(identity, session, VaultConfig::default()).expect("flavite facade");
     (flavite, buffer_id.as_u64(), revision, root, cache)
 }
 
@@ -131,5 +133,16 @@ fn end_to_end_buffer_view_materializes_and_round_trips() {
     let obj = value.as_object().expect("object");
     let mut keys: Vec<&String> = obj.keys().collect();
     keys.sort();
-    assert_eq!(keys, vec!["base_hash", "buffer_id", "path", "revision", "source_format", "state", "text"]);
+    assert_eq!(
+        keys,
+        vec![
+            "base_hash",
+            "buffer_id",
+            "path",
+            "revision",
+            "source_format",
+            "state",
+            "text"
+        ]
+    );
 }

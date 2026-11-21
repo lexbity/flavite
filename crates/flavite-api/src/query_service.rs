@@ -731,8 +731,7 @@ fn execute_link_verdicts(
         Ok(source) => source,
         Err(_) => return ContextQueryResult::Updating,
     };
-    let Ok(parsed) =
-        flavite_syntax::pulldown_glue::parse_normalized(&source.text.materialize())
+    let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(&source.text.materialize())
     else {
         return ContextQueryResult::Failed {
             message: "Current note links are unavailable".into(),
@@ -814,7 +813,13 @@ fn inspect_occurrence(
                 Some(flavite_buffer::Revision::new(*revision)),
             )
             .ok()
-            .map(|s| (s.text.materialize().to_string(), occurrence.start, occurrence.end)),
+            .map(|s| {
+                (
+                    s.text.materialize().to_string(),
+                    occurrence.start,
+                    occurrence.end,
+                )
+            }),
         crate::OccurrenceSource::Saved { content_hash } => session
             .read_saved_note(&session.root().join(&occurrence.source_path))
             .ok()
@@ -1022,7 +1027,9 @@ fn execute_backlinks(
                     Some(flavite_buffer::Revision::new(*revision)),
                 )
                 .ok()
-                .and_then(|s| exact_excerpt(&s.text.materialize(), occurrence.start, occurrence.end)),
+                .and_then(|s| {
+                    exact_excerpt(&s.text.materialize(), occurrence.start, occurrence.end)
+                }),
             crate::OccurrenceSource::Saved { content_hash } => session
                 .read_saved_note(&session.root().join(&occurrence.source_path))
                 .ok()

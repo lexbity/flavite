@@ -121,13 +121,19 @@ fn implicit_preview_and_copy_preserve_committed_state_and_cut_uses_the_same_rang
             .len(),
         history.unwrap().entries.len()
     );
-    let effect = flavite_edit_context::effect::plan(&text.text.materialize(), (4, 4), Command::Cut).unwrap();
+    let effect =
+        flavite_edit_context::effect::plan(&text.text.materialize(), (4, 4), Command::Cut).unwrap();
     run(&mut f.app, tab, Command::Cut);
     // Clipboard ordering (§5.5): the scheduled clipboard write does not
     // delete the source. The deletion happens only after the write
     // completes and the seam revalidates the source (FEUX-0002 E-16).
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         text.text.materialize().as_ref(),
         "the cut must not delete before the clipboard write completed"
     );
@@ -185,7 +191,9 @@ fn preview_ownership_rejects_stale_sources_and_old_hover_exits() {
     assert_eq!(preview_command(&f.app, tab), Some(Command::Delete));
     assert!(effect_caption(&f.app, tab).is_none());
     let view = f.app.note_editor_view(tab).unwrap();
-    let effect = flavite_edit_context::effect::plan(&view.text.materialize(), (9, 9), Command::Delete).unwrap();
+    let effect =
+        flavite_edit_context::effect::plan(&view.text.materialize(), (9, 9), Command::Delete)
+            .unwrap();
     assert_eq!(effect.range, 7..9);
     run(&mut f.app, tab, Command::Delete);
     assert_eq!(
@@ -529,7 +537,8 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
         f.app
             .note_editor_view(tab)
             .unwrap()
-            .text.materialize()
+            .text
+            .materialize()
             .starts_with("Zone")
     );
     send(
@@ -538,13 +547,21 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
     );
     // Conversely, a key captured from TYPING is a command after Escape.
     send(&mut f.app, key(5, Code::KeyD, "d"));
-    assert!(f.app.note_editor_view(tab).unwrap().text.materialize().starts_with("Zne"));
+    assert!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .starts_with("Zne")
+    );
     send(&mut f.app, key(6, Code::KeyU, "u"));
     assert!(
         f.app
             .note_editor_view(tab)
             .unwrap()
-            .text.materialize()
+            .text
+            .materialize()
             .starts_with("Zone")
     );
     let before = f.app.note_editor_view(tab).unwrap();
@@ -564,7 +581,8 @@ fn queued_keys_resolve_current_mode_and_selection_without_waiting_for_redraw() {
         f.app
             .note_editor_view(tab)
             .unwrap()
-            .text.materialize()
+            .text
+            .materialize()
             .starts_with("Zdone"),
         "after Exit a stale command frame must type normally"
     );
@@ -676,7 +694,8 @@ fn composition_commit_acknowledges_caret_and_joins_the_explicit_typing_group() {
         f.app
             .note_editor_view(tab)
             .unwrap()
-            .text.materialize()
+            .text
+            .materialize()
             .starts_with("日本語雪one")
     );
     assert_eq!(
@@ -1138,7 +1157,8 @@ fn a_new_capture_is_admitted_while_its_duplicate_is_refused() {
         f.app
             .note_editor_view(tab)
             .unwrap()
-            .text.materialize()
+            .text
+            .materialize()
             .starts_with("Xone"),
         "the next capture acts"
     );
@@ -1310,7 +1330,12 @@ fn repeat_replays_change_with_typed_text() {
     let mut seq = f.app.workspace.tab(&tab).unwrap().interaction().sequence;
     press_key(&mut f.app, tab, Code::Period, ".", &mut seq);
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "one XYZ\nXYZ line\n"
     );
 

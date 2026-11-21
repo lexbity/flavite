@@ -243,7 +243,15 @@ fn replace_regex_previews_exact_totals_and_commits_through_the_kernel() {
     assert_eq!(preview.spans.len(), 3);
 
     // The preview never mutates.
-    assert_eq!(f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(), BODY);
+    assert_eq!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
+        BODY
+    );
 
     // Enter: fresh plan → kernel commit → draft closes, text replaces.
     let _ = f
@@ -251,7 +259,12 @@ fn replace_regex_previews_exact_totals_and_commits_through_the_kernel() {
         .update(Message::CommandArgs(CommandArgsMessage::Apply(tab)));
     pump_until(&mut f.app, |app| !app.command_args.tabs.contains_key(&tab));
     assert_eq!(
-        f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(),
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
         "one [1]\ntwo [2]\nthree [3]\n"
     );
     let view = f.app.note_editor_view(tab).unwrap();
@@ -273,7 +286,15 @@ fn replace_regex_preview_works_in_a_read_only_vault_and_commit_is_refused() {
 
     // The preview still computes (text.replace_plan is ReadNotes).
     pump_preview(&mut f.app, tab, |_| true);
-    assert_eq!(f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(), BODY);
+    assert_eq!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
+        BODY
+    );
 
     // Enter refuses with the vault state; the draft stays open and the text
     // is untouched.
@@ -290,5 +311,13 @@ fn replace_regex_preview_works_in_a_read_only_vault_and_commit_is_refused() {
         f.app.command_args.tabs.contains_key(&tab),
         "the draft stays open on refusal"
     );
-    assert_eq!(f.app.note_editor_view(tab).unwrap().text.materialize().as_ref(), BODY);
+    assert_eq!(
+        f.app
+            .note_editor_view(tab)
+            .unwrap()
+            .text
+            .materialize()
+            .as_ref(),
+        BODY
+    );
 }

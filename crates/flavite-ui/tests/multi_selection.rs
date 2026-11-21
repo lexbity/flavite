@@ -231,7 +231,10 @@ fn cut_collapses_every_member_and_a_stale_target_is_a_zero_effect_refusal() {
         }));
 
     // D-11 cut of two carets takes each containing line including its break.
-    assert_eq!(&*f.app.note_editor_view(tab).unwrap().text.materialize(), "third row\n");
+    assert_eq!(
+        &*f.app.note_editor_view(tab).unwrap().text.materialize(),
+        "third row\n"
+    );
 
     // Replaying the stale target through the revalidated seam is a
     // zero-effect refusal: the source no longer matches the capture.

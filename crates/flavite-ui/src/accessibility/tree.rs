@@ -1154,8 +1154,11 @@ pub fn shell_tree(app: &App) -> TreeUpdate {
         let mut node = Node::new(Role::Button);
         if let NodeTarget::EditorContextCommand { target, command } = &control.target
             && let Some(view) = app.note_editor_view(target.tab)
-            && let Some(effect) =
-                flavite_edit_context::effect::plan(&view.text.materialize(), target.selection, *command)
+            && let Some(effect) = flavite_edit_context::effect::plan(
+                &view.text.materialize(),
+                target.selection,
+                *command,
+            )
         {
             node.set_description(effect.accessible_description());
         }

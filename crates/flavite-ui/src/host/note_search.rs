@@ -868,9 +868,9 @@ fn navigate(app: &mut App, tab: TabId) {
     let Some(&(at, end)) = cached.spans.get(find.index) else {
         return;
     };
-    let _ = app
-        .workspace
-        .set_display_selection(tab, at, end, view.revision, &view.text.materialize());
+    let _ =
+        app.workspace
+            .set_display_selection(tab, at, end, view.revision, &view.text.materialize());
     app.reading.pending_anchor.insert(tab, at);
 }
 

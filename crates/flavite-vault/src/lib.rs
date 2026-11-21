@@ -8,6 +8,7 @@
 //! index, with per-path save watermarks guarding against stale scan results.
 
 pub mod actor;
+pub mod autosave;
 pub mod channels;
 pub mod coalesce;
 pub mod editor_receipts;

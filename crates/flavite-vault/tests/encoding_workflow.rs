@@ -366,7 +366,10 @@ fn reopen_encoding_refuses_dirty_buffer() {
         .session
         .shared_buffer_snapshot(buffer_id, None)
         .expect("snapshot");
-    assert_eq!(snapshot.text.materialize().to_string(), "draft saved base\n");
+    assert_eq!(
+        snapshot.text.materialize().to_string(),
+        "draft saved base\n"
+    );
     let view = h.session.encoding_hints();
     assert!(
         !view

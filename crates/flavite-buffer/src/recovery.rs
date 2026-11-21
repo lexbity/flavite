@@ -1585,3 +1585,124 @@ mod tests {
         assert_eq!(writer.interval(), Duration::ZERO);
     }
 }
+
+// --- RFC-0011 S7-T2: recovery correctness under staged roots ---
+
+/// The staged capture path (StagedRecovery::from_buffer → from_staged)
+/// must produce byte-identical recovery files to the eager path
+/// (from_buffer) for the same buffer state. This is the fidelity
+/// contract of the O(1) under-lock capture: whatever the worker writes
+/// is exactly what the synchronous path would have written.
+#[test]
+fn staged_recovery_matches_eager_byte_for_byte() {
+    use flavite_syntax::text::TextSnapshot;
+    let fixtures: [&[u8]; 4] = [
+        b"hello\nworld",
+        b"",
+        b"a\r\nb\r\nc",
+        &b"draft ".repeat(128 * 1024),
+    ];
+    for text in fixtures {
+        let buffer = Buffer::from_snapshot(TextSnapshot::new(text).unwrap());
+        let eager = RecoveryFile::from_buffer(&buffer, 3, false);
+        let staged = RecoveryFile::from_staged(StagedRecovery::from_buffer(&buffer), 3, false);
+        assert_eq!(
+            eager.to_bytes(),
+            staged.to_bytes(),
+            "staged/eager bytes diverged for {}-byte text",
+            text.len()
+        );
+        assert_eq!(eager.text, staged.text);
+        assert_eq!(eager.source_len, staged.source_len);
+        assert_eq!(eager.content_hash, staged.content_hash);
+        assert_eq!(eager.encoded, staged.encoded);
+    }
+}
+
+/// A crash mid-write (torn destination file) must never surface as a
+/// valid recovery; the next staged write heals the note's recovery to
+/// the exact draft bytes, and restoration through the recovery file
+/// lands the edited content byte-for-byte.
+#[test]
+fn staged_recovery_torn_write_is_rejected_and_rewrite_heals() {
+    use flavite_syntax::text::TextSnapshot;
+    let dir = tempfile::tempdir().unwrap();
+    let config = RecoveryConfig::new("s7".into(), dir.path().to_path_buf(), 0);
+    let mut writer = RecoveryWriter::new(config.clone());
+    let note_key = b"notes/s7.md";
+    let draft = b"draft ".repeat(128 * 1024); // 768 KiB
+
+    // Staged write of a dirty 768 KiB draft.
+    let buffer = Buffer::from_snapshot(TextSnapshot::new(&draft).unwrap());
+    let staged = StagedRecovery::from_buffer(&buffer);
+    let path = writer
+        .write_snapshot_now(note_key, RecoveryFile::from_staged(staged, 0, false))
+        .expect("staged write must persist");
+    let good = writer
+        .read_for_note_key(note_key)
+        .expect("good recovery readable");
+    assert_eq!(good.text.len(), draft.len());
+
+    // Crash mid-write: tear the destination file (a real crash before
+    // the atomic rename leaves exactly this shape — partial bytes where
+    // the new snapshot was being written).
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(
+        writer.read_recovery_file(&path).is_none(),
+        "torn recovery file must be rejected, never partially restored"
+    );
+    assert!(writer.read_for_note_key(note_key).is_none());
+
+    // The next staged write heals the note's recovery byte-exactly.
+    let buffer2 = Buffer::from_snapshot(TextSnapshot::new(&draft).unwrap());
+    let staged2 = StagedRecovery::from_buffer(&buffer2);
+    writer
+        .write_snapshot_now(note_key, RecoveryFile::from_staged(staged2, 0, false))
+        .expect("healing staged write");
+    let healed = writer.read_for_note_key(note_key).expect("healed recovery");
+    assert_eq!(healed.text, String::from_utf8(draft.clone()).unwrap());
+    assert_eq!(healed.to_source_bytes().unwrap(), draft);
+}
+
+/// Last-good survivorship across staged writes: the newest staged
+/// snapshot wins, an older one never regresses it, and the newer
+/// snapshot (not the older) is what restore reads after the series.
+#[test]
+fn staged_recovery_newest_wins_and_no_regression() {
+    use flavite_syntax::text::TextSnapshot;
+    let dir = tempfile::tempdir().unwrap();
+    let config = RecoveryConfig::new("s7".into(), dir.path().to_path_buf(), 0);
+    let mut writer = RecoveryWriter::new(config.clone());
+    let note_key = b"notes/s7-last-good.md";
+    let buffer_id = BufferId::new();
+
+    let write_staged = |writer: &mut RecoveryWriter, text: &str, rev: u64| {
+        let buffer = Buffer::from_snapshot(TextSnapshot::new(text.as_bytes()).unwrap());
+        let mut file = RecoveryFile::from_staged(StagedRecovery::from_buffer(&buffer), 0, false);
+        file.header.buffer_id = buffer_id;
+        file.header.revision = Revision::new(rev);
+        let written = writer.write_snapshot_now(note_key, file);
+        assert!(written.is_some(), "staged snapshot rev {rev} persisted");
+    };
+    write_staged(&mut writer, "draft one", 3);
+    write_staged(&mut writer, "draft two", 8);
+
+    let latest = writer.read_for_note_key(note_key).expect("newest snapshot");
+    assert_eq!(latest.header.revision, Revision::new(8));
+    assert_eq!(latest.text, "draft two");
+
+    // A stale staged snapshot (revision 4) must be refused outright — it
+    // must never regress the preserved revision-8 record.
+    let buffer = Buffer::from_snapshot(TextSnapshot::new(b"stale draft").unwrap());
+    let mut stale = RecoveryFile::from_staged(StagedRecovery::from_buffer(&buffer), 0, false);
+    stale.header.buffer_id = buffer_id;
+    stale.header.revision = Revision::new(4);
+    assert!(
+        writer.write_snapshot_now(note_key, stale).is_none(),
+        "stale staged snapshot must be refused"
+    );
+    let still_latest = writer.read_for_note_key(note_key).expect("still newest");
+    assert_eq!(still_latest.header.revision, Revision::new(8));
+    assert_eq!(still_latest.text, "draft two");
+}

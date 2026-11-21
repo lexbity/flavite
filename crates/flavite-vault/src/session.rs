@@ -1156,6 +1156,15 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+// Thread-local accumulator for buffer-manager lock waits on the session turn
+// (RFC-0011 S7 instrumentation). `Session::execute` resets it before the
+// turn body and records the sum onto the `edit.lock_wait` span as the
+// `buffer_manager_wait` field. No allocation, no behavioral change.
+thread_local! {
+    static BUFFER_MANAGER_WAIT_US: std::cell::Cell<u128> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// The Session itself.
 ///
 /// This is the headless core that owns BufferManager and coordinates
@@ -1205,6 +1214,14 @@ pub struct Session {
     autosave_failures_total: AtomicU64,
     /// Save requests admitted by autosave, so asynchronous failures are counted too.
     autosave_requests: Mutex<HashSet<u64>>,
+    /// Autosave staging (RFC-0011 S7): the pump captures O(1) staged
+    /// snapshots under the turn and a dedicated worker materializes/encodes
+    /// them off the turn. The UI pump never serializes a document.
+    autosave_jobs: Option<crossbeam::channel::Sender<crate::autosave::StagedAutosave>>,
+    /// Completed off-turn serializations, drained by the host pump.
+    autosave_results: crossbeam::channel::Receiver<crate::autosave::AutosaveWork>,
+    /// The autosave worker's join handle.
+    autosave_worker: Option<std::thread::JoinHandle<()>>,
     /// Paths that were absent when opened; creation uses an absent-file guard.
     absent_on_open: Arc<Mutex<HashSet<PathBuf>>>,
     /// Dirty-buffer recovery checkpoints. The host schedules `recovery_tick`
@@ -1716,7 +1733,10 @@ impl Session {
                             .map(|(path, buffer)| {
                                 (
                                     native_note_key(path, &root),
-                                    buffer.base_bytes().to_vec(),
+                                    // O(1) Arc clone of the merge base under
+                                    // the lock; the Vec copy for pinning
+                                    // happens below, off the lock.
+                                    buffer.base_bytes_shared(),
                                     // O(1) staged capture under the lock;
                                     // full serialization happens below, off
                                     // the lock (RFC-0011 S3/T14).
@@ -1726,10 +1746,15 @@ impl Session {
                             .collect::<Vec<_>>();
                         drop(buffer_manager);
                         for (key, base, staged) in dirty {
-                            let snapshot =
-                                flavite_buffer::recovery::RecoveryFile::from_staged(staged, 0, false);
+                            let snapshot = flavite_buffer::recovery::RecoveryFile::from_staged(
+                                staged, 0, false,
+                            );
                             let due = writer.lock_recovering().should_write_snapshot(&snapshot);
-                            if due && actor.pin_merge_base(key.clone(), base).is_ok() {
+                            if due
+                                && actor
+                                    .pin_merge_base(key.clone(), base.as_ref().to_vec())
+                                    .is_ok()
+                            {
                                 writer.lock_recovering().write_snapshot(&key, snapshot);
                             }
                         }
@@ -1738,6 +1763,36 @@ impl Session {
                 })
                 .expect("recovery worker thread creation failed")
         });
+        // RFC-0011 S7: the autosave worker. The host pump captures O(1)
+        // staged snapshots under the turn; this thread materializes and
+        // encodes them (full serialization) off the turn so the UI pump
+        // never serializes a document.
+        let (autosave_jobs, autosave_results, autosave_worker) = {
+            let (jobs, receiver) =
+                crossbeam::channel::bounded::<crate::autosave::StagedAutosave>(64);
+            let (sender, results) =
+                crossbeam::channel::bounded::<crate::autosave::AutosaveWork>(64);
+            let worker = std::thread::Builder::new()
+                .name("vault-autosave".into())
+                .spawn(move || {
+                    while let Ok(staged) = receiver.recv() {
+                        // Contain a worker panic: a panicked serialization
+                        // must never silently drop an admitted autosave —
+                        // it surfaces as a recorded failure on the next
+                        // pump (the draft stays dirty and recoverable).
+                        let path = staged.path.clone();
+                        let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            crate::autosave::run_autosave_work(staged)
+                        }))
+                        .unwrap_or(crate::autosave::AutosaveWork::Panicked { path });
+                        if sender.send(work).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("autosave worker thread creation failed");
+            (Some(jobs), results, Some(worker))
+        };
         let (open_job_sender, open_job_receiver) = crossbeam::channel::unbounded::<OpenJob>();
         let (open_result_sender, open_result_receiver) =
             crossbeam::channel::unbounded::<OpenRead>();
@@ -2167,6 +2222,9 @@ impl Session {
             shared_snapshots: Mutex::new(HashMap::new()),
             autosave_failures_total: AtomicU64::new(0),
             autosave_requests: Mutex::new(HashSet::new()),
+            autosave_jobs,
+            autosave_results,
+            autosave_worker,
             absent_on_open: Arc::new(Mutex::new(HashSet::new())),
             recovery_writer,
             recovery_worker,
@@ -2248,6 +2306,16 @@ impl Session {
         self.request_counter.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Acquire the buffer-manager lock, timing the wait into the thread-local
+    /// accumulator emitted on the `edit.lock_wait` span by [`Session::execute`]
+    /// (RFC-0011 S7 instrumentation — no behavioral change).
+    fn lock_buffer_manager(&self) -> std::sync::MutexGuard<'_, BufferManager> {
+        let started = std::time::Instant::now();
+        let guard = self.buffer_manager.lock_recovering();
+        BUFFER_MANAGER_WAIT_US.with(|cell| cell.set(cell.get() + started.elapsed().as_micros()));
+        guard
+    }
+
     /// Execute a command.
     ///
     /// The turn body runs inside an unwinding-catch boundary: a panic in a
@@ -2262,9 +2330,15 @@ impl Session {
     pub fn execute(&self, command: SessionCommand) -> SessionResult {
         // RFC-0008 S1 (FR-10): the keystroke turn's `driving_turn` acquire.
         // The span covers the lock wait and records its duration into the
-        // `wait_us` field when the span closes.
+        // `wait_us` field when the span closes; `buffer_manager_wait`
+        // accumulates the buffer-manager lock waits of the turn body
+        // (RFC-0011 S7).
         let lock_started = std::time::Instant::now();
-        let lock_wait = tracing::info_span!("edit.lock_wait", wait_us = tracing::field::Empty);
+        let lock_wait = tracing::info_span!(
+            "edit.lock_wait",
+            wait_us = tracing::field::Empty,
+            buffer_manager_wait = tracing::field::Empty
+        );
         let _turn = lock_wait.in_scope(|| self.driving_turn.lock_recovering());
         lock_wait.record("wait_us", lock_started.elapsed().as_micros());
         let activation = match &command {
@@ -2343,6 +2417,7 @@ impl Session {
                 return result;
             }
         }
+        BUFFER_MANAGER_WAIT_US.with(|cell| cell.set(0));
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.execute_turn(command)
         })) {
@@ -2405,6 +2480,12 @@ impl Session {
                 .lock_recovering()
                 .record_receipt(&op, &result);
         }
+        // RFC-0011 S7: emit the accumulated buffer-manager lock wait of the
+        // turn body onto the lock-wait span (instrumentation only).
+        lock_wait.record(
+            "buffer_manager_wait",
+            BUFFER_MANAGER_WAIT_US.with(|cell| cell.get()),
+        );
         result
     }
 
@@ -2449,11 +2530,9 @@ impl Session {
             | SessionCommand::ApplyEdits { buffer_id, .. }
             | SessionCommand::RestoreEditingState { buffer_id, .. }
             | SessionCommand::Undo { buffer_id, .. }
-            | SessionCommand::Redo { buffer_id, .. } => self
-                .buffer_manager
-                .lock_recovering()
-                .path_for_id(*buffer_id)
-                .cloned(),
+            | SessionCommand::Redo { buffer_id, .. } => {
+                self.lock_buffer_manager().path_for_id(*buffer_id).cloned()
+            }
             SessionCommand::LinkInsert { intent, plan_id }
             | SessionCommand::LinkRemove { intent, plan_id } => {
                 let source = self
@@ -2608,6 +2687,19 @@ impl Session {
     }
 
     fn pump_autosave(&self) {
+        let Some(jobs) = &self.autosave_jobs else {
+            return;
+        };
+        // 1. Drain completed off-turn serializations first: admit them to
+        //    the actor exactly as a synchronous autosave would be, before
+        //    staging this tick's captures (so flight admission is visible
+        //    to the per-buffer in-flight guard below).
+        while let Ok(work) = self.autosave_results.try_recv() {
+            self.finish_autosave_work(work);
+        }
+        // 2. Stage due buffers under the turn. The capture is O(1) (Arc
+        //    clones); the full materialization/serialization runs on the
+        //    autosave worker (RFC-0011 S7 — the UI pump never encodes).
         let now = std::time::Instant::now();
         let dirty = self
             .buffer_manager
@@ -2636,16 +2728,133 @@ impl Session {
             {
                 continue;
             }
+            let staged = {
+                let key = native_note_key(&path, &self.identity.root);
+                let absent = self.absent_on_open.lock_recovering().contains(&path);
+                let mut manager = self.buffer_manager.lock_recovering();
+                let Some(buffer) = manager.get_buffer_by_id_mut(buffer_id) else {
+                    continue;
+                };
+                // Keep the same boundary discipline as a synchronous save:
+                // seal the undo group before the durable snapshot is staged.
+                buffer.model_mut().seal_undo_group();
+                let precondition = if absent {
+                    DiskPrecondition::Absent
+                } else if let Some(hash) = buffer.base_hash() {
+                    DiskPrecondition::Existing(hash.as_bytes())
+                } else {
+                    // No disk base; explicit create resolution is required
+                    // (the same refusal as save_note). Leave the revision
+                    // unmarked so a later state change can retry.
+                    continue;
+                };
+                crate::autosave::StagedAutosave {
+                    request_id: self.next_request_id(),
+                    path: path.clone(),
+                    note_key: key,
+                    buffer_id: buffer_id.as_u64(),
+                    revision: revision.as_u64(),
+                    version: Arc::clone(buffer.model().version_state()),
+                    base_hash: buffer.base_hash(),
+                    merge_base: buffer.base_bytes_shared(),
+                    precondition,
+                }
+            };
+            // Backpressure: if the worker is backlogged, skip this tick
+            // WITHOUT marking the revision attempted, so the next pump
+            // retries once the queue drains.
+            if jobs.try_send(staged).is_err() {
+                continue;
+            }
             self.autosave_attempted
                 .lock_recovering()
                 .insert(path.clone(), revision);
-            let result = self.save_note(path.clone());
-            match result {
-                SessionResult::Pending { request_id } => {
-                    self.autosave_requests.lock_recovering().insert(request_id);
+        }
+    }
+
+    /// Admit a completed off-turn autosave serialization: persist the
+    /// format-binding intent when needed, submit the request to the actor,
+    /// and record/notice failures. Runs on the host pump (single writer to
+    /// session state); all heavy work happened on the worker.
+    fn finish_autosave_work(&self, work: crate::autosave::AutosaveWork) {
+        match work {
+            crate::autosave::AutosaveWork::EncodeRefused { path, code, data } => {
+                // Surface the same typed actionable error a synchronous save
+                // would (strict-ASCII draft / output-limit refusal).
+                self.notice.send(crate::channels::Notice::ActionRequired {
+                    code,
+                    note: Some(flavite_buffer::manager::NoteRef::new(path.clone())),
+                });
+                let failure = SessionResult::ActionRequired { code, data };
+                self.record_autosave_failure(&path, &failure);
+            }
+            crate::autosave::AutosaveWork::Panicked { path } => {
+                tracing::error!(path = %path.display(), "autosave serialization panicked on the worker");
+                let failure = SessionResult::Error {
+                    message: "autosave serialization panicked on the worker".into(),
+                };
+                self.record_autosave_failure(&path, &failure);
+            }
+            crate::autosave::AutosaveWork::Ready {
+                request,
+                needs_hint,
+                leading_signature,
+                nul_content,
+                base_hash,
+                source_format,
+            } => {
+                if needs_hint {
+                    let hex_key = hex::encode(&request.note_key);
+                    let intent = crate::encoding::BindingIntent {
+                        native_key: hex_key.clone(),
+                        old_raw_hash: base_hash.map(|hash| hash.as_bytes()).unwrap_or([0u8; 32]),
+                        output_raw_hash: *blake3::hash(&request.bytes).as_bytes(),
+                        encoding: source_format.encoding(),
+                        bom: source_format.bom(),
+                        preserve_leading_signature: leading_signature && !source_format.bom(),
+                        nul_content_confirmed: nul_content,
+                    };
+                    if let Err(error) = self.encoding_hints.update(|record| {
+                        record.intents.insert(hex_key, intent);
+                    }) {
+                        tracing::warn!(path = %request.path.display(), ?error, "format-binding intent refused");
+                        self.record_autosave_failure(
+                            &request.path,
+                            &SessionResult::ActionRequired {
+                                code: crate::encoding::HINT_UNAVAILABLE_CODE,
+                                data: None,
+                            },
+                        );
+                        return;
+                    }
                 }
-                SessionResult::Success(_) => {}
-                failure => self.record_autosave_failure(&path, &failure),
+                // Track the admitted request so a completion failure is
+                // counted as an autosave failure (pump_save_completions).
+                // Inserted only after a successful submit — a request that
+                // never reached the actor leaves no set entry behind.
+                match self.actor.submit_save(request.clone()) {
+                    Ok(response) => {
+                        self.autosave_requests
+                            .lock_recovering()
+                            .insert(request.request_id);
+                        self.save_flights.lock_recovering().insert(
+                            request.buffer_id,
+                            SaveFlight {
+                                request,
+                                response,
+                                queued: None,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.record_autosave_failure(
+                            &request.path,
+                            &SessionResult::Error {
+                                message: error.to_string(),
+                            },
+                        );
+                    }
+                }
             }
         }
     }
@@ -6525,7 +6734,7 @@ impl Session {
         // is enabled — never on the quiet path.
         let _session_turn =
             tracing::info_span!("edit.session_turn", ?buffer_id, ?revision).entered();
-        let mut buffer_manager = self.buffer_manager.lock_recovering();
+        let mut buffer_manager = self.lock_buffer_manager();
         if let Some(path) = buffer_manager.path_for_id(buffer_id)
             && self.leased_by_replace(path)
         {
@@ -7111,7 +7320,7 @@ impl Session {
         revision: Revision,
         target: flavite_buffer::history::HistoryTarget,
     ) -> SessionResult {
-        let mut manager = self.buffer_manager.lock_recovering();
+        let mut manager = self.lock_buffer_manager();
         if manager
             .path_for_id(buffer_id)
             .is_some_and(|path| self.leased_by_replace(path))
@@ -7151,7 +7360,7 @@ impl Session {
     }
 
     fn undo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
-        let mut buffer_manager = self.buffer_manager.lock_recovering();
+        let mut buffer_manager = self.lock_buffer_manager();
         if buffer_manager
             .path_for_id(buffer_id)
             .is_some_and(|path| self.leased_by_replace(path))
@@ -7205,7 +7414,7 @@ impl Session {
 
     /// Redo an edit.
     fn redo(&self, buffer_id: BufferId, revision: Revision) -> SessionResult {
-        let mut buffer_manager = self.buffer_manager.lock_recovering();
+        let mut buffer_manager = self.lock_buffer_manager();
         if buffer_manager
             .path_for_id(buffer_id)
             .is_some_and(|path| self.leased_by_replace(path))
@@ -8175,7 +8384,9 @@ impl Session {
             .map(|(path, buffer)| {
                 (
                     native_note_key(path, &self.identity.root),
-                    buffer.base_bytes().to_vec(),
+                    // O(1) Arc clone under the lock; the Vec copy for
+                    // pinning happens below, off the lock (RFC-0011 S7).
+                    buffer.base_bytes_shared(),
                     // O(1) staged capture under the lock; serialization
                     // happens below, off the lock (RFC-0011 S3/T14).
                     StagedRecovery::from_buffer(buffer),
@@ -8188,7 +8399,10 @@ impl Session {
             let snapshot = flavite_buffer::recovery::RecoveryFile::from_staged(staged, 0, false);
             let due = writer.lock_recovering().should_write_snapshot(&snapshot);
             if due
-                && self.actor.pin_merge_base(key.clone(), base).is_ok()
+                && self
+                    .actor
+                    .pin_merge_base(key.clone(), base.as_ref().to_vec())
+                    .is_ok()
                 && let Some(path) = writer.lock_recovering().write_snapshot(&key, snapshot)
             {
                 written.push(path);
@@ -8209,7 +8423,9 @@ impl Session {
                 .map(|(path, buffer)| {
                     (
                         native_note_key(path, &self.identity.root),
-                        buffer.base_bytes().to_vec(),
+                        // O(1) Arc clone under the lock; the Vec copy for
+                        // pinning happens below, off the lock (RFC-0011 S7).
+                        buffer.base_bytes_shared(),
                         // O(1) staged capture under the lock; serialization
                         // happens below, off the lock (RFC-0011 S3/T14).
                         StagedRecovery::from_buffer(buffer),
@@ -8227,7 +8443,7 @@ impl Session {
         for (key, base, staged) in snapshots {
             let snapshot = flavite_buffer::recovery::RecoveryFile::from_staged(staged, 0, false);
             self.actor
-                .pin_merge_base(key.clone(), base)
+                .pin_merge_base(key.clone(), base.as_ref().to_vec())
                 .map_err(|error| format!("could not persist recovery merge base: {error}"))?;
             writer
                 .lock_recovering()
@@ -8343,6 +8559,14 @@ impl Drop for Session {
         }
         self.recovery_stop.store(true, Ordering::Release);
         if let Some(worker) = self.recovery_worker.take() {
+            let _ = worker.join();
+        }
+        // Close the autosave job channel: the worker drains the queue, then
+        // exits when recv() fails (RFC-0011 S7).
+        if let Some(jobs) = self.autosave_jobs.take() {
+            drop(jobs);
+        }
+        if let Some(worker) = self.autosave_worker.take() {
             let _ = worker.join();
         }
     }
@@ -11293,7 +11517,10 @@ mod tests {
 
     /// The hint the model's own last-transition ops imply (the rule the
     /// cache fill uses for undo/redo/restore transitions).
-    fn model_transition_hint(session: &Session, buffer_id: BufferId) -> Option<flavite_syntax::EditRange> {
+    fn model_transition_hint(
+        session: &Session,
+        buffer_id: BufferId,
+    ) -> Option<flavite_syntax::EditRange> {
         let manager_arc = session.buffer_manager();
         let manager = manager_arc.lock().unwrap();
         let ops = manager
@@ -11487,7 +11714,9 @@ mod tests {
                 .issue_editor_operation(buffer_id, undone2, None)
                 .expect("fixture activation"),
         }) {
-            SessionResult::Success(CommandResult::EditingStateRestored { revision, .. }) => revision,
+            SessionResult::Success(CommandResult::EditingStateRestored { revision, .. }) => {
+                revision
+            }
             result => panic!("restore failed: {result:?}"),
         };
         let hint = model_transition_hint(&session, buffer_id);
