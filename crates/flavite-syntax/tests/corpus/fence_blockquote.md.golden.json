@@ -1,0 +1,33 @@
+{
+  "links": [
+    {
+      "start": 15,
+      "end": 21,
+      "target_raw": "q1",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    },
+    {
+      "start": 101,
+      "end": 107,
+      "target_raw": "q2",
+      "alias": null,
+      "anchor": null,
+      "is_embed": false,
+      "by_id": false
+    }
+  ],
+  "tags": [
+    [
+      22,
+      29
+    ],
+    [
+      108,
+      115
+    ]
+  ],
+  "block_ids": []
+}

@@ -639,11 +639,11 @@ impl<'a, Message> EditorWidget<'a, Message> {
 /// the paged-buffer RFC inherits.
 pub(crate) const HUGE_TEXT_THRESHOLD: usize = 64 * 1024 * 1024;
 
-/// The pulldown bridge: the shipped default structure source (RFC-0008
-/// Appendix C). Same parser and converter that the pre-RFC whole-document
-/// scanning path used — parity-proven against the tree-sitter path (AC-5)
-/// — so default routing preserves known-good spans and latency at every
-/// document size under the plain-mode gate.
+/// The pulldown bridge: the whole-document structure reference (RFC-0008
+/// Appendix C), retained as the parity oracle and the test/bench seam. The
+/// widget's typing path does not use it anymore — RFC-0011 S5 routes
+/// through the segment cache ([`EditorState::segment`]); the bridge remains
+/// the semantics record the segment cache is verified against.
 fn bridge_structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
     let Ok(parsed) = flavite_syntax::pulldown_glue::parse_normalized(text) else {
         return (Vec::new(), Vec::new());
@@ -667,41 +667,6 @@ fn engine_structure_spans(
         Ok(spans) => crate::links::spans_from_structure(spans),
         Err(_) => bridge_structure_spans(text),
     }
-}
-
-/// Produce the structure spans for a revision change (RFC-0008 S7/S8,
-/// RFC-0011 S4):
-///
-/// * **Plain mode** (FR-9): documents ≥ [`HUGE_TEXT_THRESHOLD`] skip all
-///   markdown parsing — no pulldown, no tree-sitter, no spans. Editing,
-///   undo, find, and save are unaffected.
-/// * **Default**: the pulldown bridge ([`bridge_structure_spans`]) — the
-///   pre-RFC-equivalent structure source, at every size under the plain
-///   gate.
-///
-/// RFC-0011 S4: the tree-sitter engine is no longer routed here (its
-/// incremental reparses do not localize — RFC-0008 Appendix C measured —
-/// and it is retired in S6). The bridge is the transitional whole-document
-/// producer until the segment cache lands in S5; S4 keeps this phase at
-/// exactly the shipped HEAD cost (one O(n) parse per revision below the
-/// plain gate) — `// S5 removes the last O(n) keystroke cost` marks the
-/// call site in [`EditorState::reconcile_view`].
-fn structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
-    if text.len() >= HUGE_TEXT_THRESHOLD {
-        (Vec::new(), Vec::new())
-    } else {
-        bridge_structure_spans(text)
-    }
-}
-
-/// Test seam for the end-to-end keystroke bench (S8-T5): runs the exact
-/// same dispatch the widget uses on a revision change — plain-mode gate,
-/// pulldown bridge. Public only so `tests/` integration benches can measure
-/// the shipped configuration; not part of the editor's public API surface.
-#[doc(hidden)]
-#[must_use]
-pub fn structure_spans_for_perf(text: &str) -> (Vec<LinkSpan>, Vec<flavite_syntax::ScannedSpan>) {
-    structure_spans(text)
 }
 
 /// Test seam for the S8-T5 bench: the engine path, measured directly and
@@ -735,13 +700,23 @@ pub struct EditorState {
     revision: Option<u64>,
     link_spans: Vec<LinkSpan>,
     decorations: Vec<flavite_syntax::ScannedSpan>,
-    /// One materialized copy per view revision, shared by the structure
-    /// bridge (RFC-0011 S4 transitional — S5 removes it) and the user-paced
+    /// Structure source (RFC-0011 S5): the segment-scoped cache owned here,
+    /// defined in flavite-syntax. It consumes the shared `StructureText`
+    /// seam (implemented by `DocumentText`), so the widget never links
+    /// tree-sitter or depends on the whole-document bridge on the typing
+    /// path.
+    segment: flavite_syntax::segment::SegmentIndex,
+    /// Whether the D10 degradation warning has been emitted for this widget
+    /// instance: the segment cache warns once at `warn` when it degrades to
+    /// plain mode after repeated sync failures (spans dropped for the
+    /// session).
+    segment_plain_warned: bool,
+    /// One materialized copy per view revision, shared by the user-paced
     /// interaction paths (selection/word-bound/autocomplete APIs that take
     /// `&str`). It is populated lazily, never on the plain-mode typing
-    /// path; all shaping, line geometry, and paint queries go to the tree.
-    /// `RefCell` so the read-only frame paths (`draw`) share the cache with
-    /// the mutations (`layout`, `update`).
+    /// path; all shaping, line geometry, structure, and paint queries go to
+    /// the tree. `RefCell` so the read-only frame paths (`draw`) share the
+    /// cache with the mutations (`layout`, `update`).
     materialized_text: std::cell::RefCell<Option<(u64, std::sync::Arc<str>)>>,
     resolutions_present: bool,
     resolution_snapshot: Option<Arc<HashMap<String, LinkResolution>>>,
@@ -1707,22 +1682,47 @@ impl EditorState {
         self.buffer_id = Some(view.buffer_id);
         if self.revision != Some(view.revision) {
             // RFC-0008 S1 (FR-10): the structure-parse phase (`render.scan`).
-            // RFC-0011 S4: the full-document line-index build is gone; the
-            // structure routing is plain-gate → pulldown bridge. Below the
-            // gate the bridge runs over ONE materialized copy per revision
-            // (transitional — the segment cache in S5 replaces this phase).
-            let _scan_span =
-                tracing::info_span!("render.scan", doc_len = view.text.len()).entered();
-            if view.text.len() < HUGE_TEXT_THRESHOLD {
-                // S5 removes the last O(n) keystroke cost.
-                let text = self.materialized_text(view);
-                let (link_spans, decorations) = structure_spans(&text);
+            // RFC-0011 S5: the segment cache replaces the whole-document
+            // bridge — the last O(n) keystroke cost is gone. The plain-mode
+            // gate runs first (unchanged): ≥ HUGE_TEXT_THRESHOLD documents do
+            // zero structure work and zero materialization. Below the gate
+            // the cache syncs incrementally (O(segment + tail)) and produces
+            // byte-identical spans to the bridge.
+            let report = if view.text.len() < HUGE_TEXT_THRESHOLD {
+                Some(self.segment.sync(&view.text, view.last_edit))
+            } else {
+                self.segment_plain_warned = false;
+                None
+            };
+            let _scan_span = tracing::info_span!(
+                "render.scan",
+                doc_len = view.text.len(),
+                segments_rebuilt = report.map_or(0, |r| r.rebuilt_segments)
+            )
+            .entered();
+            if let Some(_report) = report
+                && !self.segment.is_degraded()
+            {
+                let (links, tags, block_ids) = self.segment.spans();
+                let (link_spans, decorations) =
+                    crate::links::spans_from_canonical(links, tags, block_ids);
                 self.link_spans = link_spans;
                 self.decorations = decorations;
             } else {
-                // Plain mode: zero structure work, zero materialization.
+                // Plain mode or degraded: zero spans for the session.
                 self.link_spans.clear();
                 self.decorations.clear();
+            }
+            // D10: warn once when the structure cache degrades to plain mode
+            // (spans dropped for the session). Rendering never blocks on
+            // structure — this is observability, not an error path.
+            if self.segment.is_degraded() && !self.segment_plain_warned {
+                tracing::warn!(
+                    buffer_id = view.buffer_id,
+                    revision = view.revision,
+                    "structure cache degraded to plain mode after repeated sync failures (RFC-0011 S5 D10); spans dropped for the session"
+                );
+                self.segment_plain_warned = true;
             }
             self.revision = Some(view.revision);
         }
@@ -5356,10 +5356,11 @@ mod tests {
         }
     }
 
-    /// S7-T4 (plain mode): ≥ 64 MiB documents yield zero spans even when the
-    /// text is full of links; the same content below the threshold yields
-    /// spans, proving the gate — not the parser — is what emptied the result.
-    /// The gate is flag-independent and precedes either structure source.
+    /// S7-T4 / RFC-0011 S5 (plain mode): ≥ 64 MiB documents yield zero
+    /// spans even when the text is full of links, and the segment cache is
+    /// never touched (the plain gate precedes structure work); the same
+    /// content below the threshold yields spans through the segment cache —
+    /// proving the gate, not the parser, empties the result.
     #[test]
     fn structure_spans_plain_mode_gates_huge_documents() {
         let mut huge = String::with_capacity(HUGE_TEXT_THRESHOLD + 1024);
@@ -5368,18 +5369,105 @@ mod tests {
         }
         assert!(huge.len() >= HUGE_TEXT_THRESHOLD);
 
-        let spans = structure_spans(&huge);
-        assert!(
-            spans.0.is_empty() && spans.1.is_empty(),
-            "plain mode must yield zero spans"
+        let mut state = EditorState::default();
+        let huge_view = EditorView {
+            revision: 1,
+            text: DocumentText::from(huge.as_str()),
+            ..long_view(0)
+        };
+        state.reconcile(&huge_view, &HashMap::new());
+        assert!(state.link_spans.is_empty() && state.decorations.is_empty());
+        assert_eq!(
+            state.segment.segment_count(),
+            0,
+            "plain gate must precede any segment work"
         );
 
         // Same content below the threshold does produce spans — the gate is
-        // length, not content. Uses the bridge path directly so the proof
-        // does not depend on the engine flag.
-        let small = &huge[..HUGE_TEXT_THRESHOLD - 1_000_000];
-        let spans = bridge_structure_spans(small);
-        assert!(!spans.0.is_empty() && !spans.1.is_empty());
+        // length, not content. The segment cache is the producer now.
+        let small = &huge[..100_000];
+        let small_view = EditorView {
+            revision: 2,
+            text: DocumentText::from(small),
+            ..huge_view.clone()
+        };
+        state.reconcile(&small_view, &HashMap::new());
+        assert!(!state.link_spans.is_empty() && !state.decorations.is_empty());
+        assert!(state.segment.segment_count() >= 1);
+    }
+
+    /// S5-T5 (D10 carried over): repeated segment-sync failures degrade the
+    /// cache to plain-for-session — spans cleared, one warning, editing
+    /// unaffected.
+    #[test]
+    fn s5_t5_structure_degradation_clears_spans_and_warns_once() {
+        struct Recording(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl tracing::subscriber::Subscriber for Recording {
+            fn register_callsite(
+                &self,
+                _metadata: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::always()
+            }
+            fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                if event.metadata().level() == &tracing::Level::WARN {
+                    self.0.lock().expect("recorder lock").push("warn".into());
+                }
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+            fn clone_span(&self, _span: &tracing::span::Id) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+        }
+
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Recording(recorded.clone()), || {
+            let base_view = EditorView {
+                revision: 1,
+                text: "prose [[a]]\n\n```\n[[hidden]]\n```\n".into(),
+                ..long_view(0)
+            };
+            let mut state = EditorState::default();
+            state.reconcile(&base_view, &HashMap::new());
+            assert!(!state.link_spans.is_empty(), "healthy sync yields spans");
+            for step in 0..4u64 {
+                state.segment.inject_inconsistent_cache();
+                let mut view = base_view.clone();
+                view.revision += step + 1;
+                view.last_edit = Some(flavite_syntax::EditRange {
+                    start: 1,
+                    old_end: 1,
+                    new_end: 2,
+                });
+                state.reconcile(&view, &HashMap::new());
+            }
+            assert!(
+                state.segment.is_degraded(),
+                "must degrade after repeated failures"
+            );
+            assert!(
+                state.link_spans.is_empty() && state.decorations.is_empty(),
+                "degraded session drops spans"
+            );
+            // Editing/undo stay functional: further reconciles are spanless
+            // but never panic.
+            let mut later = base_view.clone();
+            later.revision = 100;
+            state.reconcile(&later, &HashMap::new());
+            assert!(state.link_spans.is_empty());
+        });
+        let warns = recorded.lock().expect("recorder lock").clone();
+        assert_eq!(warns.len(), 1, "degradation warning must fire exactly once");
     }
 
     /// S4-T1 (NFR-5): the widget performs zero full-document line-window

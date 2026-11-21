@@ -67,7 +67,7 @@ pub fn ts_structure_spans(text: &str) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
 pub fn spans_from_ts(
     parsed: flavite_syntax::ts_ranges::TsParsedNote,
 ) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
-    spans_from_parsed(parsed.links, parsed.tags, parsed.block_ids)
+    spans_from_canonical(parsed.links, parsed.tags, parsed.block_ids)
 }
 
 /// Convert the incremental structure engine's spans into the widget's views.
@@ -75,24 +75,27 @@ pub fn spans_from_ts(
 pub fn spans_from_structure(
     spans: flavite_syntax::structure::StructureSpans,
 ) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
-    spans_from_parsed(spans.links, spans.tags, spans.block_ids)
+    spans_from_canonical(spans.links, spans.tags, spans.block_ids)
 }
 
 /// Convert a pulldown parse into the widget's span views. The widget no
-/// longer depends on the pulldown parse path (S8); this converter exists for
-/// parity tests and diagnostics.
+/// longer depends on the pulldown parse path (RFC-0011 S5 routes through
+/// the segment cache); this converter exists for parity tests and
+/// diagnostics, and delegates to [`spans_from_canonical`].
 #[must_use]
 pub fn spans_from_pulldown(
     parsed: flavite_syntax::pulldown_glue::ParsedNote,
 ) -> (Vec<LinkSpan>, Vec<ScannedSpan>) {
-    spans_from_parsed(parsed.links, parsed.tags, parsed.block_ids)
+    spans_from_canonical(parsed.links, parsed.tags, parsed.block_ids)
 }
 
-/// Shared conversion from a canonical parse (either glue) into the widget's
-/// link and decoration views. The canonical parse already scanned every prose
-/// window; reusing its tag/block spans avoids scanning the full note a second
-/// time and allocating duplicate link payloads that drawing never uses.
-fn spans_from_parsed(
+/// Convert canonical link/tag/block-ID spans (whole-document parse or the
+/// segment cache) into the widget's link and decoration views. The canonical
+/// parse already scanned every prose window; reusing its tag/block spans
+/// avoids scanning the full note a second time and allocating duplicate link
+/// payloads that drawing never uses.
+#[must_use]
+pub fn spans_from_canonical(
     links: Vec<flavite_syntax::pulldown_glue::Link>,
     tags: Vec<flavite_syntax::text::Span<flavite_syntax::text::TextByte>>,
     block_ids: Vec<flavite_syntax::text::Span<flavite_syntax::text::TextByte>>,
